@@ -1,0 +1,50 @@
+[project]
+name = "long-exposure"
+version = "0.2.0"
+description = "Autonomous three-agent research conductor with persistent context (formerly agent-conditioning + auto-compact)"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+    "anthropic>=0.39.0",
+    # prompt_toolkit was previously an undeclared transitive that happened
+    # to be present in every venv; orchestrator.py imports it at module
+    # top so a clean install needs it explicitly.
+    "prompt_toolkit>=3.0",
+    # Plan E: matplotlib promoted from local-setup.md
+    # operator-install to a hard dep. `figure plot` is the most-used
+    # `figure` CLI backend (Tier 1 quantitative plots per Plan C2);
+    # making it a hard dep eliminates the silent first-cycle failure
+    # mode on a fresh `uv sync`. ~35 MB transitive footprint.
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+# Plan E: cloud / system architecture diagrams via the
+# mingrammer/diagrams library + Graphviz `dot` system binary. Opt-in
+# because the system dep (graphviz) is OS-package-manager territory
+# and pure-pip can't fully bootstrap the backend; coupling them keeps
+# the install story honest. Operators who need `figure arch`:
+#     uv sync --extra figures-arch
+#     sudo apt-get install graphviz   # or equivalent (Plan F)
+figures-arch = ["diagrams>=0.23"]
+
+[project.scripts]
+long-exposure = "long_exposure.exploration:main"
+auto-compact = "auto_compact.cli:main"
+figure = "long_exposure.tools.figure:main"
+# Legacy aliases — silent forwards, dropped in v0.3 once muscle memory shifts.
+agent-exploration = "long_exposure.exploration:main"
+run-final-reporter = "run_final_reporter:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["long_exposure", "auto_compact"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"long_exposure/templates" = "long_exposure/templates"
+"long_exposure/config.yaml" = "long_exposure/config.yaml"
+"long_exposure/exploration-score.yaml" = "long_exposure/exploration-score.yaml"
+"run_final_reporter.py" = "run_final_reporter.py"

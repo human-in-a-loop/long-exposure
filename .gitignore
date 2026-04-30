@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build / dist
+.venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Runtime state (created on first run; never commit)
+long_exposure/data/*
+!long_exposure/data/.gitkeep
+long_exposure/output/*
+!long_exposure/output/.gitkeep
+.long-exposure/
+sources/data/
+
+# Logs (any pattern, anywhere in the repo)
+*.log
+*.log.*
+
+# Health / event streams
+health_events.jsonl
+
+# Signal files
+*.stop
+*.clear
+*.guide
+*.guidance
+*.graceful-stop
+
+# Per-clone instance directories
+instance-*/
+fork-*/
+clone-*/
+
+# Misc
+.vercel
+# uv.lock is committed for reproducibility — do NOT add it here
