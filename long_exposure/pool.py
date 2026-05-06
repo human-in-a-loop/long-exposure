@@ -44,6 +44,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from long_exposure import provider as _provider
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -58,6 +60,14 @@ DEFAULT_COOLDOWN_SECONDS = 800
 
 _POOL_STATE_PATH = Path.home() / ".claude-pool-state.json"
 _POOL_LOCK_PATH = Path.home() / ".claude-pool-state.lock"
+
+
+def _pool_state_path() -> Path:
+    return _provider.pool_state_path()
+
+
+def _pool_lock_path() -> Path:
+    return _provider.pool_lock_path()
 
 # Account states.
 COLD = "cold"
@@ -78,12 +88,7 @@ def parse_pool_config() -> list[str]:
     Returns [] when neither is set — single-account mode.
     Empty entries are filtered.
     """
-    raw = os.environ.get("CLAUDE_ACCOUNT_POOL", "").strip()
-    if not raw:
-        raw = os.environ.get("CLAUDE_ACCOUNTS", "").strip()
-    if not raw:
-        return []
-    return [p.strip() for p in raw.split(",") if p.strip()]
+    return _provider.parse_pool_env()
 
 
 def is_active() -> bool:
@@ -123,7 +128,7 @@ def _pool_lock():
     crashing.
     """
     try:
-        fh = open(_POOL_LOCK_PATH, "a+")
+        fh = open(_pool_lock_path(), "a+")
     except OSError:
         yield
         return
@@ -164,7 +169,7 @@ def _empty_state() -> dict:
 
 def _load_state_unlocked() -> dict:
     try:
-        return json.loads(_POOL_STATE_PATH.read_text())
+        return json.loads(_pool_state_path().read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return _empty_state()
 
@@ -172,9 +177,10 @@ def _load_state_unlocked() -> dict:
 def _save_state_unlocked(state: dict) -> None:
     """Atomic write. Silent on failure — state is advisory."""
     try:
-        tmp = _POOL_STATE_PATH.with_suffix(".json.tmp")
+        state_path = _pool_state_path()
+        tmp = state_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state, indent=2, default=str))
-        os.replace(tmp, _POOL_STATE_PATH)
+        os.replace(tmp, state_path)
     except OSError:
         pass
 
@@ -214,7 +220,7 @@ def _ensure_account_entries(state: dict, dirs: list[str]) -> dict:
 
 def _load_legacy_active_index() -> int:
     """Read the legacy ~/.claude-accounts-state.json active_index, if any."""
-    legacy = Path.home() / ".claude-accounts-state.json"
+    legacy = _provider.accounts_state_path()
     try:
         return int(json.loads(legacy.read_text()).get("active_index", 0))
     except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError, TypeError):

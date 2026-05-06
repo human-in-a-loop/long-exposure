@@ -11,7 +11,7 @@ conceptual map, see [`architecture-overview.md`](architecture-overview.md).
 | What | Why | Required |
 |---|---|---|
 | **Python 3.10+** | Runtime | Yes |
-| **[Claude Code CLI](https://docs.claude.com/en/docs/claude-code)** on `$PATH` | Model backend (Max plan; no API key needed) | Yes |
+| A supported provider CLI on `$PATH`: **[Claude Code CLI](https://docs.claude.com/en/docs/claude-code)**, Codex CLI, or Gemini CLI | Model backend for `llm_provider: claude`, `codex`, or `gemini` | Yes |
 | **`pyyaml`** | Config + score YAML parsing | Yes (pip-installed) |
 | **`prompt_toolkit`** | Interactive orchestrator REPL | Yes (pip-installed) |
 | **`anthropic`** | Used by `auto_compact` standalone CLI only — long-exposure itself does not call the SDK | No (optional) |
@@ -117,6 +117,21 @@ claude -p "say ok" --output-format json
 # Expect: JSON envelope with "is_error":false. If this fails,
 # the rest of long-exposure cannot run.
 
+# Optional Codex provider smoke
+codex exec --yolo --json -m gpt-5.5 \
+  -C /path/to/trusted/workspace -o /tmp/codex-ok.txt \
+  "Reply with exactly: ok" && cat /tmp/codex-ok.txt
+
+# Optional Gemini provider smoke (Google-account / Code Assist path)
+npm install -g @google/gemini-cli
+GOOGLE_GENAI_USE_GCA=true gemini --skip-trust \
+  --output-format json -p "Reply with exactly: ok"
+
+# Long-exposure's Gemini default is gemini-3-flash-preview with a 1M
+# context-window assumption. Gemini native subagents are disabled in
+# long-exposure; whole-cycle fan-out still runs multiple independent
+# Gemini CLI sessions concurrently.
+
 # 2. long-exposure imports cleanly
 python3 -c "import long_exposure.exploration; print('ok')"
 
@@ -126,6 +141,11 @@ from long_exposure.exploration import load_exploration_score
 load_exploration_score('long_exposure/exploration-score.yaml')
 print('score validates')
 "
+
+# Optional Wolfram smoke. `wolfram-batch` is bundled with long-exposure
+# and is compatible with `wolfram -script FILE.wls`.
+printf 'Print[$Version]\nPrint[2+2]\n' >/tmp/wolfram-smoke.wls
+.venv/bin/wolfram-batch -script /tmp/wolfram-smoke.wls
 ```
 
 ---
@@ -177,7 +197,8 @@ long-exposure/
 The bundled `auto_compact/` exposes its own `auto-compact` CLI (uses
 the Anthropic SDK directly — needs `ANTHROPIC_API_KEY`). Long-exposure
 itself does NOT use that CLI; it consumes `auto_compact` purely as a
-Python library, and all model calls go through `claude -p`.
+Python library, and model calls go through the configured provider CLI
+(`claude`, `codex`, or `gemini`).
 
 ---
 

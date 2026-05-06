@@ -25,6 +25,7 @@ long_exposure/output/*
 !long_exposure/output/.gitkeep
 .long-exposure/
 sources/data/
+agent_workspace/
 
 # Logs (any pattern, anywhere in the repo)
 *.log

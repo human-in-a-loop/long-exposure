@@ -33,10 +33,12 @@ from long_exposure.orchestrator import (
     build_allowed_tools_flags,
     call_claude,
     estimate_tokens,
+    generate_gemini_project_settings,
     generate_mcp_config,
     load_config,
     resolve_instance_dir,
 )
+from long_exposure import provider as _provider
 
 # ---------------------------------------------------------------------------
 # Score loading & validation
@@ -168,6 +170,32 @@ def build_agent_config(base_config: dict, agent_def: dict) -> dict:
     ):
         if key in agent_def:
             config[key] = agent_def[key]
+
+    _provider.configure_provider(config)
+    if (
+        _provider.is_codex()
+        and "model" not in agent_def
+        and config.get("codex_model")
+    ):
+        config["model"] = config["codex_model"]
+    if _provider.is_codex():
+        config["context_window"] = int(config.get("codex_context_window", 400_000))
+    if (
+        _provider.is_gemini()
+        and "model" not in agent_def
+        and config.get("gemini_model")
+    ):
+        config["model"] = config["gemini_model"]
+    if _provider.is_gemini():
+        config["context_window"] = int(config.get("gemini_context_window", 1_000_000))
+    if (
+        _provider.is_local()
+        and "model" not in agent_def
+        and config.get("local_model")
+    ):
+        config["model"] = config["local_model"]
+    if _provider.is_local():
+        config["context_window"] = int(config.get("local_context_window", 32768))
 
     # Custom philosophy/framework from agent def
     if "custom_philosophy" in agent_def:
@@ -379,11 +407,13 @@ def run_agent(
     mcp_config = None
     if agent_def.get("mcp", False):
         db_path = agent_config.get("compact_db", "")
-        if db_path:
+        if db_path and _provider.is_claude():
             mcp_config = generate_mcp_config(
                 db_path,
                 instance_dir=agent_config.get("instance_dir"),
             )
+    if _provider.is_gemini():
+        generate_gemini_project_settings(agent_config)
 
     try:
         envelope = call_claude(

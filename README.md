@@ -6,7 +6,12 @@ Point it at a research directive that's too open-ended for a one-shot prompt: a 
 
 The pitch in one line: you give it an ambiguous research directive; it gives you a packaged report and a traceable record of how it got there.
 
-Runs on the **Claude Code Max plan** — no API key needed. Uses Claude Code CLI as the model backend via subprocess, so all usage is covered by your Max subscription. Context persistence and session search are bundled in (formerly a separate `auto-compact` package).
+By default, long-exposure runs on the **Claude Code Max plan** via the
+Claude Code CLI, with no API key needed. It also has native Codex and Gemini
+CLI provider paths; for low-cost Google-hosted use, Gemini Flash on the
+Google-account/free-tier path is the preferred non-Claude backend. Context
+persistence and session search are bundled in (formerly a separate
+`auto-compact` package).
 
 > **Permissions: LONG-EXPOSURE SHOULD BE RUN IN A SANDBOX ENVIRONMENT.** Agents run autonomously for hours-to-weeks with broad file and tool access (Read/Write/Edit/Bash on the working directory; Bash unrestricted by default). Run in a VM, container, or otherwise isolated environment. See [`docs/local-setup.md`](docs/local-setup.md) and [`docs/configuration-reference.md`](docs/configuration-reference.md) for permission scoping options.
 
@@ -23,9 +28,24 @@ Runs on the **Claude Code Max plan** — no API key needed. Uses Claude Code CLI
 ## Requirements
 
 - **Python** 3.10+
-- **[Claude Code CLI](https://docs.claude.com/en/docs/claude-code)** on your `PATH` — required; all model calls go through `claude -p`
+- One supported model CLI on your `PATH`: **[Claude Code CLI](https://docs.claude.com/en/docs/claude-code)** for the default `claude` provider, Codex CLI for `llm_provider: codex`, or Gemini CLI for `llm_provider: gemini`.
 - **[pandoc](https://pandoc.org/installing.html)** + **[tectonic](https://tectonic-typesetting.github.io/)** — optional; only needed for PDF rendering of the final report. Runs skip PDF if missing.
-- **Wolfram Engine** — optional; only if your exploration uses Wolfram scripts (configure `wolfram_path` in `config.yaml`)
+- **Wolfram Engine** — optional; only if your exploration uses Wolfram scripts. `wolfram_path: "wolfram-batch"` uses long-exposure's portable script wrapper; set `WOLFRAM_BIN` if `wolfram` is not on `PATH`.
+
+### Provider Support
+
+Long-exposure has native integration paths for Claude, Codex, and Gemini CLI.
+For low-cost Google-hosted use, Gemini CLI with the Flash/free-tier path is
+the preferred non-Claude backend.
+
+There is also a generic `llm_provider: local` OpenAI-compatible HTTP connector
+left in the codebase for operators who want to bring their own model server.
+Long-exposure does not natively support or recommend a bundled open-source
+model path. The local connector has no provider-native tool runtime, no native
+subagents, and no managed hosting story; use it only as an extension point.
+See [`docs/google-cloud-open-source-llm-costs.md`](docs/google-cloud-open-source-llm-costs.md)
+for the cost trade-off that led to preferring Gemini Flash free tier over
+self-hosted open models on Google Cloud.
 
 ## Quick Start
 
@@ -55,7 +75,9 @@ Or, if the console script isn't installed:
 python3 -m long_exposure.exploration start "Explore foundations of microlocal analysis"
 ```
 
-No API key required — `long-exposure` calls `claude -p` under the hood, which uses your Max plan.
+For the default provider, no API key is required: `long-exposure` calls
+`claude -p` under the hood, which uses your Max plan. Gemini-backed runs use
+Gemini CLI with Google-account / Code Assist auth by default.
 
 The default score runs researcher → worker → auditor sequentially per cycle, with a reporter every `report_interval` cycles, and auto-compacts at 90% of the 1M context window.
 
@@ -265,6 +287,9 @@ Edit `long_exposure/config.yaml`. The minimal version:
 ```yaml
 model: opus
 context_window: 1000000
+codex_model: gpt-5.5
+codex_context_window: 400000
+codex_yolo: true
 model_tier: opus
 compact_threshold: 0.90
 philosophy: efficient
@@ -272,7 +297,16 @@ framework: staged
 checkpoint_format: standard
 ```
 
-The `model` field accepts aliases (`sonnet`, `opus`, `haiku`) or full model names (`claude-opus-4-6`).
+The `model` field accepts aliases (`sonnet`, `opus`, `haiku`) or full
+Claude model names. When `llm_provider: codex`, long-exposure uses
+`codex_model` and budgets compaction against `codex_context_window`
+(default 400k, so 90% compaction is 360k).
+
+Codex runs use `codex exec --yolo` by default. That intentionally
+bypasses Codex approvals and sandboxing so autonomous long-exposure
+runs behave like the existing `claude -p` path. Run Codex-backed
+long-exposure only inside an externally sandboxed VM/container or a
+workspace where full file and command access is acceptable.
 
 ### Philosophy Presets
 
@@ -447,7 +481,7 @@ long-exposure/
 ```
 
 **Dependencies:**
-- `claude` CLI — model calls via Max plan (no API key)
+- one provider CLI: `claude`, `codex`, or `gemini`
 - `pyyaml`, `anthropic`, `prompt_toolkit` — installed via pip
 - `auto_compact` — bundled (formerly a sibling package)
 
@@ -455,7 +489,7 @@ long-exposure/
 
 `auto_compact/` handles persistent context management: SQLite schema, FTS5 search, session storage/retrieval, depth-aware summary compression. It was previously a separate sibling repo; as of v0.2.0 it's bundled into this package under the same module name, so any code that does `from auto_compact.X import ...` still works.
 
-`auto_compact` exposes its own `auto-compact` CLI (an interactive tool that uses the Anthropic API directly — needs `ANTHROPIC_API_KEY`). Long-exposure itself does NOT use that CLI; it consumes `auto_compact` purely as a Python library, and all model calls go through `claude -p`.
+`auto_compact` exposes its own `auto-compact` CLI (an interactive tool that uses the Anthropic API directly — needs `ANTHROPIC_API_KEY`). Long-exposure itself does NOT use that CLI; it consumes `auto_compact` purely as a Python library, and model calls go through the configured provider CLI.
 
 ## Continuous Exploration
 
@@ -563,25 +597,36 @@ Each agent can override philosophy, framework, and model in the score file. See 
 
 ### Exploration Agent Permissions
 
-Exploration agents (researcher, worker, auditor) are restricted by the `allowed_tools` list in `exploration-score.yaml`, which Claude Code enforces at `--allowedTools` level. The default score for this deployment permits:
+Exploration agents (researcher, worker, auditor) are guided by the `allowed_tools` list in `exploration-score.yaml`.
+Claude Code enforces this at `--allowedTools` level. Codex-backed runs use
+`codex exec --yolo` by default, so Codex does not hard-enforce the Claude
+allowlist; it receives the same workspace and command-boundary guidance,
+uses `-C working_directory`, and gets `codex --search exec ...` only when
+`WebSearch` is present.
+
+The default score for this deployment permits:
 
 | Tool | Scope | Enforcement |
 |------|-------|-------------|
 | Read, Write, Edit, Glob, Grep | `working_directory` only | Claude Code path permissions — hard enforcement |
-| Bash | Pattern allowlist: `wolfram *`, `wolframscript *`, `python *`, `python3 *`, `pip *`, `pip3 *`, `cmake *`, `make *`, `ls *`, `mkdir *`, `mv *`, `cp *`, `bash *` (build-wrapper scripts), and any project-specific wrappers you add | Claude Code `--allowedTools` pattern — hard enforcement |
+| Bash | Pattern allowlist: `wolfram-batch *`, `wolfram *`, `wolframscript *`, `python *`, `python3 *`, `pip *`, `pip3 *`, `cmake *`, `make *`, `ls *`, `mkdir *`, `mv *`, `cp *`, `bash *` (build-wrapper scripts), and any project-specific wrappers you add | Claude Code `--allowedTools` pattern — hard enforcement |
 | WebSearch | Unrestricted | Read-only, no exfiltration risk |
 | Read/Glob/Grep on shared corpus | `//shared-corpus/**` (configure to your shared corpus path) | Read-only access to a shared knowledge corpus |
 | MCP session tools | Own sessions.db | Scoped to configured DB path |
 
-Agents **cannot**: run arbitrary shell commands, access git/gh, read `.env` or credentials, modify the long-exposure codebase itself, or execute binaries outside the allowlist. To narrow permissions for a particular deployment, edit `allowed_tools` in `exploration-score.yaml` (score-level) or override per-agent inside each agent's definition.
+In Claude-backed runs, agents **cannot** run arbitrary shell commands, access
+git/gh, read `.env` or credentials, modify the long-exposure codebase itself,
+or execute binaries outside the allowlist. In Codex-backed runs, those
+restrictions are soft guidance because `--yolo` is deliberately autonomous;
+use an external VM/container boundary for hard isolation.
 
 ### Security Layers
 
 | Layer | Protects against | Notes |
 |-------|-----------------|-------|
 | Claude's built-in safety | Malicious content generation | Baseline — no replication needed |
-| File tool scoping | File access outside `working_directory` | Hard enforcement by Claude Code |
-| Bash pattern allowlist | Shell commands outside the listed binaries | Hard enforcement by Claude Code |
+| File tool scoping | File access outside `working_directory` | Hard enforcement by Claude Code; Codex uses `-C working_directory` plus soft guidance under `--yolo` |
+| Bash pattern allowlist | Shell commands outside the listed binaries | Hard enforcement by Claude Code; soft guidance for Codex under `--yolo` |
 | Wolfram/Python interpreter shell functions (e.g. `Run[]`, `subprocess`, `system()`) | Not blocked at CLI level once the interpreter is allowed | Low practical risk in trusted-corpus settings — Claude's conditioning resists generating shell payloads through multi-agent research pipelines. Tighten `allowed_tools` if your corpus contains hostile input |
 | VM / virtual desktop isolation | Cross-user access, system compromise | Recommended for multi-user deployment. The VM is the blast radius — nothing beyond it to compromise |
 

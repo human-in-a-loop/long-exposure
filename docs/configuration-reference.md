@@ -20,18 +20,55 @@ fixed.
 ### Model
 
 ```yaml
+llm_provider: claude       # claude | codex | gemini | local
 model: opus               # alias (sonnet, opus, haiku) or full name
+codex_model: gpt-5.5
+gemini_model: gemini-3-flash-preview
+local_model: custom-local-model
+local_base_url: http://127.0.0.1:18080/v1
+local_context_window: 32768
+local_max_tokens: 2048
+local_recent_log_pct: 0.25
+local_compact_max_tokens: 4096
+local_temperature: 0.2
+local_top_p: 0.95
 context_window: 1000000
+codex_context_window: 400000
+gemini_context_window: 1000000
+codex_yolo: true
+gemini_yolo: true
+gemini_auth_env: GOOGLE_GENAI_USE_GCA
+gemini_auth_value: "true"
+codex_subagents:
+  max_threads: 3
+  max_depth: 1
 model_tier: opus
 cli_timeout: 0            # seconds per claude -p call (0 = no timeout)
 ```
 
 | Key | Meaning |
 |---|---|
-| `model` | Model alias passed to `claude -p --model`. Aliases resolve to current canonical names. |
-| `context_window` | Used to compute compaction thresholds and budget pressure ranges |
+| `llm_provider` | Backend: `claude` by default, `codex`, `gemini`, or `local`. `local` is an unsupported OpenAI-compatible extension point, not a native long-exposure model path. Can be overridden with `LONG_EXPOSURE_LLM_PROVIDER`. |
+| `model` | Claude model alias passed to `claude -p --model`. For Codex, agent calls use `codex_model` unless an agent explicitly overrides `model`. |
+| `codex_model` | Codex CLI model used when `llm_provider: codex`. |
+| `gemini_model` | Gemini CLI model used when `llm_provider: gemini`. Default is `gemini-3-flash-preview`, the robust Google-account/free-tier Gemini 3 model verified live. `gemini-3-pro-preview` is more capable but was not dependable on the free-tier path in live testing (`capacity exhausted`). |
+| `local_model` | Operator-supplied model alias served by an OpenAI-compatible endpoint when `llm_provider: local`. |
+| `local_base_url` | Operator-supplied OpenAI-compatible API base URL. |
+| `local_context_window` | Operator-supplied local context budget used for compaction math and prompt budget guidance. |
+| `local_max_tokens` | Maximum completion tokens requested from the local endpoint. |
+| `local_recent_log_pct` | Fraction of local context reserved for injecting recent per-agent JSONL transcript memory. Default `0.25`, about 8k tokens at 32k context. |
+| `local_compact_max_tokens` | Maximum tokens requested for local transcript compaction summaries. |
+| `local_temperature` | Local sampling temperature. |
+| `local_top_p` | Local nucleus sampling value. |
+| `context_window` | Claude context budget used to compute compaction thresholds and budget pressure ranges |
+| `codex_context_window` | Codex context budget. When `llm_provider: codex`, this overrides `context_window`; default `400000`, so compaction fires at `360000` tokens with `compact_threshold: 0.90`. |
+| `gemini_context_window` | Gemini context budget. When `llm_provider: gemini`, this overrides `context_window`; default `1000000`, matching Gemini CLI's advertised 1M Google-account window. |
+| `codex_yolo` | When true, normal Codex agent turns run with `codex exec --yolo`, bypassing approvals and sandboxing. This is the Codex analogue of long-exposure's autonomous `claude -p` posture; use only in an externally sandboxed environment. |
+| `gemini_yolo` | When true, normal Gemini agent turns run with `gemini --yolo`; compaction uses `--approval-mode plan`. Long-exposure also writes project-local `.gemini/settings.json` tool/MCP settings for the agent's current permission scope. |
+| `gemini_auth_env` / `gemini_auth_value` | Default Gemini auth selector. The default sets `GOOGLE_GENAI_USE_GCA=true` when no Gemini API/Vertex auth env is already set, keeping the integration on the Google-account / Code Assist path rather than API pay-as-you-go. |
+| `codex_subagents` | Codex subagent runtime caps. `max_threads` limits concurrent child threads; `max_depth: 1` permits direct children but prevents recursive subagent trees. |
 | `model_tier` | Used by template substitution; selects philosophy-tier-specific phrasing |
-| `cli_timeout` | Per-`claude -p` call timeout; `0` disables. Override per-agent in score |
+| `cli_timeout` | Per-provider CLI call timeout; `0` disables. Override per-agent in score |
 
 ### Compaction
 
@@ -158,7 +195,7 @@ anti_patterns_enabled: true       # include named failure modes (Spiral, Leap, e
 ```yaml
 working_directory: /path/to/your/project   # absolute; scopes file tools
 
-wolfram_path: ""   # empty disables wolfram tool guidance
+wolfram_path: "wolfram-batch"   # empty disables Wolfram guidance
 
 allowed_tools:
   - Read
@@ -174,6 +211,12 @@ File tools (`Read`, `Write`, `Edit`, `Glob`, `Grep`) are automatically
 scoped to `working_directory`. Bash is unrestricted by default; you
 can pattern-restrict:
 
+`wolfram-batch` is a bundled console command compatible with
+`wolfram -script file.wls`. It runs scripts through the interactive
+`wolfram` kernel, which covers installations where interactive Wolfram
+works but `wolfram -script` or `wolframscript` hits licensing startup
+problems. If `wolfram` is not on `PATH`, set `WOLFRAM_BIN=/path/to/wolfram`.
+
 ```yaml
 allowed_tools:
   - Read
@@ -188,6 +231,28 @@ To bypass all permission checks (use only in isolated environments):
 ```yaml
 allowed_tools: dangerously_skip_all
 ```
+
+Provider translation:
+
+| Concern | Claude | Codex | Gemini |
+|---|---|---|---|
+| Non-interactive autonomous execution | `claude -p` with explicit tool flags | `codex exec --yolo` by default (`codex_yolo: true`) | `gemini --yolo --skip-trust` by default (`gemini_yolo: true`) |
+| File-tool scope | `Read/Write/Edit/Glob/Grep` are converted to scoped `--allowedTools` entries under `working_directory` | `-C working_directory` plus long-exposure directory-boundary guidance; `--yolo` deliberately removes Codex sandbox prompts | `cwd=working_directory`, Gemini `tools.core` / `--allowed-tools` mapped from the same long-exposure allowlist, plus directory-boundary guidance |
+| Bash | Allowed or pattern-restricted through Claude `Bash(...)` allowlist entries | Allowed by `--yolo`; pattern restrictions remain soft guidance in the prompt | Mapped to Gemini `run_shell_command` or `run_shell_command(command)` where a command prefix is present |
+| Web search | `WebSearch` allowed through Claude tool flags | Top-level `--search` is added (`codex --search exec ...`) when `WebSearch` is present | Mapped to Gemini `google_web_search`; `WebFetch` maps to `web_fetch` when used |
+| Tool-disabled summary calls | `--tools ""` | read-only Codex sandbox where supported | `--approval-mode plan` |
+| Parallel turn helpers | Claude agent-teams | Codex subagents, inheriting the lead's `--yolo` runtime posture | No native subagents; use whole-cycle fan-out for parallel Gemini threads |
+
+Generic local connector translation:
+
+| Concern | Local behavior |
+|---|---|
+| Runtime | Operator-supplied OpenAI-compatible HTTP endpoint. This is an extension point, not a natively supported long-exposure backend. |
+| Tool execution | No native tool bridge. Workspace and tool guidance remain soft prompt guidance. |
+| Session search MCP | Not advertised in prompts unless a provider actually receives MCP tools. Inline gems still appear as summaries. |
+| Context persistence | Backend calls are stateless, but long-exposure writes per-agent local JSONL transcripts, injects bounded recent logs, and compacts them into `sessions.db`. |
+| Parallel turn helpers | No native local equivalent yet. Whole-cycle fan-out remains in Python. |
+| Tools | No executable local tool bridge. Tool permissions are prompt guidance only for the generic local connector. |
 
 ### Context proximity
 
@@ -389,7 +454,11 @@ Always at least specify Read and Bash for any agent that needs to
 operate on files.
 
 The MCP search tool (`search_sessions`, etc.) is added automatically
-when `mcp: true` is set on the agent.
+when `mcp: true` is set on a Claude-backed agent. Gemini-backed runs
+write a project-local `.gemini/settings.json` with the `sessions` MCP
+server and the current tool allowlist. Codex CLI MCP config is still a
+separate integration point; durable memory remains available through
+`sessions.db` and prompt-injected summaries.
 
 ---
 
@@ -424,22 +493,24 @@ Default mapping (`PHILOSOPHY_EFFORT_MAP` in `orchestrator.py`):
 | `reporter` | `medium` |
 | `custom` | `high` |
 
-### Budget pressure (1M context window)
+### Budget pressure
 
 Budget pressure is communicated via the **operating protocol** layer
 of the system prompt and modifies output depth *within* the agent's
 fixed effort level. The thresholds scale automatically with
-`context_window`.
+`context_window`. Claude defaults to a 1M token budget. Codex runs use
+`codex_context_window` (default 400k), so the same percentages map to
+smaller absolute thresholds.
 
 | Pressure | Token range | Behavior |
 |---|---|---|
-| `none` | below 400k | Work at full depth per philosophy |
-| `mild` | 400k–600k | Concise tool calls, shorter reasoning, skip nice-to-haves |
-| `significant` | 600k–800k | Minimal output, results and decisions only, no new branches |
-| `critical` | above 800k | Finish current stage immediately, shortest correct output |
+| `none` | below 40% of the active context budget | Work at full depth per philosophy |
+| `mild` | 40–60% of the active context budget | Concise tool calls, shorter reasoning, skip nice-to-haves |
+| `significant` | 60–80% of the active context budget | Minimal output, results and decisions only, no new branches |
+| `critical` | above 80% of the active context budget | Finish current stage immediately, shortest correct output |
 
 Compaction triggers at `compact_threshold × context_window` (default
-900k tokens).
+900k tokens for Claude, 360k tokens for Codex).
 
 ### How they interact
 

@@ -53,6 +53,10 @@ long-exposure does, see the project [README](../README.md).
 | [`workspace-conventions.md`](workspace-conventions.md) | Folder skeleton, POR, ledger, status taxonomy, validators, timestamping | Workspace structure |
 | [`figures.md`](figures.md) | Figures as first-class; lexicon framework (scaffold only) | Figures / vocabulary |
 | [`soft-guidance.md`](soft-guidance.md) | Why soft-guidance, where to put it, the two refinements | Adding/editing prompts |
+| [`google-cloud-open-source-llm-costs.md`](google-cloud-open-source-llm-costs.md) | Cost trade-offs showing why Gemini Flash free tier is preferred over self-hosted open models on Google Cloud | Provider planning |
+| [`gemini-stage-1-audit.md`](gemini-stage-1-audit.md) | Read-only architecture audit and Stage 0 Gemini CLI findings | Contributor |
+| [`gemini-integration-plan.md`](gemini-integration-plan.md) | Multi-stage Gemini CLI integration plan | Contributor |
+| [`gemini-plan-review.md`](gemini-plan-review.md) | Pre-implementation review and risk notes for Gemini | Contributor |
 
 ---
 

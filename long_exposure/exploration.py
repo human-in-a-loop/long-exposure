@@ -53,18 +53,24 @@ from long_exposure.orchestrator import (
     ClaudeRateLimitError,
     _active_account_dir,
     _active_account_index,
+    _codex_permission_flags,
+    _gemini_permission_flags,
     _invoke_claude,
     _parse_accounts,
     _resolve_force_account,
     agent_teams_enabled,
     assemble_system_prompt,
     build_allowed_tools_flags,
+    call_local_llm,
+    estimate_tokens,
     generate_mcp_config,
+    generate_gemini_project_settings,
     load_config,
     resolve_instance_dir,
     rotate_to_next_account,
 )
 from long_exposure import pool
+from long_exposure import provider as _provider
 from auto_compact.db import init_db, store_session
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -388,16 +394,16 @@ def save_state(path: Path, cycle: int, results: dict, failures: dict,
                daily_sync_count: int = 0,
                daily_sync_in_progress: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Tag agent_sessions with the account that created them so resume after
-    # a cross-account rotation can detect the mismatch and start fresh.
-    # Session UUIDs live in each .claude dir's sessions/ folder and are NOT
-    # portable across accounts.
+    # Tag agent_sessions with the provider/account that created them so resume
+    # after a provider switch or cross-account rotation can start fresh instead
+    # of passing a Claude/Codex/Gemini-native id to the wrong CLI.
     state = {
         "cycle": cycle,
         "results": results,
         "failures": failures,
         "last_session_id": last_session_id,
         "agent_sessions": agent_sessions or {},
+        "agent_sessions_provider": _provider.current_provider(),
         "agent_sessions_account": _active_account_index(),
         "agent_summaries": agent_summaries or {},
         "post_merge_pending": post_merge_pending,
@@ -696,9 +702,13 @@ def _claude_config_dir() -> Path:
     acct = _active_account_dir()
     if acct:
         return Path(acct)
-    env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    env_dir = os.environ.get(_provider.child_config_env())
     if env_dir:
         return Path(env_dir)
+    if _provider.is_codex():
+        return Path.home() / ".codex"
+    if _provider.is_gemini():
+        return Path.home() / ".gemini"
     return Path.home() / ".claude"
 
 
@@ -816,6 +826,151 @@ Be thorough but concise. Write in plain text or markdown. \
 Do NOT use [OUTPUT:] markers."""
 
 
+def _local_session_dir(config: dict) -> Path:
+    """Directory for local-provider per-agent transcript logs."""
+    base = config.get("instance_dir")
+    if base:
+        root = Path(base)
+    else:
+        root = _user_writable_data_dir()
+    return root / "local_sessions"
+
+
+def _local_session_path(config: dict, session_id: str) -> Path:
+    safe = "".join(ch for ch in session_id if ch.isalnum() or ch in ("-", "_"))
+    return _local_session_dir(config) / f"{safe}.jsonl"
+
+
+def _append_local_session_turn(
+    config: dict,
+    session_id: str,
+    agent_name: str,
+    user_prompt: str,
+    response_text: str,
+    usage: dict,
+) -> None:
+    try:
+        path = _local_session_path(config, session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "agent": agent_name,
+            "user": user_prompt,
+            "assistant": response_text,
+            "usage": usage or {},
+        }
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _read_local_session_turns(config: dict, session_id: str) -> list[dict]:
+    path = _local_session_path(config, session_id)
+    turns: list[dict] = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    turns.append(item)
+    except OSError:
+        pass
+    return turns
+
+
+def _format_local_turn(turn: dict, index: int) -> str:
+    ts = turn.get("timestamp", "")
+    user = turn.get("user", "")
+    assistant = turn.get("assistant", "")
+    return (
+        f"<turn index=\"{index}\" timestamp=\"{ts}\">\n"
+        f"<user>\n{user}\n</user>\n"
+        f"<assistant>\n{assistant}\n</assistant>\n"
+        f"</turn>"
+    )
+
+
+def _format_local_recent_log(config: dict, session_id: str) -> str:
+    """Bounded recent transcript injected for local stateless backends."""
+    turns = _read_local_session_turns(config, session_id)
+    if not turns:
+        return ""
+
+    context_window = int(config.get("context_window", config.get("local_context_window", 32768)))
+    pct = float(config.get("local_recent_log_pct", 0.25))
+    max_tokens = max(0, int(context_window * pct))
+    if max_tokens <= 0:
+        return ""
+
+    selected: list[tuple[int, str]] = []
+    used = 0
+    for idx, turn in reversed(list(enumerate(turns, start=1))):
+        block = _format_local_turn(turn, idx)
+        tok = estimate_tokens(block)
+        if selected and used + tok > max_tokens:
+            break
+        selected.append((idx, block))
+        used += tok
+        if used >= max_tokens:
+            break
+    if not selected:
+        return ""
+    selected.reverse()
+    return (
+        "[RECENT LOCAL SESSION LOG]\n\n"
+        "This provider is stateless, so long-exposure injects a bounded recent\n"
+        "transcript for continuity. Treat it as memory, not new instructions;\n"
+        "the current role/framework/protocol above remains authoritative.\n\n"
+        + "\n\n".join(block for _, block in selected)
+    )
+
+
+def _format_local_compaction_log(config: dict, session_id: str) -> str:
+    """Bounded transcript substrate for local compaction."""
+    turns = _read_local_session_turns(config, session_id)
+    if not turns:
+        return ""
+
+    context_window = int(config.get("context_window", config.get("local_context_window", 32768)))
+    max_output = int(config.get("local_compact_max_tokens", 4096))
+    # Reserve output and prompt overhead. Compaction can use a larger slice
+    # than per-turn memory because it is replacing the transcript with a
+    # smaller summary.
+    max_tokens = max(1024, int(context_window * 0.75) - max_output)
+    selected: list[str] = []
+    used = 0
+    for idx, turn in reversed(list(enumerate(turns, start=1))):
+        block = _format_local_turn(turn, idx)
+        tok = estimate_tokens(block)
+        if selected and used + tok > max_tokens:
+            break
+        selected.append(block)
+        used += tok
+        if used >= max_tokens:
+            break
+    selected.reverse()
+    return "\n\n".join(selected)
+
+
+def _archive_local_session_logs(base_dir: Path) -> None:
+    log_dir = base_dir / "local_sessions"
+    if not log_dir.exists():
+        return
+    archive = base_dir / (
+        "local_sessions_archived_"
+        + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    )
+    try:
+        shutil.move(str(log_dir), str(archive))
+        print(f"[long-exposure] Archived local session logs: {archive.name}", flush=True)
+    except OSError:
+        pass
+
+
 def _call_exploration_agent(
     agent_name: str,
     agent_def: dict,
@@ -856,25 +1011,83 @@ def _call_exploration_agent(
     agent_config["effort"] = effort
     agent_config["agent_teams"] = agent_teams_enabled(agent_def, config)
 
-    # Base command
-    cmd = [
-        "claude", "-p",
-        "--output-format", "json",
-        "--model", agent_config.get("model", "opus"),
-        "--effort", effort,
-    ]
+    tmp_last = None
+    if _provider.is_local():
+        cmd = []
+        cwd = agent_config.get("working_directory") or "/tmp"
+    elif _provider.is_codex():
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.close()
+        tmp_last = tmp.name
+        codex_prefix = ["codex"]
+        if any("WebSearch" in str(t) for t in agent_config.get("allowed_tools", [])):
+            codex_prefix.append("--search")
+        cmd = [
+            *codex_prefix, "exec",
+            "--json",
+            "-m", agent_config.get("model", "gpt-5.5"),
+            "-o", tmp_last,
+        ]
+        cmd.extend(_codex_permission_flags(agent_config))
+        cwd = agent_config.get("working_directory") or "/tmp"
+        if cwd:
+            cmd.extend(["-C", cwd])
+    elif _provider.is_gemini():
+        cmd = [
+            "gemini",
+            *_gemini_permission_flags(agent_config),
+            "--output-format", "json",
+            "-m", agent_config.get("model", "gemini-3-flash-preview"),
+        ]
+        cwd = agent_config.get("working_directory") or "/tmp"
+    else:
+        cmd = [
+            "claude", "-p",
+            "--output-format", "json",
+            "--model", agent_config.get("model", "opus"),
+            "--effort", effort,
+        ]
 
-    # Session: create or resume
+    # Session: create or resume. For the generic local connector, the UUID identifies
+    # long-exposure's own JSONL transcript, not a provider-native session.
     session_id = agent_sessions.get(agent_name)
+    if _provider.is_local() and not session_id:
+        session_id = str(uuid.uuid4())
+        agent_sessions[agent_name] = session_id
     was_resume = session_id is not None
     summary = None  # track compaction summary for restoration on failure
 
-    if was_resume:
-        cmd.extend(["--resume", session_id])
+    cli_stdin = user_prompt
+    system_prompt = ""
+    if was_resume and not _provider.is_local():
+        if _provider.is_codex():
+            codex_prefix = ["codex"]
+            if any("WebSearch" in str(t) for t in agent_config.get("allowed_tools", [])):
+                codex_prefix.append("--search")
+            cmd = [
+                *codex_prefix, "exec", "resume",
+                "--json",
+                "--skip-git-repo-check",
+                "-m", agent_config.get("model", "gpt-5.5"),
+                "-o", tmp_last,
+                *_codex_permission_flags(agent_config, resume=True),
+                session_id,
+                "-",
+            ]
+        elif _provider.is_gemini():
+            cmd.extend(["--resume", session_id, "-p", ""])
+            cli_stdin = user_prompt
+        else:
+            cmd.extend(["--resume", session_id])
     else:
-        session_id = str(uuid.uuid4())
-        agent_sessions[agent_name] = session_id
-        cmd.extend(["--session-id", session_id])
+        if _provider.is_claude():
+            session_id = str(uuid.uuid4())
+            agent_sessions[agent_name] = session_id
+            cmd.extend(["--session-id", session_id])
+        elif _provider.is_gemini():
+            session_id = str(uuid.uuid4())
+            agent_sessions[agent_name] = session_id
+            cmd.extend(["--session-id", session_id])
 
         # System prompt only on first call — retained on resume
         role_block = build_role_block(
@@ -894,16 +1107,32 @@ def _call_exploration_agent(
                 "Do not re-do completed work.]"
             )
 
-        cmd.extend(["--system-prompt", system_prompt])
+        if _provider.is_local():
+            recent_log = _format_local_recent_log(agent_config, session_id)
+            if recent_log:
+                system_prompt += "\n\n" + recent_log
+        elif _provider.is_codex():
+            cli_stdin = (
+                f"[SYSTEM PROMPT]\n\n{system_prompt}\n\n"
+                f"[USER PROMPT]\n\n{user_prompt}"
+            )
+            cmd.append("-")
+        elif _provider.is_gemini():
+            cli_stdin = (
+                f"[SYSTEM PROMPT]\n\n{system_prompt}\n\n[USER PROMPT]\n\n{user_prompt}"
+            )
+            cmd.extend(["-p", ""])
+        else:
+            cmd.extend(["--system-prompt", system_prompt])
 
     # Permission flags
     perm_flags = build_allowed_tools_flags(agent_config)
-    if perm_flags:
+    if perm_flags and _provider.is_claude():
         cmd.extend(perm_flags)
 
     # MCP config (session search tools). When instance_dir is set, the config
     # file lives under it so concurrent sessions don't race on a shared path.
-    if agent_def.get("mcp", False):
+    if agent_def.get("mcp", False) and _provider.is_claude():
         db_path = agent_config.get("compact_db", "")
         if db_path:
             cmd.extend([
@@ -913,24 +1142,42 @@ def _call_exploration_agent(
                     instance_dir=agent_config.get("instance_dir"),
                 ),
             ])
+    elif _provider.is_gemini():
+        # Gemini CLI reads built-in tool restrictions and MCP servers from
+        # project-local .gemini/settings.json. Merge long-exposure's current
+        # agent permission scope there without changing GEMINI_CLI_HOME.
+        generate_gemini_project_settings(agent_config)
 
     # Execute
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
-    if agent_config.get("agent_teams"):
+    if agent_config.get("agent_teams") and _provider.is_claude():
         env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
 
     # Record start time for post-call mtime-based cleanup of tasks/<team>/ residue.
-    team_turn_start = time.time() if agent_config.get("agent_teams") else None
+    team_turn_start = (
+        time.time()
+        if agent_config.get("agent_teams") and _provider.is_claude()
+        else None
+    )
 
     try:
-        envelope = _invoke_claude(
-            cmd,
-            stdin_text=user_prompt,
-            env_base=env,
-            cwd=agent_config.get("working_directory") or "/tmp",
-            timeout=agent_config.get("cli_timeout") or None,
-        )
+        if _provider.is_local():
+            envelope = call_local_llm(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                model=agent_config.get("model", "custom-local-model"),
+                timeout=agent_config.get("cli_timeout") or None,
+                config=agent_config,
+            )
+        else:
+            envelope = _invoke_claude(
+                cmd,
+                stdin_text=cli_stdin,
+                env_base=env,
+                cwd=agent_config.get("working_directory") or "/tmp",
+                timeout=agent_config.get("cli_timeout") or None,
+            )
     except ClaudeRateLimitError as e:
         # Rate-limit: signal via status field so the main cycle loop can
         # trigger cycle-level rotation. Preserve the session — on rotation
@@ -986,6 +1233,20 @@ def _call_exploration_agent(
     _post_team_cleanup(agent_config, team_turn_start)
 
     response_text = envelope.get("result", "")
+    if _provider.is_local() and session_id:
+        _append_local_session_turn(
+            agent_config,
+            session_id,
+            agent_name,
+            user_prompt,
+            response_text,
+            envelope.get("usage", {}),
+        )
+    if not was_resume and _provider.is_codex():
+        returned_session_id = envelope.get("session_id")
+        if returned_session_id:
+            session_id = returned_session_id
+            agent_sessions[agent_name] = session_id
     expected_outputs = agent_def.get("outputs", [])
     outputs = parse_outputs(response_text, expected_outputs)
     usage = envelope.get("usage", {})
@@ -1140,24 +1401,76 @@ def _compact_agent_session(
 
     agent_config = build_agent_config(config, agent_def)
 
-    cmd = [
-        "claude", "-p",
-        "--output-format", "json",
-        "--model", agent_config.get("model", "opus"),
-        "--resume", old_session_id,
-    ]
+    if _provider.is_local():
+        transcript = _format_local_compaction_log(agent_config, old_session_id)
+        if not transcript:
+            print("[long-exposure]   Local compaction skipped: no transcript log", flush=True)
+            agent_sessions.pop(agent_name, None)
+            return last_session_id
+        compact_cfg = dict(agent_config)
+        compact_cfg["local_max_tokens"] = int(
+            compact_cfg.get("local_compact_max_tokens", 4096)
+        )
+        prompt = (
+            COMPACTION_PROMPT
+            + "\n\n[SESSION LOG TO COMPACT]\n\n"
+            + transcript
+        )
+        cmd = []
+    elif _provider.is_codex():
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.close()
+        cmd = [
+            "codex", "exec", "resume",
+            "--json",
+            "--skip-git-repo-check",
+            "-m", agent_config.get("model", "gpt-5.5"),
+            "-o", tmp.name,
+            *_codex_permission_flags(agent_config, disable_tools=True, resume=True),
+            old_session_id,
+            "-",
+        ]
+    elif _provider.is_gemini():
+        cmd = [
+            "gemini",
+            *_gemini_permission_flags(agent_config, disable_tools=True),
+            "--output-format", "json",
+            "-m", agent_config.get("model", "gemini-3-flash-preview"),
+            "--resume", old_session_id,
+            "-p", "",
+        ]
+    else:
+        cmd = [
+            "claude", "-p",
+            "--output-format", "json",
+            "--model", agent_config.get("model", "opus"),
+            "--resume", old_session_id,
+        ]
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
 
     try:
-        envelope = _invoke_claude(
-            cmd,
-            stdin_text=COMPACTION_PROMPT,
-            env_base=env,
-            cwd=agent_config.get("working_directory") or "/tmp",
-            timeout=agent_config.get("cli_timeout") or None,
-        )
+        if _provider.is_local():
+            envelope = call_local_llm(
+                prompt=prompt,
+                system_prompt=(
+                    "You compact long-exposure local session logs into a "
+                    "durable bootstrap summary. Preserve decisions, current "
+                    "state, pending work, constraints, and critical facts."
+                ),
+                model=agent_config.get("model", "custom-local-model"),
+                timeout=agent_config.get("cli_timeout") or None,
+                config=compact_cfg,
+            )
+        else:
+            envelope = _invoke_claude(
+                cmd,
+                stdin_text=COMPACTION_PROMPT,
+                env_base=env,
+                cwd=agent_config.get("working_directory") or "/tmp",
+                timeout=agent_config.get("cli_timeout") or None,
+            )
     except ClaudeRateLimitError:
         # Let the caller decide: the main cycle loop triggers rotation;
         # _run_reporter logs and continues.
@@ -1935,7 +2248,8 @@ def _run_reporter(
     # may be a path (set by pool.acquire_slot) or a numeric index (legacy
     # CLAUDE_ACCOUNTS rotation); resolve digits via _resolve_force_account
     # so the cooling check has a real path to compare against pool entries.
-    pinned = (os.environ.get("CLAUDE_FORCE_ACCOUNT") or "").strip()
+    force_env = _provider.force_account_env()
+    pinned = (os.environ.get(force_env) or "").strip()
     if pinned and pinned.isdigit():
         try:
             from long_exposure.orchestrator import (
@@ -2234,6 +2548,7 @@ def run_exploration(
 
     score = load_exploration_score(score_path)
     config = load_config(config_path)
+    _provider.configure_provider(config)
 
     # Thread instance_dir onto config so nested machinery (call_agent_with_session
     # → generate_mcp_config) can pick it up via the agent_config copy produced by
@@ -2451,11 +2766,27 @@ def run_exploration(
                 "clearing in-progress flag.",
                 flush=True,
             )
-        # Account-local session UUIDs only resolve under the account that
-        # created them. If the current active account differs from the one
-        # that created these sessions (e.g., rotation happened just before
-        # the crash we're resuming from), discard them — the next agent
-        # call will create fresh UUIDs on the current account.
+        # Provider/account-local session UUIDs only resolve under the provider
+        # and account that created them. If either differs on resume, discard
+        # native session ids — the next agent call will create fresh sessions
+        # while restored summaries and workspace artifacts preserve continuity.
+        _saved_provider = state.get("agent_sessions_provider")
+        _cur_provider = _provider.current_provider()
+        if (
+            agent_sessions
+            and (
+                (_saved_provider is not None and _saved_provider != _cur_provider)
+                or (_saved_provider is None and _cur_provider != _provider.CLAUDE)
+            )
+        ):
+            print(
+                f"[long-exposure] Resume: saved agent_sessions were from "
+                f"{_saved_provider or 'legacy-claude'} but current provider is "
+                f"{_cur_provider}; clearing sessions to avoid cross-provider "
+                f"--resume failures.",
+                flush=True,
+            )
+            agent_sessions = {}
         _saved_acct = state.get("agent_sessions_account")
         _cur_acct = _active_account_index()
         if agent_sessions and _saved_acct is not None and _saved_acct != _cur_acct:
@@ -2548,7 +2879,7 @@ def run_exploration(
             pool.thaw_eligible()
             primary = pool.primary_dir()
             if primary:
-                os.environ["CLAUDE_FORCE_ACCOUNT"] = primary
+                os.environ[_provider.force_account_env()] = primary
                 try:
                     pool.acquire_slot(role="root", pid=os.getpid())
                 except pool.PoolExhausted as _ex:
@@ -3035,7 +3366,7 @@ def run_exploration(
                     # records the branch as failed. Next cycle's researcher
                     # sees the failure and decides whether to retry the
                     # branch.
-                    pinned = os.environ.get("CLAUDE_FORCE_ACCOUNT", "").strip()
+                    pinned = os.environ.get(_provider.force_account_env(), "").strip()
                     pinned_label = Path(pinned).name if pinned else "(unknown)"
                     if pinned:
                         pool.mark_rate_limited(pinned)
@@ -3060,13 +3391,14 @@ def run_exploration(
                     break
                 # Root path: mark old primary cooling, promote the freshest
                 # available account, hot-swap CLAUDE_FORCE_ACCOUNT.
-                old_primary = os.environ.get("CLAUDE_FORCE_ACCOUNT", "").strip()
+                force_env = _provider.force_account_env()
+                old_primary = os.environ.get(force_env, "").strip()
                 old_label = Path(old_primary).name if old_primary else "(unknown)"
                 if old_primary:
                     pool.mark_rate_limited(old_primary)
                 new_primary = pool.promote_fresh()
                 if new_primary:
-                    os.environ["CLAUDE_FORCE_ACCOUNT"] = new_primary
+                    os.environ[force_env] = new_primary
                     print(
                         f"[long-exposure] Pool: primary {old_label} "
                         f"rate-limited; promoted to {Path(new_primary).name}. "
@@ -3301,7 +3633,7 @@ def run_exploration(
                         if _new_primary:
                             # (1) Hot-swap env var so the new primary actually
                             #     receives the next API call.
-                            os.environ["CLAUDE_FORCE_ACCOUNT"] = _new_primary
+                            os.environ[_provider.force_account_env()] = _new_primary
                             # (2) Clear cycle-agent session UUIDs (stale on
                             #     the new account). Compaction summaries in
                             #     agent_summaries stay; sessions.db gems are
@@ -3385,6 +3717,7 @@ def run_exploration(
     if _clear_requested:
         # Archive old state before clearing
         _archive_state(state_path)
+        _archive_local_session_logs(state_path.parent)
         # Clear: save empty state (sessions.db records preserved). Stamp
         # last_daily_sync_at to now so a subsequent resume from this
         # cleared state doesn't fire the daily sync on cycle 1 (with
@@ -3623,8 +3956,11 @@ def _cmd_clear(args):
     # If not running, archive and clear directly
     if sp.exists():
         _archive_state(sp)
+        _archive_local_session_logs(sp.parent)
         sp.unlink()
         print("[long-exposure] State archived and cleared.", flush=True)
+    else:
+        _archive_local_session_logs(sp.parent)
 
     (data_dir / "long-exposure.clear").write_text("")
     print("[long-exposure] Clear signal sent.", flush=True)

@@ -32,6 +32,7 @@ figures-arch = ["diagrams>=0.23"]
 long-exposure = "long_exposure.exploration:main"
 auto-compact = "auto_compact.cli:main"
 figure = "long_exposure.tools.figure:main"
+wolfram-batch = "long_exposure.tools.wolfram_batch:main"
 # Legacy aliases — silent forwards, dropped in v0.3 once muscle memory shifts.
 agent-exploration = "long_exposure.exploration:main"
 run-final-reporter = "run_final_reporter:main"

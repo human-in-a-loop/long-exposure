@@ -453,8 +453,36 @@ print(pool.format_pool_summary())
 ## Removing an account
 
 Drop the directory from `CLAUDE_ACCOUNT_POOL` and restart.
+
+## Codex Provider Pool
+
+When `llm_provider: codex` or `LONG_EXPOSURE_LLM_PROVIDER=codex` is
+active, the same state machine uses Codex-specific names:
+
+| Purpose | Claude | Codex |
+|---|---|---|
+| Pool env | `CLAUDE_ACCOUNT_POOL` / `CLAUDE_ACCOUNTS` | `CODEX_ACCOUNT_POOL` / `CODEX_HOMES` |
+| Force pin | `CLAUDE_FORCE_ACCOUNT` | `CODEX_FORCE_ACCOUNT` |
+| Child config/auth dir | `CLAUDE_CONFIG_DIR` | `CODEX_HOME` |
+| Pool state file | `~/.claude-pool-state.json` | `~/.codex-pool-state.json` |
+
+Each `CODEX_HOME` directory must be authenticated for the Codex CLI and
+verified with `codex exec` in a trusted workspace before adding it to
+`CODEX_ACCOUNT_POOL`.
 `_ensure_account_entries` removes any account entry not present in the
 new env-var list at the next init.
+
+## Gemini Provider Pool
+
+Gemini multi-account pooling is disabled for now. Gemini CLI supports
+`GEMINI_CLI_HOME`, but separate Google-account/free-tier homes require
+operator-managed OAuth setup and have not been live-validated under the
+long-exposure pool state machine.
+
+A Gemini run ignores `GEMINI_ACCOUNT_POOL` and `GEMINI_HOMES`; use a
+single authenticated Gemini CLI account. Parallel fan-out is still supported
+on that account because fan-out creates concurrent Gemini sessions, not
+separate account pins.
 
 ---
 

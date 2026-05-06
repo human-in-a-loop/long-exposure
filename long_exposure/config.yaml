@@ -1,8 +1,28 @@
 # config.yaml
 
 # === Model ===
+llm_provider: claude                  # claude | codex | gemini | local (local is an unsupported extension point)
 model: opus                          # alias (sonnet, opus, haiku) or full name
+codex_model: gpt-5.5                  # used when llm_provider: codex unless agent overrides model
+gemini_model: gemini-3-flash-preview  # used when llm_provider: gemini unless agent overrides model
+local_model: custom-local-model        # operator-supplied OpenAI-compatible model alias
+local_base_url: http://127.0.0.1:18080/v1
+local_context_window: 32768           # operator-supplied local context budget
+local_max_tokens: 2048
+local_recent_log_pct: 0.25            # inject at most 25% of context as recent per-agent transcript
+local_compact_max_tokens: 4096        # cap local compaction summaries
+local_temperature: 0.2
+local_top_p: 0.95
 context_window: 1000000
+codex_context_window: 400000          # Codex compacts at 90% of this value (360k)
+gemini_context_window: 1000000        # Gemini CLI free-tier docs advertise a 1M context window
+codex_yolo: true                      # run codex exec --yolo by default (bypass approvals/sandbox like claude -p)
+gemini_yolo: true                     # run gemini --yolo by default for autonomous headless turns
+gemini_auth_env: GOOGLE_GENAI_USE_GCA # default Google-account / Code Assist auth selector
+gemini_auth_value: "true"
+codex_subagents:
+  max_threads: 3                      # cap concurrent Codex subagent threads
+  max_depth: 1                        # direct children only; no recursive subagent trees
 model_tier: opus
 cli_timeout: 0                       # seconds per claude -p call (0 = no timeout)
 
@@ -62,10 +82,11 @@ anti_patterns_enabled: true
 # running a real exploration.
 working_directory: ""
 
-# Path to the `wolfram` binary for Wolfram Language scripts. Leave empty
-# if you don't have Wolfram installed — agents will be instructed not to
-# use it. Set to e.g. /usr/local/bin/wolfram or ~/bin/wolfram.
-wolfram_path: ""
+# Command for Wolfram Language scripts. Leave empty if you don't have
+# Wolfram installed — agents will be instructed not to use it.
+# Use `wolfram-batch` when interactive `wolfram` works but `wolfram -script`
+# or `wolframscript` fails in your environment. Set WOLFRAM_BIN if needed.
+wolfram_path: "wolfram-batch"
 
 # Tools allowed in non-interactive (-p) mode.
 # File tools are automatically scoped to working_directory above.

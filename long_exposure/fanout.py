@@ -31,6 +31,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from long_exposure import provider as _provider
+
 
 # Lazy-import delegators for names defined in long_exposure.exploration.
 #
@@ -883,10 +885,11 @@ def _spawn_clone(
                 f"post-acquire ({_err}); update_slot_pid will be skipped",
                 flush=True,
             )
-        env["CLAUDE_FORCE_ACCOUNT"] = pinned_account_dir
-        # Drop CLAUDE_ACCOUNTS so the clone doesn't see the multi-account
+        env[_provider.force_account_env()] = pinned_account_dir
+        # Drop provider pool envs so the clone doesn't see the multi-account
         # retry loop in call_claude — pinned accounts must single-attempt.
-        env.pop("CLAUDE_ACCOUNTS", None)
+        for env_name in _provider.account_pool_envs():
+            env.pop(env_name, None)
         print(
             f"[long-exposure]   clone-{clone_k}: pinned to "
             f"{Path(pinned_account_dir).name}",
@@ -1748,4 +1751,3 @@ def _run_fanout_conductor(
         "clone_dirs": [str(p) for p in clone_dirs],
         "outcomes": outcomes,
     }
-

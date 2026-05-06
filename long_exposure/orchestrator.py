@@ -19,8 +19,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import uuid
 import xml.etree.ElementTree as _ET
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +47,7 @@ from auto_compact.proximity import (
 )
 
 from long_exposure import pool as _pool
+from long_exposure import provider as _provider
 
 # ---------------------------------------------------------------------------
 # Directory setup
@@ -1295,7 +1299,25 @@ def load_config(path: str | Path | None = None) -> dict:
 
     defaults = {
         "model": "opus",
+        "llm_provider": "claude",
+        "codex_model": "gpt-5.5",
+        "gemini_model": "gemini-3-flash-preview",
+        "local_model": "custom-local-model",
+        "local_base_url": "http://127.0.0.1:18080/v1",
+        "local_context_window": 32768,
+        "local_max_tokens": 2048,
+        "local_recent_log_pct": 0.25,
+        "local_compact_max_tokens": 4096,
+        "local_temperature": 0.2,
+        "local_top_p": 0.95,
         "context_window": 1_000_000,
+        "codex_context_window": 400_000,
+        "gemini_context_window": 1_000_000,
+        "codex_yolo": True,
+        "gemini_yolo": True,
+        "gemini_auth_env": "GOOGLE_GENAI_USE_GCA",
+        "gemini_auth_value": "true",
+        "codex_subagents": {"max_threads": 3, "max_depth": 1},
         "model_tier": "opus",
         "compact_threshold": 0.90,
         "compact_db": "./data/sessions.db",
@@ -1315,6 +1337,23 @@ def load_config(path: str | Path | None = None) -> dict:
     }
     for key, default in defaults.items():
         config.setdefault(key, default)
+    _provider.configure_provider(config)
+    config["llm_provider"] = _provider.current_provider()
+    if _provider.is_codex():
+        config["_claude_model"] = config.get("model")
+        if config.get("codex_model"):
+            config["model"] = config["codex_model"]
+        config["context_window"] = int(config.get("codex_context_window", 400_000))
+    elif _provider.is_gemini():
+        config["_claude_model"] = config.get("model")
+        if config.get("gemini_model"):
+            config["model"] = config["gemini_model"]
+        config["context_window"] = int(config.get("gemini_context_window", 1_000_000))
+    elif _provider.is_local():
+        config["_claude_model"] = config.get("model")
+        if config.get("local_model"):
+            config["model"] = config["local_model"]
+        config["context_window"] = int(config.get("local_context_window", 32768))
 
     # Resolve compact_db relative to config file
     db_path = Path(config["compact_db"])
@@ -1600,6 +1639,60 @@ _PEER_DIRECTIVE_ON = (
     "SendMessage is a full teammate wake, so batch where it's natural."
 )
 
+_CODEX_SUBAGENTS_TEMPLATE = """\
+<subagents>
+  Codex subagents are available for this turn. Use them for independent
+  sub-work when doing so materially shortens the turn: parameter sweeps,
+  separate artifact reviews, parallel data checks, and bounded
+  implementation slices.
+
+  Runtime facts:
+    - Subagents inherit the lead's sandbox and approval posture. This
+      long-exposure Codex run starts the lead with --yolo, so subagents
+      inherit the same no-approval/no-sandbox execution mode.
+    - Concurrent subagent threads are capped at {max_threads}.
+    - Spawn depth is capped at {max_depth}; do not ask subagents to spawn
+      further subagents.
+
+  Use Codex's built-in subagent roles by task shape:
+    - explorer: read-heavy codebase or artifact investigation.
+    - worker: bounded implementation, repair, generation, or validation.
+    - default: any task that does not fit those two roles.
+
+  Preserve the same role, effort, and budget discipline in every delegated
+  prompt:
+    "Effort: {effort} (match the lead)."
+    "Response budget: produce a response no longer than {teammate_response_budget_tokens} tokens."
+
+  The lead owns the final [OUTPUT: ...] markers. Subagent replies are
+  inputs to synthesis, not substitutes.
+</subagents>"""
+
+_GEMINI_PARALLELISM_TEMPLATE = """\
+<gemini-parallelism>
+  Gemini CLI is the active provider for this turn. Preserve the same
+  role, effort, and budget discipline you would use under Claude or
+  Codex.
+
+  Runtime facts:
+    - This run uses Gemini CLI headless mode with yolo approval for normal
+      agent turns.
+    - Gemini native subagents are NOT enabled for this integration. Do not
+      attempt to spawn Gemini subagents or wait for subagent availability.
+    - Context window: {context_window_tokens}; compact at {compact_at_tokens}.
+    - Response budget for any delegated/narrow sub-work: no more than
+      {teammate_response_budget_tokens} tokens.
+
+  Parallelism discipline:
+    - For independent work that needs its own build/test/audit loop, prefer
+      long-exposure whole-cycle fan-out via the researcher.
+    - Whole-cycle fan-out launches multiple independent Gemini CLI sessions
+      concurrently; use that path for real parallelism.
+    - Within this single turn, do bounded serial decomposition only. Clearly
+      mark independent follow-up branches for the next researcher instead of
+      pretending native subagents exist.
+</gemini-parallelism>"""
+
 
 def agent_teams_enabled(agent_def: dict, config: dict) -> bool:
     """Single source of truth for whether the team feature is active.
@@ -1634,6 +1727,22 @@ def build_team_guidance_block(config: dict) -> str:
         if defaults.get("allow_peer_messages", False)
         else _PEER_DIRECTIVE_OFF
     )
+
+    if _provider.is_codex():
+        subagents = config.get("codex_subagents") or {}
+        return _CODEX_SUBAGENTS_TEMPLATE.format(
+            effort=config.get("effort", "high"),
+            teammate_response_budget_tokens=f"{teammate_budget:,}",
+            max_threads=int(subagents.get("max_threads", 3)),
+            max_depth=int(subagents.get("max_depth", 1)),
+        )
+
+    if _provider.is_gemini():
+        return _GEMINI_PARALLELISM_TEMPLATE.format(
+            context_window_tokens=f"{context_window:,}",
+            compact_at_tokens=f"{compact_at:,}",
+            teammate_response_budget_tokens=f"{teammate_budget:,}",
+        )
 
     return _AGENT_TEAMS_TEMPLATE.format(
         model=config.get("model", "opus"),
@@ -1764,37 +1873,48 @@ def assemble_system_prompt(
 
     # --- Layer 5: Context Gems (only if provided) ---
     if gems_xml:
-        gem_instructions = (
-            "[CONTEXT GEMS]\n\n"
-            "Context gems are pre-ranked pointers to past sessions that are likely\n"
-            "relevant to your current work. Before starting:\n\n"
-            "1. Read the gems. They are brief — this takes seconds.\n"
-            "2. If a gem is directly relevant to your current task, fetch the full\n"
-            "   session with search_sessions_by_id(session_id) before proceeding.\n"
-            "3. If no gems seem relevant, proceed normally. They are guidance,\n"
-            "   not requirements.\n"
-            "4. Do not spend more than one checkpoint worth of budget reviewing\n"
-            "   gems. Glance, note what's useful, move on.\n\n"
-            f"{gems_xml}"
-        )
+        if _provider.is_claude():
+            gem_instructions = (
+                "[CONTEXT GEMS]\n\n"
+                "Context gems are pre-ranked pointers to past sessions that are likely\n"
+                "relevant to your current work. Before starting:\n\n"
+                "1. Read the gems. They are brief — this takes seconds.\n"
+                "2. If a gem is directly relevant to your current task, fetch the full\n"
+                "   session with search_sessions_by_id(session_id) before proceeding.\n"
+                "3. If no gems seem relevant, proceed normally. They are guidance,\n"
+                "   not requirements.\n"
+                "4. Do not spend more than one checkpoint worth of budget reviewing\n"
+                "   gems. Glance, note what's useful, move on.\n\n"
+                f"{gems_xml}"
+            )
+        else:
+            gem_instructions = (
+                "[CONTEXT GEMS]\n\n"
+                "Context gems are pre-ranked summaries of past sessions likely\n"
+                "relevant to your current work. This provider does not expose the\n"
+                "session-search MCP tools in-process, so use only the summaries\n"
+                "included below and proceed normally if they are not enough.\n\n"
+                f"{gems_xml}"
+            )
         prompt_parts.append(gem_instructions)
 
     # --- Layer 6: Tool Definitions ---
-    prompt_parts.append(
-        "[AVAILABLE TOOLS]\n\n"
-        "You have access to session history tools:\n\n"
-        "1. search_sessions(query, limit)\n"
-        "   Search past session summaries by content (FTS).\n"
-        "   Parameters: query (string, required), limit (integer, optional, default 5, max 20)\n\n"
-        "2. search_sessions_by_id(session_id)\n"
-        "   Retrieve a specific session's full summary by ID.\n"
-        "   Use this to get full context for a session found via gems or the catalog.\n"
-        "   Parameters: session_id (string, required)\n\n"
-        "3. list_session_catalog(topic_filter, tools_filter, limit)\n"
-        "   Browse session metadata (topic, subtopic, tools, keywords).\n"
-        "   All parameters optional. Useful for discovering what sessions exist.\n"
-        "   Parameters: topic_filter (string), tools_filter (string), limit (integer, default 25)"
-    )
+    if _provider.is_claude():
+        prompt_parts.append(
+            "[AVAILABLE TOOLS]\n\n"
+            "You have access to session history tools:\n\n"
+            "1. search_sessions(query, limit)\n"
+            "   Search past session summaries by content (FTS).\n"
+            "   Parameters: query (string, required), limit (integer, optional, default 5, max 20)\n\n"
+            "2. search_sessions_by_id(session_id)\n"
+            "   Retrieve a specific session's full summary by ID.\n"
+            "   Use this to get full context for a session found via gems or the catalog.\n"
+            "   Parameters: session_id (string, required)\n\n"
+            "3. list_session_catalog(topic_filter, tools_filter, limit)\n"
+            "   Browse session metadata (topic, subtopic, tools, keywords).\n"
+            "   All parameters optional. Useful for discovering what sessions exist.\n"
+            "   Parameters: topic_filter (string), tools_filter (string), limit (integer, default 25)"
+        )
 
     return "\n\n".join(prompt_parts)
 
@@ -2052,6 +2172,14 @@ _ACCOUNT_STATE_PATH = Path.home() / ".claude-accounts-state.json"
 _ACCOUNT_LOCK_PATH = Path.home() / ".claude-accounts-state.lock"
 
 
+def _account_state_path() -> Path:
+    return _provider.accounts_state_path()
+
+
+def _account_lock_path() -> Path:
+    return _provider.accounts_lock_path()
+
+
 @contextmanager
 def _account_state_lock():
     """Exclusive advisory lock for account-state read-modify-write cycles.
@@ -2067,7 +2195,7 @@ def _account_state_lock():
     cannot be opened, so this never introduces a new failure mode.
     """
     try:
-        fh = open(_ACCOUNT_LOCK_PATH, "a+")
+        fh = open(_account_lock_path(), "a+")
     except OSError:
         yield
         return
@@ -2107,7 +2235,11 @@ def _parse_accounts() -> list[str | None]:
     an empty list — a pathological CLAUDE_ACCOUNTS value like ",, " falls
     back to [None] so rotate_to_next_account can't divide by zero.
     """
-    raw = os.environ.get("CLAUDE_ACCOUNTS", "").strip()
+    raw = ""
+    for env_name in _provider.account_pool_envs():
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            break
     if not raw:
         return [None]
     parsed = [p.strip() for p in raw.split(",") if p.strip()]
@@ -2121,7 +2253,7 @@ def _resolve_force_account(accounts: list[str | None]) -> tuple[bool, str | None
     meaningless. When True, pinned_dir is either a path or None (meaning
     "default ~/.claude").
     """
-    raw = os.environ.get("CLAUDE_FORCE_ACCOUNT", "").strip()
+    raw = os.environ.get(_provider.force_account_env(), "").strip()
     if not raw:
         return False, None
     if raw.isdigit():
@@ -2137,7 +2269,7 @@ def _resolve_force_account(accounts: list[str | None]) -> tuple[bool, str | None
 def _load_account_state() -> dict:
     """Load persisted account state. Missing/corrupt → fresh state."""
     try:
-        return json.loads(_ACCOUNT_STATE_PATH.read_text())
+        return json.loads(_account_state_path().read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {"active_index": 0}
 
@@ -2151,15 +2283,16 @@ def _save_account_state(state: dict) -> None:
     events log so a recurring write failure (e.g., disk full) is visible.
     """
     try:
-        tmp = _ACCOUNT_STATE_PATH.with_suffix(".json.tmp")
+        state_path = _account_state_path()
+        tmp = state_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state))
-        os.replace(tmp, _ACCOUNT_STATE_PATH)
+        os.replace(tmp, state_path)
     except OSError as _e:
         try:
             from long_exposure import health_events as _he
             _he.append_event(
                 "account_state_save_failed",
-                detail=f"path={_ACCOUNT_STATE_PATH} err={type(_e).__name__}: {_e}",
+                detail=f"path={_account_state_path()} err={type(_e).__name__}: {_e}",
             )
         except Exception:
             pass
@@ -2191,7 +2324,7 @@ def _active_account_index() -> int:
     accounts = _parse_accounts()
     is_forced, _ = _resolve_force_account(accounts)
     if is_forced:
-        raw = os.environ.get("CLAUDE_FORCE_ACCOUNT", "").strip()
+        raw = os.environ.get(_provider.force_account_env(), "").strip()
         return int(raw) % max(1, len(accounts)) if raw.isdigit() else 0
     return _load_account_state().get("active_index", 0) % max(1, len(accounts))
 
@@ -2275,6 +2408,253 @@ def _is_rate_limit(
     return False
 
 
+def _codex_yolo_enabled(config: dict | None = None) -> bool:
+    if config is None:
+        return True
+    return bool(config.get("codex_yolo", True))
+
+
+def _codex_subagent_flags(config: dict | None = None) -> list[str]:
+    cfg = (config or {}).get("codex_subagents") or {}
+    max_threads = int(cfg.get("max_threads", 3))
+    max_depth = int(cfg.get("max_depth", 1))
+    return [
+        "-c", f"agents.max_threads={max_threads}",
+        "-c", f"agents.max_depth={max_depth}",
+    ]
+
+
+def _codex_permission_flags(
+    config: dict | None = None,
+    *,
+    disable_tools: bool = False,
+    resume: bool = False,
+) -> list[str]:
+    """Translate long-exposure's Codex execution posture to CLI flags.
+
+    Claude has per-tool allowlist flags. Codex's closest non-interactive
+    analogue for long-exposure is yolo/full-auto execution: no approval
+    prompts, no sandbox wall, with workspace boundaries carried by
+    long-exposure's prompt guidance and explicit cwd. When tools are
+    disabled for summary calls, keep Codex conservative instead.
+    """
+    flags: list[str] = []
+    if not disable_tools and _codex_yolo_enabled(config):
+        flags.append("--yolo")
+    elif disable_tools and not resume:
+        flags.extend(["-s", "read-only"])
+    elif not resume:
+        flags.extend(["-s", "workspace-write"])
+    flags.extend(_codex_subagent_flags(config))
+    return flags
+
+
+def _gemini_yolo_enabled(config: dict | None = None) -> bool:
+    if config is None:
+        return True
+    return bool(config.get("gemini_yolo", True))
+
+
+def _gemini_permission_flags(
+    config: dict | None = None,
+    *,
+    disable_tools: bool = False,
+) -> list[str]:
+    flags = ["--skip-trust"]
+    if disable_tools:
+        flags.extend(["--approval-mode", "plan"])
+    elif _gemini_yolo_enabled(config):
+        flags.append("--yolo")
+    if config and not disable_tools:
+        allowed = _gemini_allowed_tool_names(config)
+        if allowed:
+            flags.extend(["--allowed-tools", ",".join(allowed)])
+    return flags
+
+
+def _is_codex_command(cmd: list[str]) -> bool:
+    return bool(cmd) and Path(cmd[0]).name == "codex"
+
+
+def _is_gemini_command(cmd: list[str]) -> bool:
+    return bool(cmd) and Path(cmd[0]).name == "gemini"
+
+
+def _extract_codex_envelope(stdout: str, final_text: str, duration_ms: int) -> dict | None:
+    thread_id = None
+    usage = {}
+    saw_event = False
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        saw_event = True
+        if event.get("type") == "thread.started":
+            thread_id = event.get("thread_id") or thread_id
+        elif event.get("type") == "turn.completed":
+            usage = event.get("usage") or usage
+        elif event.get("type") == "error":
+            return {
+                "result": event.get("message") or final_text,
+                "usage": usage,
+                "duration_ms": duration_ms,
+                "session_id": thread_id,
+                "is_error": True,
+            }
+    if not saw_event and not final_text:
+        return None
+    return {
+        "result": final_text,
+        "usage": usage,
+        "duration_ms": duration_ms,
+        "session_id": thread_id,
+    }
+
+
+def _flatten_gemini_model_stats(stats: dict) -> dict:
+    usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+    models = (stats or {}).get("models") or {}
+    for model_stats in models.values():
+        tokens = (model_stats or {}).get("tokens") or {}
+        usage["input_tokens"] += int(tokens.get("input") or tokens.get("prompt") or 0)
+        usage["output_tokens"] += int(tokens.get("candidates") or 0)
+        usage["cache_read_input_tokens"] += int(tokens.get("cached") or 0)
+    return usage
+
+
+def _extract_gemini_envelope(stdout: str, duration_ms: int) -> dict | None:
+    if not stdout:
+        return None
+    try:
+        raw = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    error = raw.get("error") if isinstance(raw, dict) else None
+    if error:
+        return {
+            "result": str(error.get("message") if isinstance(error, dict) else error),
+            "usage": {},
+            "duration_ms": duration_ms,
+            "session_id": raw.get("session_id"),
+            "is_error": True,
+        }
+    response = raw.get("response") if isinstance(raw, dict) else None
+    if response is None:
+        response = raw.get("result", "") if isinstance(raw, dict) else ""
+    return {
+        "result": response or "",
+        "usage": _flatten_gemini_model_stats(raw.get("stats") or {}),
+        "duration_ms": duration_ms,
+        "session_id": raw.get("session_id"),
+    }
+
+
+def _configure_gemini_auth_env(env: dict, config: dict | None = None) -> None:
+    cfg = config or {}
+    if any(env.get(k) for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA")):
+        return
+    key = cfg.get("gemini_auth_env") or "GOOGLE_GENAI_USE_GCA"
+    value = str(cfg.get("gemini_auth_value", "true"))
+    if key:
+        env[key] = value
+
+
+def _add_repo_to_pythonpath(env: dict) -> None:
+    """Make bundled long_exposure tools importable from agent workspaces."""
+    repo_root = str(SCRIPT_DIR.parent)
+    existing = env.get("PYTHONPATH", "")
+    parts = [p for p in existing.split(os.pathsep) if p]
+    if repo_root not in parts:
+        env["PYTHONPATH"] = os.pathsep.join([repo_root, *parts])
+
+
+def _local_base_url(config: dict | None = None) -> str:
+    raw = (config or {}).get("local_base_url") or os.environ.get("LONG_EXPOSURE_LOCAL_BASE_URL")
+    return (raw or "http://127.0.0.1:18080/v1").rstrip("/")
+
+
+def call_local_llm(
+    prompt: str,
+    system_prompt: str = "",
+    model: str = "custom-local-model",
+    timeout: int = 0,
+    config: dict | None = None,
+) -> dict:
+    """Call a local OpenAI-compatible chat-completions endpoint.
+
+    This is intentionally stateless. Durable continuity remains in
+    long-exposure's file-backed prompts, summaries, gems, and cycle outputs;
+    the local runtime is just a local inference engine.
+    """
+    cfg = config or {}
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": model or cfg.get("local_model", "custom-local-model"),
+        "messages": messages,
+        "max_tokens": int(cfg.get("local_max_tokens", 2048)),
+        "temperature": float(cfg.get("local_temperature", 0.2)),
+        "top_p": float(cfg.get("local_top_p", 0.95)),
+        "stream": False,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = Request(
+        f"{_local_base_url(cfg)}/chat/completions",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    started = datetime.now(timezone.utc)
+    try:
+        with urlopen(req, timeout=timeout or int(cfg.get("local_timeout", 600))) as resp:
+            raw = resp.read().decode("utf-8")
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:500]
+        raise ClaudeCliError(f"local LLM HTTP {e.code}: {body}") from e
+    except URLError as e:
+        raise ClaudeCliError(
+            f"local LLM endpoint unavailable at {_local_base_url(cfg)}: {e.reason}"
+        ) from e
+
+    duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+    try:
+        envelope = json.loads(raw)
+        choices = envelope.get("choices") or []
+        message = (choices[0] or {}).get("message") or {}
+        text = message.get("content") or ""
+    except (json.JSONDecodeError, AttributeError, IndexError, TypeError) as e:
+        raise ClaudeCliError(f"local LLM returned malformed JSON: {raw[:300]!r}") from e
+
+    if not text and envelope.get("error"):
+        raise ClaudeCliError(f"local LLM error: {str(envelope.get('error'))[:500]}")
+
+    usage = dict(envelope.get("usage", {}) or {})
+    if "input_tokens" not in usage and "prompt_tokens" in usage:
+        usage["input_tokens"] = usage.get("prompt_tokens", 0)
+    if "output_tokens" not in usage and "completion_tokens" in usage:
+        usage["output_tokens"] = usage.get("completion_tokens", 0)
+
+    return {
+        "result": text,
+        "usage": usage,
+        "duration_ms": duration_ms,
+        "session_id": envelope.get("id"),
+    }
+
+
 def _invoke_claude(
     cmd: list[str],
     stdin_text: str,
@@ -2301,9 +2681,24 @@ def _invoke_claude(
     """
     env = (env_base if env_base is not None else os.environ).copy()
     env.pop("CLAUDECODE", None)
+    _add_repo_to_pythonpath(env)
     acct_dir = _active_account_dir()
     if acct_dir:
-        env["CLAUDE_CONFIG_DIR"] = acct_dir
+        env[_provider.child_config_env()] = acct_dir
+    if _is_gemini_command(cmd):
+        try:
+            _configure_gemini_auth_env(env, load_config())
+        except Exception:
+            _configure_gemini_auth_env(env, None)
+
+    output_file = None
+    if _is_codex_command(cmd):
+        for i, arg in enumerate(cmd):
+            if arg in ("-o", "--output-last-message") and i + 1 < len(cmd):
+                output_file = Path(cmd[i + 1])
+                break
+
+    started = datetime.now(timezone.utc)
 
     try:
         result = subprocess.run(
@@ -2316,7 +2711,76 @@ def _invoke_claude(
             env=env,
         )
     except subprocess.TimeoutExpired as e:
-        raise ClaudeCliError(f"Claude CLI timed out after {timeout}s") from e
+        if output_file:
+            try:
+                output_file.unlink()
+            except OSError:
+                pass
+        raise ClaudeCliError(f"{_provider.current_provider()} CLI timed out after {timeout}s") from e
+
+    duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+
+    if _is_codex_command(cmd):
+        final_text = ""
+        if output_file:
+            try:
+                final_text = output_file.read_text()
+            except OSError:
+                final_text = ""
+            try:
+                output_file.unlink()
+            except OSError:
+                pass
+        envelope = _extract_codex_envelope(result.stdout, final_text, duration_ms)
+        if _is_rate_limit(result.returncode, result.stderr, result.stdout, envelope):
+            snippet = (result.stderr or result.stdout or final_text or "")[:300]
+            raise ClaudeRateLimitError(
+                f"codex account rate-limited (exit {result.returncode}): {snippet}"
+            )
+        if result.returncode != 0:
+            raise ClaudeCliError(
+                f"codex CLI exited with code {result.returncode}: "
+                f"{(result.stderr or result.stdout)[:500]}"
+            )
+        if envelope is None:
+            raise ClaudeCliError(
+                "Failed to parse codex JSONL output "
+                f"(stdout prefix: {(result.stdout or '')[:200]!r})"
+            )
+        if envelope.get("is_error") is True:
+            msg = (envelope.get("result") or "").strip()[:500] or "api error"
+            raise ClaudeCliError(f"codex CLI API error: {msg}")
+        if acct_dir and _pool.is_active():
+            usage = envelope.get("usage") or {}
+            if usage:
+                _pool.record_usage(acct_dir, usage)
+        return envelope
+
+    if _is_gemini_command(cmd):
+        envelope = _extract_gemini_envelope(result.stdout, duration_ms)
+        if _is_rate_limit(result.returncode, result.stderr, result.stdout, envelope):
+            snippet = (result.stderr or result.stdout or "")[:300]
+            raise ClaudeRateLimitError(
+                f"gemini account rate-limited (exit {result.returncode}): {snippet}"
+            )
+        if result.returncode != 0:
+            raise ClaudeCliError(
+                f"gemini CLI exited with code {result.returncode}: "
+                f"{(result.stderr or result.stdout)[:500]}"
+            )
+        if envelope is None:
+            raise ClaudeCliError(
+                "Failed to parse gemini JSON output "
+                f"(stdout prefix: {(result.stdout or '')[:200]!r})"
+            )
+        if envelope.get("is_error") is True:
+            msg = (envelope.get("result") or "").strip()[:500] or "api error"
+            raise ClaudeCliError(f"gemini CLI API error: {msg}")
+        if acct_dir and _pool.is_active():
+            usage = envelope.get("usage") or {}
+            if usage:
+                _pool.record_usage(acct_dir, usage)
+        return envelope
 
     # Parse envelope eagerly when possible so rate-limit classification has
     # access to structured fields even on exit 0.
@@ -2330,7 +2794,8 @@ def _invoke_claude(
     if _is_rate_limit(result.returncode, result.stderr, result.stdout, envelope):
         snippet = (result.stderr or "")[:300] or (result.stdout or "")[:300]
         raise ClaudeRateLimitError(
-            f"Claude account rate-limited (exit {result.returncode}): {snippet}"
+            f"{_provider.current_provider()} account rate-limited "
+            f"(exit {result.returncode}): {snippet}"
         )
 
     if result.returncode != 0:
@@ -2383,36 +2848,93 @@ def call_claude(
     call, raises ClaudeRateLimitError so the caller can wait via its own
     existing cooldown path.
     """
-    cmd = [
-        "claude", "-p",
-        "--output-format", "json",
-        "--model", model,
-        "--no-session-persistence",
-    ]
+    if _provider.is_local():
+        return call_local_llm(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            model=model,
+            timeout=timeout,
+            config=load_config(),
+        )
 
-    if effort:
-        cmd.extend(["--effort", effort])
-    if disable_tools:
-        cmd.extend(["--tools", ""])
-    if mcp_config:
-        cmd.extend(["--mcp-config", mcp_config])
-    if permission_flags:
-        cmd.extend(permission_flags)
-    if system_prompt:
-        cmd.extend(["--system-prompt", system_prompt])
+    tmp_last = None
+    if _provider.is_codex():
+        effective_cwd = cwd or os.getcwd()
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.close()
+        tmp_last = tmp.name
+        codex_prefix = ["codex"]
+        if not disable_tools and permission_flags and any("WebSearch" in f for f in permission_flags):
+            codex_prefix.append("--search")
+        cmd = [
+            *codex_prefix, "exec",
+            "--json",
+            "--ephemeral",
+            "-m", model,
+            "-o", tmp_last,
+        ]
+        codex_cfg = load_config()
+        cmd.extend(_codex_permission_flags(codex_cfg, disable_tools=disable_tools))
+        cmd.extend(["-C", effective_cwd])
+        combined_prompt = (
+            f"[SYSTEM PROMPT]\n\n{system_prompt}\n\n[USER PROMPT]\n\n{prompt}"
+            if system_prompt else prompt
+        )
+        prompt_for_cli = combined_prompt
+        cmd.append("-")
+        cwd_for_cli = effective_cwd
+    elif _provider.is_gemini():
+        effective_cwd = cwd or os.getcwd()
+        gemini_cfg = load_config()
+        gemini_cfg["working_directory"] = effective_cwd
+        if mcp_config:
+            gemini_cfg["compact_db"] = gemini_cfg.get("compact_db")
+        generate_gemini_project_settings(gemini_cfg)
+        cmd = [
+            "gemini",
+            *_gemini_permission_flags(gemini_cfg, disable_tools=disable_tools),
+            "--output-format", "json",
+            "-m", model,
+            "-p", "",
+        ]
+        prompt_for_cli = (
+            f"[SYSTEM PROMPT]\n\n{system_prompt}\n\n[USER PROMPT]\n\n{prompt}"
+            if system_prompt else prompt
+        )
+        cwd_for_cli = effective_cwd
+    else:
+        cmd = [
+            "claude", "-p",
+            "--output-format", "json",
+            "--model", model,
+            "--no-session-persistence",
+        ]
+
+        if effort:
+            cmd.extend(["--effort", effort])
+        if disable_tools:
+            cmd.extend(["--tools", ""])
+        if mcp_config:
+            cmd.extend(["--mcp-config", mcp_config])
+        if permission_flags:
+            cmd.extend(permission_flags)
+        if system_prompt:
+            cmd.extend(["--system-prompt", system_prompt])
+        prompt_for_cli = prompt
+        cwd_for_cli = cwd
 
     accounts = _parse_accounts()
     is_forced, _pin = _resolve_force_account(accounts)
 
     if is_forced or len(accounts) == 1:
         # Single-account or pinned: one attempt, rate-limit bubbles up.
-        return _invoke_claude(cmd, prompt, cwd=cwd, timeout=timeout or None)
+        return _invoke_claude(cmd, prompt_for_cli, cwd=cwd_for_cli, timeout=timeout or None)
 
     # Multi-account: try up to len(accounts) times, rotating on rate-limit.
     last_err: ClaudeRateLimitError | None = None
     for attempt in range(len(accounts)):
         try:
-            return _invoke_claude(cmd, prompt, cwd=cwd, timeout=timeout or None)
+            return _invoke_claude(cmd, prompt_for_cli, cwd=cwd_for_cli, timeout=timeout or None)
         except ClaudeRateLimitError as e:
             last_err = e
             prev, new, new_dir = rotate_to_next_account()
@@ -2448,13 +2970,14 @@ def call_claude_pool_aware(*args, **kwargs) -> dict:
     try:
         return call_claude(*args, **kwargs)
     except ClaudeRateLimitError:
-        pinned = os.environ.get("CLAUDE_FORCE_ACCOUNT", "").strip()
+        force_env = _provider.force_account_env()
+        pinned = os.environ.get(force_env, "").strip()
         if pinned:
             _pool.mark_rate_limited(pinned)
         new_primary = _pool.promote_fresh()
         if not new_primary or new_primary == pinned:
             raise
-        os.environ["CLAUDE_FORCE_ACCOUNT"] = new_primary
+        os.environ[force_env] = new_primary
         print(
             f"[orchestrator] Pool: primary rate-limited; promoted -> "
             f"{Path(new_primary).name}; retrying.",
@@ -2533,6 +3056,105 @@ def generate_mcp_config(
     tmp_path.write_text(json.dumps(config_data, indent=2))
     os.replace(tmp_path, config_path)
     return str(config_path)
+
+
+def _gemini_tool_name(tool: str) -> str | None:
+    raw = str(tool).strip()
+    if not raw:
+        return None
+    name = raw.split("(", 1)[0].strip()
+    arg = raw[len(name):].strip()
+    if name == "Read":
+        return "read_file"
+    if name == "Write":
+        return "write_file"
+    if name == "Edit":
+        return "replace"
+    if name == "Glob":
+        return "glob"
+    if name == "Grep":
+        return "grep_search"
+    if name == "WebSearch":
+        return "google_web_search"
+    if name == "WebFetch":
+        return "web_fetch"
+    if name == "Bash":
+        if arg.startswith("(") and arg.endswith(")"):
+            command = arg[1:-1].strip()
+            command = command.split(":", 1)[0].strip()
+            command = command.split()[0] if command else ""
+            if command and "*" not in command:
+                return f"run_shell_command({command})"
+        return "run_shell_command"
+    return None
+
+
+def _gemini_allowed_tool_names(config: dict) -> list[str]:
+    tools = config.get("allowed_tools", [])
+    if tools == "dangerously_skip_all":
+        return [
+            "read_file", "write_file", "replace", "glob", "grep_search",
+            "list_directory", "run_shell_command", "google_web_search", "web_fetch",
+        ]
+    names = {"list_directory"}
+    for tool in tools or []:
+        mapped = _gemini_tool_name(str(tool))
+        if mapped:
+            names.add(mapped)
+    return sorted(names)
+
+
+def generate_gemini_project_settings(config: dict) -> str | None:
+    """Merge long-exposure Gemini tool/MCP settings into .gemini/settings.json.
+
+    Gemini CLI reads project-local `.gemini/settings.json` from the subprocess
+    cwd. This avoids changing GEMINI_CLI_HOME, which would isolate OAuth
+    credentials and break the authenticated free-tier path.
+    """
+    cwd = Path(config.get("working_directory") or os.getcwd()).resolve()
+    settings_dir = cwd / ".gemini"
+    settings_path = settings_dir / "settings.json"
+    try:
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            current = json.loads(settings_path.read_text())
+            if not isinstance(current, dict):
+                current = {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            current = {}
+
+        tools_cfg = dict(current.get("tools") or {})
+        tools_cfg["core"] = _gemini_allowed_tool_names(config)
+        # `allowed` marks matching tools/commands trusted under yolo. Keep it
+        # aligned with core so agent-type permission scopes are not widened.
+        tools_cfg["allowed"] = list(tools_cfg["core"])
+        current["tools"] = tools_cfg
+
+        db_path = config.get("compact_db")
+        if db_path:
+            mcp_servers = dict(current.get("mcpServers") or {})
+            mcp_servers["sessions"] = {
+                "command": sys.executable,
+                "args": [str(SCRIPT_DIR / "mcp_search_server.py")],
+                "env": {"SESSIONS_DB": str(db_path)},
+                "trust": True,
+                "includeTools": [
+                    "search_sessions",
+                    "search_sessions_by_id",
+                    "list_session_catalog",
+                ],
+            }
+            current["mcpServers"] = mcp_servers
+            current["mcp"] = {"allowed": ["sessions"]}
+
+        tmp_path = settings_path.with_name(
+            f"settings.json.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        )
+        tmp_path.write_text(json.dumps(current, indent=2))
+        os.replace(tmp_path, settings_path)
+        return str(settings_path)
+    except OSError:
+        return None
 
 
 def resolve_instance_dir(cli_flag: str | None) -> Path | None:

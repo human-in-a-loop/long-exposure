@@ -84,6 +84,7 @@ allowed_tools:
   - Edit
   - Glob
   - Grep
+  - "Bash(wolfram-batch *)"
   - "Bash(wolfram *)"
   - "Bash(wolframscript *)"
   # Python — path-independent. Bare forms match PATH-resolved invocations;
@@ -779,6 +780,7 @@ agents:
       - Edit
       - Glob
       - Grep
+      - "Bash(wolfram-batch *)"
       - "Bash(/usr/local/bin/wolfram *)"
       - "Bash(wolfram *)"
       - "Bash(wolframscript *)"
@@ -1005,6 +1007,7 @@ agents:
       - Edit
       - Glob
       - Grep
+      - "Bash(wolfram-batch *)"
       - "Bash(/usr/local/bin/wolfram *)"
       - "Bash(wolfram *)"
       - "Bash(wolframscript *)"
@@ -1243,6 +1246,7 @@ agents:
       - Edit
       - Glob
       - Grep
+      - "Bash(wolfram-batch *)"
       - "Bash(/usr/local/bin/wolfram *)"
       - "Bash(wolfram *)"
       - "Bash(wolframscript *)"

@@ -85,9 +85,10 @@ notes if you ever need to add another column.
 
 Each agent (researcher, worker, auditor, ...) maintains its own
 Claude Code session UUID across cycles. Conversation length grows
-each cycle. When token usage hits 90% of the context window
-(`compact_threshold = 0.90`, `context_window = 1_000_000` → 900k
-tokens), auto-compact fires.
+each cycle. When token usage hits 90% of the active provider context
+window, auto-compact fires. Claude defaults to
+`context_window = 1_000_000` → 900k tokens. Codex defaults to
+`codex_context_window = 400_000` → 360k tokens.
 
 ### The compaction cycle
 

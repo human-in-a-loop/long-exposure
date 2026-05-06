@@ -182,7 +182,37 @@ disk.
 
 ---
 
-## Agent-teams (intra-cycle)
+## Agent-teams / Codex subagents (intra-cycle)
+
+Claude-backed runs use Claude Code agent-teams. Codex-backed runs use
+Codex subagents. The long-exposure gating is the same: only agents with
+`agent_teams: true` and the master switch enabled receive intra-turn
+parallelism guidance. Provider-specific mechanics differ inside the
+runtime.
+
+Codex subagents:
+
+- Are enabled by current Codex releases and spawn only when the lead is
+  explicitly instructed to use them.
+- Inherit the lead's sandbox and approval posture; long-exposure starts
+  Codex leads with `--yolo`, so child subagents inherit that autonomous
+  mode.
+- Are capped by `codex_subagents.max_threads` and
+  `codex_subagents.max_depth` in `config.yaml`. The default is
+  `max_threads: 3`, `max_depth: 1`.
+- Use built-in roles by task shape: `explorer` for read-heavy
+  investigation, `worker` for bounded implementation/validation, and
+  `default` for general subtasks.
+
+Gemini-backed runs do not use native Gemini subagents. The Google-account /
+free-tier path does not provide dependable native subagent availability, so
+long-exposure injects Gemini-specific guidance telling workers and auditors not
+to spawn or wait for native subagents. Gemini parallelism still works through
+whole-cycle fan-out: each branch is a separate Python clone process with its
+own independent Gemini CLI session/thread, and the root barrier/merge behavior
+is unchanged.
+
+The rest of this section describes the Claude agent-teams runtime.
 
 When a worker or auditor faces embarrassingly-parallel sub-work
 within a single turn (parameter sweeps, cross-comparisons, batch
