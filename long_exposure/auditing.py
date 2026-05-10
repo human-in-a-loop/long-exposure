@@ -25,13 +25,19 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re as _re
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from long_exposure.limits import WALL_CAP_SECONDS
+from long_exposure import paths
+from long_exposure.limits import (
+    DELTA_DETECT_MIN_BYTES,
+    FINAL_STAGE_TOKEN_THRESHOLD,
+    WALL_CAP_SECONDS,
+)
 
 # Lazy-import wrappers for cycle-loop helpers, mirroring reporting.py's pattern.
 # Importing at module-load time creates a circular import (exploration.py
@@ -73,7 +79,7 @@ def _is_stop_requested() -> bool:
 # ---------------------------------------------------------------------------
 
 
-_TOKEN_THRESHOLD = 20_000
+_TOKEN_THRESHOLD = FINAL_STAGE_TOKEN_THRESHOLD
 _N_MAX = 5  # Stage 3 §4.4: cap removed; constant kept (one-line revertable).
 
 
@@ -179,7 +185,7 @@ def _compute_figure_coverage(workspace: Path) -> dict:
 def _estimate_audit_input_tokens(workspace: Path) -> int:
     plan = _count_tokens(workspace / "plan_of_record.md")
     ledger = _count_tokens(workspace / "promise_ledger.jsonl")
-    reports = sum(_count_tokens(p) for p in workspace.rglob("report_cycles_*.md"))
+    reports = sum(_count_tokens(p) for p in paths.iter_cycle_report_paths(workspace))
     closures = sum(_count_tokens(p) for p in _find_closure_docs(workspace))
     return plan + ledger + reports + closures
 
@@ -212,11 +218,85 @@ def _expected_file_for_stage(stage: int, n: int, workspace: Path) -> Path:
     """Each stage writes one file; the file is the gate."""
     label = _stage_label(stage, n)
     if label == "explore":
-        return workspace / "final_audit_explore.md"
+        return paths.final_audit_explore_path(workspace)
     if label == "document":
-        return workspace / "final_audit_report.md"
-    safe = label.replace("(", "").replace(")", "").replace(" ", "_").replace("/", "of")
-    return workspace / f"final_audit_{safe}.md"
+        return paths.final_audit_report_path(workspace)
+    return paths.final_audit_stage_path(workspace, label)
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+        return st.st_size, st.st_mtime_ns
+    except OSError:
+        return None
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{int(time.time() * 1000)}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _marker_metadata(marker_path: Path) -> dict | None:
+    if not marker_path.exists():
+        return None
+    try:
+        data = json.loads(marker_path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _committed_baseline(path: Path, marker_path: Path) -> tuple[bool, str, float | None]:
+    marker = _marker_metadata(marker_path)
+    if marker is not None and path.exists():
+        ts = marker.get("committed_at")
+        try:
+            boundary = datetime.fromisoformat(str(ts)).timestamp() if ts else marker_path.stat().st_mtime
+        except (OSError, ValueError):
+            boundary = None
+        return True, "marker", boundary
+    try:
+        if path.exists() and path.stat().st_size > DELTA_DETECT_MIN_BYTES:
+            return True, "legacy_size", None
+    except OSError:
+        pass
+    return False, "none", None
+
+
+def _write_commit_marker(marker_path: Path, *, run_id: str | None, mode: str, token_count: int) -> None:
+    payload = {
+        "committed_at": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "mode": mode,
+        "input_tokens": int(token_count),
+    }
+    try:
+        _atomic_write_text(marker_path, json.dumps(payload, indent=2) + "\n")
+    except OSError as e:
+        print(f"[long-exposure]   Audit commit marker write skipped: {e}", flush=True)
+
+
+def _write_run_mode(path: Path, payload: dict) -> None:
+    try:
+        _atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def _estimate_delta_report_tokens(workspace: Path, boundary_ts: float | None) -> int:
+    if boundary_ts is None:
+        return 0
+    chars = 0
+    for p in paths.iter_cycle_report_paths(workspace):
+        try:
+            if p.stat().st_mtime > boundary_ts:
+                chars += len(p.read_text())
+        except OSError:
+            continue
+    return chars // 4
 
 
 # ---------------------------------------------------------------------------
@@ -258,12 +338,8 @@ def _rescue_audit_stage_file(expected: Path, output_text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-_FINDINGS_FILE = "final_audit_findings.jsonl"
-_LESSON_CANDIDATES_FILE = "final_audit_lessons.jsonl"
-
-
 def _findings_path(workspace: Path) -> Path:
-    return workspace / _FINDINGS_FILE
+    return paths.findings_path(workspace)
 
 
 def _read_findings(workspace: Path) -> list[dict]:
@@ -329,14 +405,14 @@ def _commit_lessons(
     run_id: str | None,
     total_cycles: int,
 ) -> list[dict]:
-    """Read final_audit_lessons.jsonl, take the first N (in agent's stated rank
+    """Read audits/final/lessons.jsonl, take the first N (in agent's stated rank
     order), and commit them to sessions.db with record_type='lesson' and to
     LESSONS.md. Returns the list of committed lesson dicts.
 
     Hybrid enforcement (Plan 5 §2.2): the agent's role text states the cap and
     asks for ranking; this function enforces it deterministically regardless.
     """
-    p = workspace / _LESSON_CANDIDATES_FILE
+    p = paths.lessons_path(workspace)
     if not p.exists():
         return []
 
@@ -543,7 +619,7 @@ def _commit_reconciliation_events(workspace: Path, run_id: str, cycle: int) -> i
 
 def read_final_audit_summary(workspace: Path) -> dict | None:
     """Return the parsed final_audit_summary.json, or None if absent/invalid."""
-    p = workspace / "final_audit_summary.json"
+    p = paths.final_audit_summary_path(workspace)
     if not p.exists():
         return None
     try:
@@ -573,7 +649,9 @@ def _run_final_auditor(
     agent_summaries: dict | None = None,
 ) -> str | None:
     """Execute the final auditor in 2+2N stages with shared wall-cap."""
-    workspace = Path(config.get("working_directory") or ".")
+    workspace = paths.workspace_root(config.get("working_directory") or ".")
+    config["working_directory"] = str(workspace)
+    paths.ensure_layout(config)
     run_id = (
         results.get("run_id")
         or score_inputs.get("run_id")
@@ -581,8 +659,25 @@ def _run_final_auditor(
     )
 
     input_tokens = _estimate_audit_input_tokens(workspace)
-    n, total_stages = _final_auditor_stage_count(input_tokens)
+    audit_path = paths.final_audit_report_path(config)
+    marker_path = paths.final_audit_commit_marker_path(config)
+    delta_mode, delta_source, boundary_ts = _committed_baseline(audit_path, marker_path)
+    mode = "delta" if delta_mode else "fresh"
+    delta_tokens = _estimate_delta_report_tokens(workspace, boundary_ts) if delta_mode else 0
+    budget_tokens = max(delta_tokens, 1) if delta_mode and boundary_ts is not None else input_tokens
+    n, total_stages = _final_auditor_stage_count(budget_tokens)
     document_stage = total_stages  # last
+    _write_run_mode(paths.final_audit_run_mode_path(config), {
+        "agent": "final_auditor",
+        "mode": mode,
+        "detection_source": delta_source,
+        "canonical_path": str(audit_path),
+        "commit_marker": str(marker_path),
+        "baseline_boundary_ts": boundary_ts,
+        "total_input_tokens": input_tokens,
+        "budget_tokens": budget_tokens,
+        "stages": total_stages,
+    })
 
     print(f"\n{'='*60}", flush=True)
     print("[long-exposure] === Final Auditor ===", flush=True)
@@ -591,10 +686,17 @@ def _run_final_auditor(
         f"N={n}, total stages={total_stages} (1 explore + {n} verify + {n} test + 1 document)",
         flush=True,
     )
+    if delta_mode:
+        print(
+            f"[long-exposure] Delta final-audit mode via {delta_source}; "
+            f"budget ~{budget_tokens:,} tokens; reports={paths.cycle_reports_glob(config)}",
+            flush=True,
+        )
 
     audit_sessions: dict = {}
     audit_summaries: dict = {}
     pending_rescue_warning: str | None = None
+    document_stage_touched = False
     start_ts = time.monotonic()
 
     # Reset per-run findings file at start so a re-run on resume cannot
@@ -637,6 +739,7 @@ def _run_final_auditor(
             label = _stage_label(stage, n)
             expected = _expected_file_for_stage(stage, n, workspace)
             wall_cap_hit = False
+        expected_before = _file_signature(expected)
 
         stage_results = dict(results)
         stage_results["stage"] = f"{stage} of {total_stages} ({label})"
@@ -646,8 +749,22 @@ def _run_final_auditor(
         stage_results["working_dir"] = str(workspace)
         stage_results["rescue_warning"] = pending_rescue_warning or "(none)"
         stage_results["findings_file"] = str(_findings_path(workspace))
-        stage_results["lesson_candidates_file"] = str(workspace / _LESSON_CANDIDATES_FILE)
+        stage_results["lesson_candidates_file"] = str(paths.lessons_path(workspace))
+        stage_results["report_glob"] = paths.cycle_reports_glob(config)
+        stage_results["audit_dir"] = str(paths.final_audit_dir(config))
         stage_results["wall_cap_hit"] = "true" if wall_cap_hit else "false"
+        if delta_mode:
+            stage_results["directive"] = (
+                "DELTA-AUDIT MODE: A committed baseline final_audit_report.md "
+                f"already exists at {audit_path}. Treat it as canonical for "
+                "previously covered work. Focus on new per-cycle deliverables "
+                f"matching {paths.cycle_reports_glob(config)} and newer than "
+                "the prior committed baseline when that boundary is available. "
+                "Do not re-verify prior findings unless a new artifact directly "
+                "reopens them. The document stage should report only new "
+                "findings, new lessons, and reconciliation events.\n\n"
+                + str(stage_results.get("directive", task))
+            )
         pending_rescue_warning = None
 
         print(
@@ -716,6 +833,25 @@ def _run_final_auditor(
                     f"next stage, verify and overwrite {expected} if the "
                     f"rescued content is incomplete."
                 )
+            elif expected and _file_signature(expected) == expected_before:
+                print(
+                    f"[long-exposure]   FILE GATE: {expected.name} unchanged "
+                    f"during stage {stage}.",
+                    flush=True,
+                )
+                if not (delta_mode and label == "document") and _rescue_audit_stage_file(expected, output_text):
+                    print(
+                        f"[long-exposure]   FILE GATE: rescued "
+                        f"{expected.name} from output.",
+                        flush=True,
+                    )
+                pending_rescue_warning = (
+                    f"STAGE {stage} FILE GATE FAILED. Expected {expected} "
+                    "already existed but was not changed during this stage. "
+                    "Verify and overwrite it if rescued content is incomplete."
+                )
+            if label == "document" and _file_signature(expected) != expected_before:
+                document_stage_touched = True
 
             # Compaction
             if total_ctx >= compact_at:
@@ -769,8 +905,8 @@ def _run_final_auditor(
     # FINAL GATE: render final_audit_report.pdf if the markdown landed.
     # Mirrors reporting.py's PDF gate. Best-effort; absence of pandoc/tectonic
     # is non-fatal — markdown is always usable.
-    audit_md = workspace / "final_audit_report.md"
-    audit_pdf = workspace / "final_audit_report.pdf"
+    audit_md = paths.final_audit_report_path(config)
+    audit_pdf = paths.final_audit_pdf_path(config)
     if audit_md.exists() and not audit_pdf.exists():
         try:
             from long_exposure.reporting import render_pdf
@@ -779,7 +915,7 @@ def _run_final_auditor(
             print(f"[long-exposure]   Audit PDF render error: {e}", flush=True)
 
     # Ensure final_audit_summary.json exists, even if the agent skipped it.
-    summary_path = workspace / "final_audit_summary.json"
+    summary_path = paths.final_audit_summary_path(config)
     if not summary_path.exists():
         # Synthesize a minimal summary so the reporter can ingest something.
         synth = {
@@ -808,6 +944,15 @@ def _run_final_auditor(
             )
         except OSError:
             pass
+
+    if audit_md.exists() and (not delta_mode or document_stage_touched):
+        _write_commit_marker(marker_path, run_id=run_id, mode=mode, token_count=budget_tokens)
+    elif audit_md.exists():
+        print(
+            "[long-exposure]   Audit commit marker not updated: delta audit "
+            "baseline was not changed.",
+            flush=True,
+        )
 
     # Merge auditor sessions back so they persist across resumes.
     if agent_sessions is not None:

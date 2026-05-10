@@ -29,7 +29,7 @@ persistence and session search are bundled in (formerly a separate
 
 - **Python** 3.10+
 - One supported model CLI on your `PATH`: **[Claude Code CLI](https://docs.claude.com/en/docs/claude-code)** for the default `claude` provider, Codex CLI for `llm_provider: codex`, or Gemini CLI for `llm_provider: gemini`.
-- **[pandoc](https://pandoc.org/installing.html)** + **[tectonic](https://tectonic-typesetting.github.io/)** — optional; only needed for PDF rendering of the final report. Runs skip PDF if missing.
+- **[pandoc](https://pandoc.org/installing.html)** + **[tectonic](https://tectonic-typesetting.github.io/)** — required for standard PDF reports. `long-exposure-setup` installs/checks them where the platform package manager supports it; markdown reports still land if a runtime PDF render fails.
 - **Wolfram Engine** — optional; only if your exploration uses Wolfram scripts. `wolfram_path: "wolfram-batch"` uses long-exposure's portable script wrapper; set `WOLFRAM_BIN` if `wolfram` is not on `PATH`.
 
 ### Provider Support
@@ -52,18 +52,28 @@ self-hosted open models on Google Cloud.
 Install once:
 
 ```bash
-pip install -e .          # or: uv sync  (uses uv.lock for reproducibility)
+git clone <repo> long-exposure
+cd long-exposure
+uv run long-exposure-setup --yes
+# or: pip install -e . && long-exposure-setup --skip-uv-sync --yes
 ```
 
 Edit `long_exposure/config.yaml` → set `working_directory` to the project dir agents should read and write.
 
-Then launch the run. **The preferred interface is the `/long-exposure` slash command from within Claude Code** — it handles scope confirmation and streams logs into your transcript:
+Then launch the run. The provider-neutral launcher is the default operator
+surface; CLI-specific slash commands or skills should route to it:
+
+```bash
+long-exposure launch "Explore foundations of microlocal analysis"
+```
+
+From Claude Code, `/long-exposure` should route to the same launcher:
 
 ```
 /long-exposure Explore foundations of microlocal analysis
 ```
 
-Equivalent from a terminal:
+The lower-level conductor command remains available for scripts:
 
 ```bash
 long-exposure start "Explore foundations of microlocal analysis"
@@ -89,6 +99,7 @@ The default score runs researcher → worker → auditor sequentially per cycle,
 | Install + environment setup | [`docs/local-setup.md`](docs/local-setup.md) |
 | Conceptual map + design principles | [`docs/architecture-overview.md`](docs/architecture-overview.md) |
 | Every YAML knob (config + score) | [`docs/configuration-reference.md`](docs/configuration-reference.md) |
+| Opt-in telemetry | [`docs/telemetry.md`](docs/telemetry.md) |
 | Fan-out + agent-teams | [`docs/parallelism.md`](docs/parallelism.md) |
 | Multi-account pool | [`docs/multi-account-pool.md`](docs/multi-account-pool.md) |
 | sessions.db, auto-compact, gems | [`docs/persistence-and-gems.md`](docs/persistence-and-gems.md) |
@@ -100,20 +111,20 @@ The default score runs researcher → worker → auditor sequentially per cycle,
 ### Conceptual map
 
 ```
-                       CLI: long-exposure {start|stop|resume|clear}
+                       CLI: long-exposure {launch|status|guide|start|stop|resume|clear}
                                       │
                                       ▼
               ┌─────────────────────────────────────────────┐
               │ exploration.py — deterministic cycle loop   │
               │  (researcher → worker → auditor; reporter   │
-              │   every N; daily-sync every 24h; signal     │
-              │   polling at cycle boundary; rotation       │
-              │   on rate-limit; auto-compact at 90%)       │
+              │   every N; daily-sync every 24h; manager    │
+              │   notices; signal polling at cycle boundary;│
+              │   rotation on rate-limit; auto-compact 90%) │
               └─────────────────────────────────────────────┘
                 ▲                  │                       │
                 │                  ▼                       │
                 │       conductor.py / orchestrator.py     │
-                │       (claude -p subprocess; assemble    │
+                │       (provider CLI subprocess; assemble │
                 │        4-layer prompt; agent-teams       │
                 │        within turn; rate-limit detect)   │
                 │                  │                       │
@@ -153,27 +164,26 @@ The orchestrator reads `config.yaml` and assembles a system prompt from four tem
 4. Session Summary — restored context after compaction (if resuming)
 ```
 
-Each layer is a `.md` template in `long_exposure/templates/` with `{variable}` placeholders filled from the config and preset defaults. The assembled prompt is passed to `claude -p --system-prompt "..."` via subprocess.
+Each layer is a `.md` template in `long_exposure/templates/` with `{variable}` placeholders filled from the config and preset defaults. The assembled prompt is passed to the selected provider CLI in non-interactive mode.
 
 When token usage hits the compact threshold, the orchestrator generates a depth-aware XML summary, stores it in SQLite (via auto-compact), rebuilds the system prompt with the summary in layer 4, and continues with a fresh conversation. The agent picks up exactly where it left off.
 
-### Claude Code Integration
+### Provider CLI Integration
 
-The orchestrator uses the same pattern proven in the superprompt project:
+The orchestrator launches the selected provider CLI in non-interactive mode:
 
 ```python
-subprocess.run(
-    ["claude", "-p", "--output-format", "json", "--model", model,
-     "--no-session-persistence", "--system-prompt", system_prompt],
-    input=prompt, env={...without CLAUDECODE...}, ...
-)
+call_claude(prompt, system_prompt, model=model, cwd=working_dir)
 ```
 
 Key details:
-- `claude -p` runs in non-interactive print mode
-- `--output-format json` returns `{"result": "...", "usage": {"input_tokens": N, "output_tokens": N}}`
-- `--no-session-persistence` keeps each call stateless
-- `env.pop("CLAUDECODE")` allows nested invocation from within Claude Code
+- Claude, Codex, and Gemini calls are normalized to one result envelope:
+  `{"status": "ok", "result": "...", "usage": {...}}`.
+- Provider subprocesses run non-interactively from Python.
+- Provider-specific session persistence is disabled or isolated where the CLI
+  supports it; long-exposure keeps continuity in `sessions.db` and state files.
+- Nested CLI invocation strips provider shell variables that would confuse
+  child processes.
 - `search_sessions` is exposed via an MCP server (`--mcp-config`)
 
 ### Multi-Account Failover
@@ -501,9 +511,12 @@ All commands accept optional `--score`, `--config`, `--output`, `--state`, `--in
 
 | Command | Effect |
 |---------|--------|
+| `long-exposure launch "topic description"` | Preflight + start exploration through the provider-neutral launcher |
 | `long-exposure start` | Start exploration using task from score YAML |
 | `long-exposure start "topic description"` | Start with inline task (archives + clears any existing state) |
 | `long-exposure stop` | Send stop signal — finishes current agent, saves state |
+| `long-exposure status` | Print the latest status and manager notice |
+| `long-exposure guide "note"` | Queue live guidance for the next cycle |
 | `Ctrl+C` | Same as `stop`, when watching the terminal |
 | `long-exposure clear` | Stop + archive state + clear context for new topic |
 | `long-exposure resume` | Continue from saved state, with the directive saved at stop time |
@@ -513,7 +526,7 @@ All commands accept optional `--score`, `--config`, `--output`, `--state`, `--in
 ### Lifecycle
 
 ```
-long-exposure start "topic A"       # begins cycles
+long-exposure launch "topic A"      # begins cycles
   ... cycles run ...
 long-exposure stop                  # saves state, exits
 long-exposure resume                # picks up where it left off
@@ -521,7 +534,7 @@ long-exposure resume                # picks up where it left off
 long-exposure resume "Pivot to ..."  # redirect without clearing context
   ... more cycles ...
 long-exposure clear                 # archives state, clears context
-long-exposure start "topic B"       # fresh start, new topic
+long-exposure launch "topic B"      # fresh start, new topic
   ... cycles run ...
 long-exposure resume --from-archive data/exploration_state_20260316T1400.json
                                     # revisit topic A from archived state

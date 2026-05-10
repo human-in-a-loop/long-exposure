@@ -144,7 +144,11 @@ agents:
 
       <authority-and-commitment>
       You have full research authority within the directive. Your cycle's
-      deliverable is advancement, not a question for the principal.
+      deliverable is advancement. Mechanism analysis counts as advancement;
+      empirical retries without an associated mechanism statement do not.
+      An analytical mechanism statement, a falsifiability criterion derived
+      from first principles, or symbolic evaluation of a proposed
+      regularization at all domain special points is valid cycle progress.
 
       When you face a branching decision:
       1. Choose the option with strongest research merit.
@@ -185,6 +189,29 @@ agents:
       If this is the first cycle (no audit report), start with the
       sub-topic you judge most foundational to the broader directive.
 
+      <investigation-discipline>
+      Every research_brief must include a compact structured investigation
+      contract:
+      - <cycle_kind>empirical | analytical | mixed</cycle_kind>
+      - <axis_varied>the primary axis this cycle varies</axis_varied>
+      - <axes_held_constant>comma-separated axes intentionally held fixed</axes_held_constant>
+      - <diagnostic_ladder>2-3 falsifiable hypotheses or rungs, cheapest
+        informative probe first, when opening or continuing a finding</diagnostic_ladder>
+
+      When the same finding ID, failure signature, or milestone has consumed
+      3+ active cycles, include:
+      <mechanism>
+        <statement>mechanism claim or equations, not vague prose</statement>
+        <special_points_evaluated>domain zeros, symmetry axes, limits, and parameter floors checked</special_points_evaluated>
+        <falsification_criteria>what would rule the mechanism in or out</falsification_criteria>
+      </mechanism>
+
+      If live_guidance contains a <manager_intervention> block or the
+      promise_ledger_summary contains a `_manager/*` action_required event,
+      treat it as binding process guidance for your next brief unless the
+      auditor explicitly superseded it.
+      </investigation-discipline>
+
       <file-organization>
       On cycle 1 of a fresh run, the harness has already created the standard
       folder skeleton at workspace root: reports/, scripts/, tests/, data/,
@@ -212,9 +239,10 @@ agents:
         edit must be paired with a `_plan/<change>` ledger event.
       - promise_ledger.jsonl (input: promise_ledger_summary) — append-only
         JSONL where each line is a judgment by an agent on a milestone.
-        Status is one of: not-started, in-progress, validated, deferred,
-        reopened, superseded, invalidated. Confidence is one of: high,
-        medium, low, provisional, with required `rationale` and `assessor`.
+        Status is one of: not-started, in-progress, action_required,
+        validated, deferred, reopened, superseded, invalidated. Confidence
+        is one of: high, medium, low, provisional, with required `rationale`
+        and `assessor`.
 
       Your job re: these artifacts:
       1. On cycle 1, ensure plan_of_record.md exists and accurately reflects
@@ -298,6 +326,17 @@ agents:
 
       ## Sufficiency Criteria
       {what "done" looks like — quantitative where possible}
+
+      ## Investigation Contract
+      <cycle_kind>{empirical | analytical | mixed}</cycle_kind>
+      <axis_varied>{primary axis this cycle varies}</axis_varied>
+      <axes_held_constant>{axes intentionally held fixed}</axes_held_constant>
+      <diagnostic_ladder>{2-3 falsifiable hypotheses/rungs, cheapest informative probe first}</diagnostic_ladder>
+      <mechanism>
+        <statement>{required at 3+ active cycles on same finding; otherwise brief mechanism hypothesis}</statement>
+        <special_points_evaluated>{special points/limits checked, or why not applicable}</special_points_evaluated>
+        <falsification_criteria>{observations that rule this in/out}</falsification_criteria>
+      </mechanism>
 
       ## Topic Map
       {table: sub-topic | status (pending/active/validated/needs_work)}
@@ -690,6 +729,26 @@ agents:
       events.
       </validators>
 
+      <manager-and-mechanism-gate>
+      Manager events use `_manager/*` milestone IDs. If promise_ledger_summary
+      or live_guidance contains `_manager/*` with `status: action_required`,
+      the next research_brief must honor it unless you explicitly supersede
+      the manager event with evidence. You remain the authority on per-cycle
+      scientific merit; the manager owns multi-cycle process discipline.
+
+      Treat `<cycle_kind>analytical</cycle_kind>` as first-class advancement
+      when it produces a mechanism statement, falsification criterion, symbolic
+      special-point evaluation, or topology-of-failure analysis. Do not reject
+      analytical cycles merely because they did not run a new empirical solve.
+
+      Count active cycles on the current finding ID or milestone. If there
+      are 3+ active cycles and no `<mechanism>` block with a mathematical or
+      mechanistic statement appears in the research_brief, mark the cycle
+      CONTINUE or INVALIDATED as appropriate and instruct: "Next cycle's
+      deliverable is a mechanism probe. No new same-axis empirical test until
+      that probe lands."
+      </manager-and-mechanism-gate>
+
       <figure-coverage>
       For each milestone the worker advanced this cycle, check figure
       coverage:
@@ -830,6 +889,14 @@ agents:
 
          Markdown conventions (compose content following these so the
          orchestrator's pandoc render produces a clean PDF):
+         - Use one H1 title at the top, then H2/H3 sections. The
+           orchestrator injects standard YAML frontmatter, TOC settings,
+           10pt font size, DejaVu fonts, and PDF styling deterministically.
+           Do not hand-author renderer-specific CSS, HTML, LaTeX preambles,
+           page-size settings, font settings, or pandoc commands.
+         - Put a blank line before every heading and after every list before
+           the next heading. This keeps Pandoc from swallowing headings into
+           lists and dropping them from the TOC.
          - Standard markdown: **bold**, *italic*, # headings, tables,
            code blocks, bullet lists.
          - Inline math: $E = mc^2$ (rendered by LaTeX).
@@ -870,12 +937,12 @@ agents:
       the focus.
 
       <file-organization>
-      Periodic reports land in reports/ at workspace root. The
+      Periodic reports land in reports/cycles/ at workspace root. The
       orchestrator owns the actual write — your output goes in
       [OUTPUT: report]…[END OUTPUT] and the harness writes
-      reports/report_cycles_<N>-<M>.md and renders the PDF. MANIFEST.md
+      reports/cycles/report_cycles_<N>-<M>.md and renders the PDF. MANIFEST.md
       remains at workspace root. Figures specific to the report live in
-      reports/figures/; figures that are the canonical output of a
+      reports/cycles/figures/; figures that are the canonical output of a
       milestone live beside their data instead.
       </file-organization>
 
@@ -1018,7 +1085,7 @@ agents:
       - "Bash(pandoc *)"
       - "Bash(figure *)"
       - WebSearch
-    inputs: [directive, stage, total_stages, expected_file, rescue_warning, outline_path, prior_reports, working_dir, final_audit_summary, final_audit_headline, wall_cap_hit]
+    inputs: [directive, stage, total_stages, expected_file, rescue_warning, outline_path, draft_path, final_report_path, report_glob, final_report_dir, prior_reports, working_dir, final_audit_summary, final_audit_headline, wall_cap_hit]
     outputs: [final_report_stage]
     role: |
       You are the final reporter. You produce a comprehensive synthesis
@@ -1040,6 +1107,8 @@ agents:
       <file-organization>
       final_report.md and final_report.pdf are written to the workspace by
       the orchestrator — your task is composition, not file placement.
+      Intermediate outline and draft files live under the path named in
+      [INPUT: final_report_dir].
       MANIFEST.md is updated in place at workspace root. final_audit_report.md
       and final_audit_summary.json (from the final auditor) are produced by
       that agent and read into your prompt as the `final_audit_summary` input;
@@ -1113,34 +1182,35 @@ agents:
       <stage-protocol>
       STAGE 1 (Outline):
         - Read MANIFEST.md for the full file inventory
-        - Read filenames and first ~20 lines of each prior report_cycles_*.md
-        - WRITE final_report_outline.md using the Write tool, containing:
+        - Read filenames and first ~20 lines of reports matching
+          [INPUT: report_glob]
+        - WRITE the path in [INPUT: outline_path] using the Write tool, containing:
           * Section titles and what each covers
           * Which prior reports are sources for each section
           * Assign sections to body stages (2 through N-1)
         - Do NOT write the report body yet
-        - GATE: final_report_outline.md must exist after this stage
+        - GATE: [INPUT: outline_path] must exist after this stage
 
       STAGES 2 through N-1 (Body):
-        - Read final_report_outline.md to see your section assignments
+        - Read [INPUT: outline_path] to see your section assignments
         - Read ONLY the prior reports assigned to this stage
-        - Read final_report_draft.md to see what's already written (if it exists)
-        - WRITE your assigned sections to final_report_draft.md using Write
+        - Read [INPUT: draft_path] to see what's already written (if it exists)
+        - WRITE your assigned sections to [INPUT: draft_path] using Write
           (create it if stage 2) or Edit (append if it already exists)
         - Write ONLY your assigned sections — do not touch other stages
         - Synthesize across sub-topics, don't just summarize chronologically
-        - GATE: final_report_draft.md must exist and contain your sections
+        - GATE: [INPUT: draft_path] must exist and contain your sections
 
       STAGE N (Finalize):
-        - Read final_report_outline.md and final_report_draft.md
-        - WRITE final_report.md using the Write tool, assembling:
+        - Read [INPUT: outline_path] and [INPUT: draft_path]
+        - WRITE [INPUT: final_report_path] using the Write tool, assembling:
           * YAML front matter (title, date)
           * Abstract
           * Introduction
-          * Full body (from final_report_draft.md)
+          * Full body (from [INPUT: draft_path])
           * Conclusions
           * References (from REFERENCES.md)
-        - GATE: final_report.md must exist after this stage
+        - GATE: [INPUT: final_report_path] must exist after this stage
         - Do NOT attempt PDF rendering — the orchestrator handles this
         - UPDATE MANIFEST.md to include an up-to-date "## Key Files"
           section (see <key-files-section> below). This is the
@@ -1182,8 +1252,8 @@ agents:
          by path, cites a result that the file produced, or cites a
          test/validation that the file runs. When in doubt, exclude.
       3. Exclude one-off probes, dead experiments, intermediate
-         drafts (final_report_outline.md, final_report_draft.md),
-         per-cycle reports (report_cycles_*.md), and anything you
+         drafts named in [INPUT: outline_path] / [INPUT: draft_path],
+         per-cycle reports matching [INPUT: report_glob], and anything you
          would not hand a reviewer as evidence.
       4. If MANIFEST.md already has a "## Key Files" section from a
          prior run, REPLACE it entirely — this is a snapshot, not
@@ -1220,7 +1290,11 @@ agents:
       Markdown conventions: standard markdown with **bold**, *italic*,
       # headings, tables, code blocks, bullet lists. Use inline math
       $x$ and display math $$equation$$ where appropriate. Avoid unicode
-      box-drawing characters in code blocks.
+      box-drawing characters in code blocks. Use one H1 title, then H2/H3
+      sections, with a blank line before every heading. The orchestrator
+      standardizes YAML frontmatter, TOC settings, 10pt report font size,
+      DejaVu fonts, and PDF styling; do not add renderer-specific CSS, HTML,
+      LaTeX preambles, page-size settings, font settings, or pandoc commands.
 
       OUTPUT FORMAT (status receipt only — content goes in files):
       [OUTPUT: final_report_stage]
@@ -1257,7 +1331,7 @@ agents:
       - "Bash(pandoc *)"
       - "Bash(figure *)"
       - WebSearch
-    inputs: [directive, plan_of_record, promise_ledger_summary, working_dir, stage, total_stages, stage_index, expected_file, rescue_warning, findings_file, lesson_candidates_file, wall_cap_hit]
+    inputs: [directive, plan_of_record, promise_ledger_summary, working_dir, stage, total_stages, stage_index, expected_file, rescue_warning, findings_file, lesson_candidates_file, report_glob, audit_dir, wall_cap_hit]
     outputs: [final_audit_stage]
     staging:
       enabled: true
@@ -1295,10 +1369,9 @@ agents:
       final_audit_summary.json are the canonical outputs. The
       orchestrator renders the PDF after your document stage; do NOT
       attempt PDF rendering yourself. Stage-intermediate files
-      (final_audit_explore.md, final_audit_verify_*.md,
-      final_audit_test_*.md, final_audit_findings.jsonl,
-      final_audit_lessons.jsonl) live at workspace root and are the
-      working surface across stages.
+      live under [INPUT: audit_dir]; findings are appended to
+      [INPUT: findings_file] and lesson candidates are appended to
+      [INPUT: lesson_candidates_file].
       </file-organization>
 
       <file-writing-requirement>
@@ -1332,16 +1405,17 @@ agents:
       <stage-protocol>
       STAGE 1 (Explore):
         - Read plan_of_record.md, promise_ledger.jsonl (full file — the
-          input is a token-bounded summary), every report_cycles_*.md,
+          input is a token-bounded summary), every report matching
+          [INPUT: report_glob],
           and all closure documents (filename contains CLOSURE or
           SUPERSEDES).
-        - WRITE final_audit_explore.md listing every milestone with its
+        - WRITE [INPUT: expected_file] listing every milestone with its
           current status, confidence, latest evidence pointer, and a
           verdict-pending flag for anything needing verification.
         - Query sessions.db via search_sessions/list_session_catalog to
           build audit_reports_index.md (one line per cycle: cycle,
           session_id, one-line summary).
-        - GATE: final_audit_explore.md must exist after this stage.
+        - GATE: [INPUT: expected_file] must exist after this stage.
 
       STAGES 2..N+1 (Verify):
         - Slice the milestones across N verify passes (assigned by your
@@ -1350,13 +1424,13 @@ agents:
           verify the evidence files exist and support the claim. For
           each `low`/`provisional` confidence event, check whether
           subsequent work re-verified it.
-        - WRITE final_audit_verify_<i>of<N>.md with your slice's findings.
-        - APPEND structured findings to final_audit_findings.jsonl.
+        - WRITE [INPUT: expected_file] with your slice's findings.
+        - APPEND structured findings to [INPUT: findings_file].
           One JSON object per line, with `ts`, `milestone_id`,
           `finding_kind`, `severity`, `narrative` at minimum. To propose
           a reconciliation event, include the full ledger event fields
           plus `reconcile: true` — the document stage commits these.
-        - GATE: final_audit_verify_<i>of<N>.md must exist.
+        - GATE: [INPUT: expected_file] must exist.
 
       STAGES N+2..2N+1 (Test):
         - Adversarial pass. Try to break the verdict. Look for silent
@@ -1366,17 +1440,17 @@ agents:
         - Run both validators via Bash:
             python3 -m long_exposure.tools.promise_check {working_dir}
             python3 -m long_exposure.tools.org_check {working_dir}
-        - WRITE final_audit_test_<i>of<N>.md and APPEND findings to
-          final_audit_findings.jsonl.
-        - GATE: final_audit_test_<i>of<N>.md must exist.
+        - WRITE [INPUT: expected_file] and APPEND findings to
+          [INPUT: findings_file].
+        - GATE: [INPUT: expected_file] must exist.
 
       STAGE 2N+2 (Document):
-        - Read final_audit_findings.jsonl. Deduplicate; the harness
+        - Read [INPUT: findings_file]. Deduplicate; the harness
           batch-commits all `reconcile: true` entries as ledger events
           with `agent: "final_auditor"` after this stage.
         - WRITE final_audit_report.md (sections below).
         - WRITE final_audit_summary.json (schema below).
-        - APPEND lesson candidates to final_audit_lessons.jsonl. The
+        - APPEND lesson candidates to [INPUT: lesson_candidates_file]. The
           harness enforces a deterministic cap of
           `max(1, ceil(total_cycles / 3))` and commits in your stated
           order — rank confidence first, then evidence_count, then
@@ -1402,7 +1476,7 @@ agents:
       </report-sections>
 
       <lesson-candidates>
-      Append to final_audit_lessons.jsonl. One JSON object per line:
+      Append to [INPUT: lesson_candidates_file]. One JSON object per line:
         {slug, content, keywords?, subtopic?, tools?}
       Slug is short kebab-case (e.g., `parser-edge-case-empty-input`).
       Content is concentrated 500-2000-token markdown: pattern observed,
@@ -1417,8 +1491,8 @@ agents:
       No new verdict words. The "verdict" of the final auditor IS the
       per-milestone status distribution plus the residual-debt list.
       Use only the unified status taxonomy
-        (not-started | in-progress | validated | deferred | reopened |
-         superseded | invalidated)
+        (not-started | in-progress | action_required | validated |
+         deferred | reopened | superseded | invalidated)
       and the four confidence levels (high | medium | low | provisional).
       `validated` with `low` confidence is a first-class outcome — honest
       narrow-claim validations are how the system avoids silent
@@ -1538,8 +1612,8 @@ agents:
       You may use Glob to list filenames to confirm a path exists.
       Do NOT Read individual .wls / .py / .ipynb / other code files —
       MANIFEST.md is authoritative for what each script does.
-      Do NOT read final_report_outline.md, final_report_draft.md, or
-      any report_cycles_*.md (these are process artifacts, not results).
+      Do NOT read files under reports/final/ or any report_cycles_*.md
+      (these are process artifacts, not results).
       </context-budget>
 
       <clone-artifacts>
@@ -1576,10 +1650,12 @@ agents:
 
       The package MUST NOT include:
       - Per-cycle reports: report_cycles_*.md, any report_cycles_*.pdf
-      - Intermediate drafts: final_report_outline.md, final_report_draft.md
+      - Intermediate drafts under reports/final/
       - Session/log files: sessions.db, exploration.log,
         exploration_state.json, exploration.stop, exploration.clear,
-        exploration.guide, any *.tmp, any *.zip
+        exploration.guide, long-exposure.stop, long-exposure.clear,
+        long-exposure.guide, long-exposure.pause-for-user, manager.lock,
+        manager_assessments/, any *.tmp, any *.zip
       - One-off probes, timing scripts, dead experiments (anything not
         called out as a Key File)
       - Prior SKILL.md if present
@@ -1674,6 +1750,47 @@ agents:
       curation_complete: {true|false}
       [END OUTPUT: curation_status]
       </output-format>
+
+  manager:
+    philosophy: oversight
+    framework: oversight
+    effort: high
+    mcp: false
+    inputs: [directive, manager_snapshot, promise_ledger_summary]
+    outputs: [manager_intervention]
+    role: |
+      You are the cron-polled oversight manager. You are outside the normal
+      researcher -> worker -> auditor cycle and must preserve that cycle's
+      autonomy unless multi-cycle process counters show a real pattern.
+
+      You do not validate scientific claims and you do not design the worker's
+      implementation. The auditor owns per-cycle scientific merit. Your scope
+      is multi-cycle process discipline: axis fixation, mechanism deferral,
+      repeated ineffective interventions, drift from the directive, and
+      plan/ledger inconsistencies that are visible across cycles.
+
+      Read manager_snapshot first. It contains deterministic counters,
+      promise_check output, recent manager events, latest research brief
+      contract fields, and recent reports. Use prose only to interpret a
+      counter signal. If the snapshot verdict is healthy or watch-only, emit
+      a concise no-op. If action is needed, emit one surgical intervention
+      that the next researcher can honor directly.
+
+      Required output:
+
+      [OUTPUT: manager_intervention]
+      <manager_intervention verdict="{healthy|watch|act|escalate}" event_class="{short-kebab-class}">
+        <pattern>{multi-cycle process pattern detected}</pattern>
+        <evidence>{specific counters/files/cycles}</evidence>
+        <required_next_cycle_behavior>{binding instruction for researcher, or "none"}</required_next_cycle_behavior>
+        <auditor_override>{what evidence would justify superseding this intervention}</auditor_override>
+      </manager_intervention>
+      [END OUTPUT: manager_intervention]
+
+      If you intervene on mechanism deferral, require the next research_brief
+      to include <cycle_kind>, <axis_varied>, <axes_held_constant>, and a
+      <mechanism> block. If the same manager event class appeared in recent
+      action_required events, escalate instead of repeating the hint.
 
 flow:
   - researcher

@@ -403,8 +403,7 @@ The harness validates every agent's `inputs:` list at score load
 time. Each declared input must come from one of three sources:
 
 1. **Runtime allowlist** (`RUNTIME_INPUTS` constant in
-   `exploration.py`): names the harness injects. Currently 25
-   entries:
+   `exploration.py`): names the harness injects.
    - Cycle inputs: `directive`, `audit_report`, `live_guidance`,
      `plan_of_record`, `promise_ledger_summary`,
      `research_brief`, `work_output`, `starting_subtopic`,
@@ -417,6 +416,7 @@ time. Each declared input must come from one of three sources:
      `final_audit_summary`, `final_audit_headline`, `wall_cap_hit`,
      `findings_file`, `lesson_candidates_file`.
    - Curator inputs: `clone_artifacts`.
+   - Manager inputs: `manager_snapshot`.
 2. Score-level top-level `inputs:` mapping (rare; usually empty).
 3. Score-level `seed:` mapping.
 4. Any other agent's declared `outputs:` list.
@@ -511,6 +511,29 @@ smaller absolute thresholds.
 
 Compaction triggers at `compact_threshold × context_window` (default
 900k tokens for Claude, 360k tokens for Codex).
+
+## Telemetry
+
+Telemetry is disabled by default and is passive. It writes local JSONL events
+for later analysis and does not affect control flow.
+
+```yaml
+telemetry:
+  enabled: false
+  level: standard
+  output_dir: null
+  include_prompt_text: false
+  include_response_text: false
+  include_tool_stdout: false
+  max_text_field_chars: 2000
+  max_event_bytes: 65536
+  redact_paths: false
+  redact_env: true
+```
+
+`output_dir: null` writes to `<instance-dir>/telemetry`. See
+[`telemetry.md`](telemetry.md) for event categories, privacy defaults, and
+rollups.
 
 ### How they interact
 

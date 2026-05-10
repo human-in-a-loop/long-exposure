@@ -20,8 +20,7 @@ Load-bearing properties to preserve:
 | Plan/free-tier usage | Claude and Codex paths use local CLIs and account homes, not pay-as-you-go APIs. | Gemini should default to Google-account / Code Assist auth, not Gemini API billing. |
 | Emergent parallelism | Whole-cycle fan-out is Python subprocess topology; intra-turn helper guidance is provider-specific. | Gemini free tier can preserve process fan-out; native Gemini subagents cannot be assumed on Google-account auth. |
 
-Stage 0 installed Gemini CLI `0.41.1` under
-`gemini` and verified:
+Stage 0 installed Gemini CLI `0.41.1` under a user-local npm prefix and verified:
 
 ```bash
 GOOGLE_GENAI_USE_GCA=true gemini --skip-trust -p "Reply with exactly: gemini-ok" --output-format json

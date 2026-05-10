@@ -26,6 +26,7 @@ from pathlib import Path
 
 STANDARD_FOLDERS = (
     "reports",
+    "audits",
     "scripts",
     "tests",
     "data",
@@ -52,22 +53,24 @@ ALLOWED_AT_ROOT_FILES = {
     ".gitignore",
     # Final synthesis outputs — written at workspace root by the harness
     # and curator-contract; matches the final reporter's and final
-    # auditor's existing file-gate placement (reporting.py:_run_final_reporter
-    # and auditing.py:_run_final_auditor). Per-CYCLE reports go to reports/
-    # (Plan 3 §3.2); end-of-run synthesis stays at root.
+    # auditor's file-gate placement. Per-cycle reports go to
+    # reports/cycles/; end-of-run synthesis stays at root.
     "final_report.md",
     "final_report.pdf",
     "final_audit_report.md",
     "final_audit_report.pdf",
+    "final_report.committed",
+    "final_audit_report.committed",
     "final_audit_summary.json",
-    # Drafts / intermediates the final reporter produces during staging.
+}
+
+LEGACY_ROOT_STAGE_PATTERNS = (
     "final_report_outline.md",
     "final_report_draft.md",
-    # Final auditor staging files.
     "final_audit_explore.md",
     "final_audit_findings.jsonl",
     "final_audit_lessons.jsonl",
-}
+)
 
 ALLOWED_AT_ROOT_DIRS = {
     *STANDARD_FOLDERS,
@@ -81,7 +84,7 @@ ALLOWED_AT_ROOT_DIRS = {
     "node_modules",
 }
 
-# Filenames that suggest periodic reports — they should live in reports/.
+# Filenames that suggest periodic reports — they should live in reports/cycles/.
 # `final_report*` and `final_audit_report*` are NOT in this set: they live at
 # workspace root by harness contract (curator + file gate).
 REPORT_FILENAME_PATTERNS = ("report_cycles_",)
@@ -163,10 +166,20 @@ def run(workspace: Path) -> Findings:
     for f in root_files:
         if f.name in ALLOWED_AT_ROOT_FILES:
             continue
+        if (
+            f.name in LEGACY_ROOT_STAGE_PATTERNS
+            or f.name.startswith("final_audit_verify_")
+            or f.name.startswith("final_audit_test_")
+        ):
+            findings.note(
+                f"legacy root stage artifact: {f.name} "
+                "(new runs write scratch under reports/final/ or audits/final/)"
+            )
+            continue
         # Reports at root → should be in reports/
         if any(f.name.startswith(p) for p in REPORT_FILENAME_PATTERNS):
             findings.err(
-                f"report at workspace root: {f.name} (should live in reports/)"
+                f"report at workspace root: {f.name} (should live in reports/cycles/)"
             )
             continue
         # Scripts at root
@@ -217,7 +230,7 @@ def run(workspace: Path) -> Findings:
         for p in docs_dir.rglob("report_cycles_*.md"):
             findings.warn(
                 f"periodic report under docs/: {p.relative_to(workspace).as_posix()} "
-                f"(future runs should write to reports/)"
+                f"(future runs should write to reports/cycles/)"
             )
     # final_report at workspace root is tolerated by ALLOWED_AT_ROOT_FILES;
     # but if it's in docs/, it's a misplacement.

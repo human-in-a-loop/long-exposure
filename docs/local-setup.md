@@ -15,7 +15,7 @@ conceptual map, see [`architecture-overview.md`](architecture-overview.md).
 | **`pyyaml`** | Config + score YAML parsing | Yes (pip-installed) |
 | **`prompt_toolkit`** | Interactive orchestrator REPL | Yes (pip-installed) |
 | **`anthropic`** | Used by `auto_compact` standalone CLI only — long-exposure itself does not call the SDK | No (optional) |
-| **`pandoc`** + **[`tectonic`](https://tectonic-typesetting.github.io/)** | PDF rendering of reports | Optional — runs skip PDF if missing, log an off-nominal event, markdown still produced |
+| **`pandoc`** + **[`tectonic`](https://tectonic-typesetting.github.io/)** | PDF rendering of in-cycle and final reports | Yes for standard report output. `long-exposure-setup` installs/checks them where the platform package manager supports it. If absent at runtime, markdown still lands and PDF render failures are surfaced. |
 | **Wolfram Engine** | Wolfram Language scripts the worker may run | Optional — set `wolfram_path: ""` in `config.yaml` if absent |
 | **`matplotlib`** (Python) | `figure plot` subcommand backend (quantitative data plots). Hard dep since Plan E. | Yes (auto-installed by `uv sync` / `pip install -e .`) |
 | **D2 binary** ([install](https://d2lang.com/tour/install/)) | `figure flow` subcommand backend (flowcharts, sequence, state, ERD, structural diagrams) | Optional but needed for any `figure flow` invocation. PNG rendering pulls headless Chromium (~165 MB, one-time) on first invocation |
@@ -97,21 +97,40 @@ git clone <repo> long-exposure
 cd long-exposure
 
 # Reproducible install (recommended)
-uv sync
+uv run long-exposure-setup --yes
 
 # Or via pip
 pip install -e .
+long-exposure-setup --skip-uv-sync --yes
 ```
 
-Either install gives you the `long-exposure` console script. From
-within Claude Code, the `/long-exposure` slash command is the
-preferred entry point (configured separately — see your Claude Code
-plugin docs).
+`long-exposure-setup` runs `uv sync` unless `--skip-uv-sync` is passed,
+checks Python imports, checks `pandoc` and `tectonic`, and installs missing
+system binaries through the detected package manager when supported:
+`apt-get`, `dnf`, `yum`, `pacman`, `zypper`, `brew`, or `winget`.
+If the platform is unsupported, it prints the exact missing tools and exits
+non-zero instead of guessing.
+
+Either install gives you the `long-exposure` console script. The preferred
+entry point is provider-neutral:
+
+```bash
+long-exposure launch "<directive>"
+```
+
+Claude/Codex/Gemini slash commands or skills should be thin adapters that
+route to that command.
 
 ### Verifying
 
 ```bash
-# 1. Claude CLI works in non-interactive mode
+# 1. Deterministic environment check
+long-exposure-doctor
+
+# JSON output is useful for CI, issue reports, or agentic debugging.
+long-exposure-doctor --json
+
+# 2. Claude CLI works in non-interactive mode
 claude -p "say ok" --output-format json
 
 # Expect: JSON envelope with "is_error":false. If this fails,
@@ -132,10 +151,10 @@ GOOGLE_GENAI_USE_GCA=true gemini --skip-trust \
 # long-exposure; whole-cycle fan-out still runs multiple independent
 # Gemini CLI sessions concurrently.
 
-# 2. long-exposure imports cleanly
+# 3. long-exposure imports cleanly
 python3 -c "import long_exposure.exploration; print('ok')"
 
-# 3. Score YAML loads + validates
+# 4. Score YAML loads + validates
 python3 -c "
 from long_exposure.exploration import load_exploration_score
 load_exploration_score('long_exposure/exploration-score.yaml')
@@ -155,7 +174,7 @@ printf 'Print[$Version]\nPrint[2+2]\n' >/tmp/wolfram-smoke.wls
 ```
 long-exposure/
 ├── long_exposure/                  # Core package
-│   ├── orchestrator.py             # claude -p subprocess + 4-layer prompt
+│   ├── orchestrator.py             # provider CLI subprocess + 4-layer prompt
 │   ├── conductor.py                # Score loader + agent prompt assembly
 │   ├── exploration.py              # Cycle loop + signal handling
 │   ├── fanout.py                   # Parallel-cycle fan-out + barrier
@@ -209,7 +228,7 @@ mode is the one most users want.
 
 | Mode | Entry | What it is |
 |---|---|---|
-| **Exploration** | `long-exposure start "<directive>"` (or `python -m long_exposure.exploration start ...`) | The continuous researcher → worker → auditor loop. Default for `/long-exposure` slash command. See [`usage-guide.md`](usage-guide.md). |
+| **Exploration** | `long-exposure launch "<directive>"` or low-level `long-exposure start "<directive>"` | The continuous researcher → worker → auditor loop. CLI adapters should route here. See [`usage-guide.md`](usage-guide.md). |
 | **Conductor** | `python -m long_exposure.conductor <score.yaml>` | Run a multi-agent score *once* (sequential or parallel steps; no loop, no persistent sessions). For one-shot multi-agent flows. |
 | **Orchestrator** | `python -m long_exposure.orchestrator` | Interactive single-agent REPL with auto-compact. Type messages, get responses; context survives compaction. |
 
@@ -304,7 +323,10 @@ recommended — see [`multi-account-pool.md`](multi-account-pool.md).
 | `long_exposure/data/sessions.db` | Single source of truth (SQLite, accumulates across runs) | System |
 | `long_exposure/data/exploration_state.json` | Current cycle state (overwritten) | System |
 | `long_exposure/data/health_events.jsonl` | Off-nominal events log (silent fallbacks, rescues, retries) — `tail -n 50` to surface | System |
-| `long_exposure/data/long-exposure.{stop,clear,guide}` | Signal files | Operator |
+| `long_exposure/data/long-exposure.{stop,clear,guide,pause-for-user}` | Signal files | Operator / manager |
+| `long_exposure/data/manager_assessments/` | Cron manager assessment logs | Manager |
+| `long_exposure/data/manager_notifications.jsonl` | Structured manager notices for launchers/status | Manager |
+| `<instance>/telemetry/events.jsonl` | Opt-in passive telemetry events | System |
 | `long_exposure/data/mcp_config.json` | MCP server config (points at sessions.db) | System |
 | `long_exposure/data/fork-<id>/` | Fan-out fork directories (per-clone instance dirs, merge reports, shadow ledgers) | System |
 | `~/.claude-pool-state.json` | Multi-account pool state | System |
@@ -313,7 +335,9 @@ recommended — see [`multi-account-pool.md`](multi-account-pool.md).
 | `<workspace>/promise_ledger.jsonl` | Append-only judgment history | All agents |
 | `<workspace>/STRUCTURE.md` | Workspace folder layout (researcher-authored cycle 1) | Researcher agent |
 | `<workspace>/MANIFEST.md` | Curated artifact list | Reporter / curator agents |
-| `<workspace>/reports/` | Periodic reports | Reporter agent |
+| `<workspace>/reports/cycles/` | Periodic reports | Reporter agent |
+| `<workspace>/reports/final/` | Final reporter scratch | Final reporter agent |
+| `<workspace>/audits/final/` | Final auditor scratch and sidecars | Final auditor agent |
 | `<workspace>/final_report.{md,pdf}` | End-of-run synthesis | Final reporter agent |
 | `<workspace>/final_audit_report.{md,pdf}` | Run-scope audit | Final auditor agent |
 | `<workspace>/final_audit_summary.json` | Structured audit record | Final auditor agent |
@@ -324,31 +348,7 @@ recommended — see [`multi-account-pool.md`](multi-account-pool.md).
 ## Health-check command
 
 ```bash
-python3 -c "
-import long_exposure.exploration, long_exposure.orchestrator
-import long_exposure.fanout, long_exposure.pool
-from long_exposure.exploration import load_exploration_score
-load_exploration_score('long_exposure/exploration-score.yaml')
-import long_exposure.health_events as he
-
-# Figure backends: probe each, report present/missing without raising.
-import shutil, importlib, os
-print('all imports + score validation: OK')
-print('pool active:', __import__('long_exposure.pool', fromlist=['is_active']).is_active())
-
-def probe(name, check):
-    try:
-        ok = check()
-    except Exception:
-        ok = False
-    print(f'figure backend {name:11}: {\"OK\" if ok else \"missing\"}')
-
-probe('matplotlib', lambda: importlib.import_module('matplotlib') is not None)
-probe('d2',         lambda: shutil.which('d2') is not None or
-                            os.path.isfile(os.path.expanduser('~/.local/bin/d2')))
-probe('diagrams',   lambda: importlib.import_module('diagrams') is not None)
-probe('dot',        lambda: shutil.which('dot') is not None)
-"
+long-exposure-doctor
 ```
 
 Each backend prints `OK` or `missing`. Use this after install to spot

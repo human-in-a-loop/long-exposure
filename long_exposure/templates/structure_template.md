@@ -14,7 +14,8 @@ lives in named subfolders (e.g., `benchmark-XX-...`).
 
 | folder      | purpose                                                            |
 |-------------|--------------------------------------------------------------------|
-| `reports/`  | periodic + final reports; campaign-level closure letters           |
+| `reports/`  | harness-managed cycle reports and final-reporter scratch           |
+| `audits/`   | harness-managed final-auditor scratch and sidecar JSONL files      |
 | `scripts/`  | worker-authored code that produces results                         |
 | `tests/`    | auditor-authored verification code                                 |
 | `data/`     | datasets (CSV/JSON/etc); machine-facing                            |
@@ -30,7 +31,9 @@ lives in named subfolders (e.g., `benchmark-XX-...`).
 
 - Plots co-located with their source data, NOT in a separate `figures/`.
 - Stale artifacts MOVED to nearest `stale/` (root or domain-internal); never deleted.
-- Reporter writes ONLY to `reports/` (not to root, not to `docs/`).
+- Periodic reporter writes ONLY to `reports/cycles/` (not to root, not to `docs/`).
+- Final reporter scratch lives in `reports/final/`; canonical `final_report.*` stays at root.
+- Final auditor scratch lives in `audits/final/`; canonical `final_audit_*` stays at root.
 - Worker default: scripts to `scripts/`, data outputs to `data/`, plots beside data.
 - Auditor default: verification scripts to `tests/`.
 - Cross-cutting tools (validators, helpers) to `tools/`.

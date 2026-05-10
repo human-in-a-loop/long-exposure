@@ -47,6 +47,10 @@ from long_exposure.workspace_bootstrap import (
     derive_run_id,
     summarize_ledger,
 )
+from long_exposure.report_formatting import (
+    normalize_report_markdown,
+    render_report_pdf,
+)
 from long_exposure.orchestrator import (
     PHILOSOPHY_EFFORT_MAP,
     ClaudeCliError,
@@ -70,7 +74,9 @@ from long_exposure.orchestrator import (
     rotate_to_next_account,
 )
 from long_exposure import pool
+from long_exposure import paths
 from long_exposure import provider as _provider
+from long_exposure import telemetry
 from auto_compact.db import init_db, store_session
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -187,6 +193,7 @@ def _check_signal_files(data_dir: Path) -> None:
     stop_file_new = data_dir / "long-exposure.stop"
     stop_file_old = data_dir / "exploration.stop"
     graceful_file = data_dir / "long-exposure.graceful-stop"
+    pause_file = data_dir / "long-exposure.pause-for-user"
     guide_paths = (
         data_dir / "long-exposure.guide",
         data_dir / "exploration.guide",
@@ -218,6 +225,14 @@ def _check_signal_files(data_dir: Path) -> None:
         print(
             "[long-exposure] Graceful-stop signal received; "
             "will exit after current cycle.",
+            flush=True,
+        )
+    elif pause_file.exists():
+        pause_file.unlink(missing_ok=True)
+        _graceful_stop_requested = True
+        print(
+            "[long-exposure] Manager pause-for-user signal received; "
+            "will exit at this cycle boundary and preserve state for resume.",
             flush=True,
         )
 
@@ -280,6 +295,8 @@ RUNTIME_INPUTS: frozenset[str] = frozenset({
     "live_guidance",
     "plan_of_record",
     "promise_ledger_summary",
+    # Cron-polled manager inputs (set by long_exposure.manager)
+    "manager_snapshot",
     # Per-cycle reporter inputs (set in _run_reporter)
     "cycle_range",
     "cycle_sessions",
@@ -1753,49 +1770,17 @@ def _atomic_write_text(path: Path, text: str) -> None:
 def _render_report_pdf(md_path: Path, pdf_path: Path, cwd: str) -> None:
     """Render a periodic-report PDF using pandoc + tectonic.
 
-    Mirrors the command the reporter agent previously ran, so output
-    looks identical. The `-H <(echo ...)` bash process substitution in
-    that command can't be expressed via subprocess, so we materialize
-    the LaTeX header in a tempfile and pass the path instead.
-
     Raises subprocess.CalledProcessError / TimeoutExpired / FileNotFoundError
     on failure so callers can degrade to MD-only.
     """
-    # Unicode glyph coverage via fontspec — see reporting.py:_HEADER_TEX
-    # for the failure mode this prevents (literal Greek/math text falls
-    # back to Latin Modern, which lacks those glyphs and crashes rc=43).
-    # DejaVu is on every modern Linux with the full Unicode BMP.
-    header_body = (
-        r"\usepackage{fontspec}" "\n"
-        r"\setmainfont{DejaVu Serif}" "\n"
-        r"\setsansfont{DejaVu Sans}" "\n"
-        r"\setmonofont{DejaVu Sans Mono}" "\n"
-        r"\renewcommand{\rule}[2]"
-        r"{\noindent\makebox[\textwidth]{\hrulefill}}"
-    )
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".tex", delete=False,
-    ) as hf:
-        hf.write(header_body)
-        header_path = hf.name
-    try:
-        subprocess.run(
-            [
-                "pandoc", str(md_path), "-o", str(pdf_path),
-                "--pdf-engine=tectonic",
-                "-V", "geometry:margin=1in",
-                "-H", header_path,
-            ],
-            cwd=cwd,
-            check=True,
-            timeout=300,
-            capture_output=True,
+    proc = render_report_pdf(md_path, pdf_path, cwd=cwd, timeout=300)
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode,
+            proc.args,
+            output=proc.stdout,
+            stderr=proc.stderr,
         )
-    finally:
-        try:
-            os.unlink(header_path)
-        except OSError:
-            pass
 
 
 class _TeeStream:
@@ -2356,6 +2341,13 @@ def _run_reporter(
         score_inputs=score_inputs,
         agent_summaries=agent_summaries,
     )
+    telemetry.emit_agent_result(
+        "reporter",
+        result,
+        cycle=cycle,
+        provider=config.get("llm_provider"),
+        model=config.get("model"),
+    )
 
     if result["status"] == "ok":
         usage = result.get("usage", {})
@@ -2411,14 +2403,36 @@ def _run_reporter(
                 # downstream reads. Legacy report_cycles_*.md at root
                 # remain readable — _estimate_prior_report_tokens uses
                 # rglob so it picks up reports anywhere.
-                _reports_dir = Path(_wd) / "reports"
+                paths.ensure_layout(config)
+                _reports_dir = paths.cycle_reports_dir(config)
                 try:
                     _reports_dir.mkdir(parents=True, exist_ok=True)
                 except OSError:
                     _reports_dir = Path(_wd)  # fall back to root
-                _md = _reports_dir / f"{_basename}.md"
+                _md = paths.cycle_report_md(config, _basename)
                 try:
-                    _atomic_write_text(_md, output_text)
+                    formatted_report = normalize_report_markdown(
+                        output_text,
+                        fallback_title=(
+                            f"Long-Exposure Report "
+                            f"{cycle_range_start}-{cycle_range_end}"
+                        ),
+                    )
+                    _atomic_write_text(_md, formatted_report)
+                    telemetry.emit(
+                        "report_markdown_written",
+                        phase="report",
+                        cycle=cycle,
+                        agent="reporter",
+                        provider=config.get("llm_provider"),
+                        model=config.get("model"),
+                        status="ok",
+                        data={
+                            "mode": reporter_mode,
+                            "path": str(_md),
+                            "bytes": len(formatted_report.encode("utf-8")),
+                        },
+                    )
                     print(
                         f"[long-exposure]   report: wrote {_md}",
                         flush=True,
@@ -2433,9 +2447,19 @@ def _run_reporter(
                     _md_ok = False
 
                 if _md_ok:
-                    _pdf = _reports_dir / f"{_basename}.pdf"
+                    _pdf = paths.cycle_report_pdf(config, _basename)
                     try:
                         _render_report_pdf(_md, _pdf, _wd)
+                        telemetry.emit(
+                            "report_pdf_render_end",
+                            phase="report",
+                            cycle=cycle,
+                            agent="reporter",
+                            provider=config.get("llm_provider"),
+                            model=config.get("model"),
+                            status="ok",
+                            data={"mode": reporter_mode, "path": str(_pdf)},
+                        )
                         print(
                             f"[long-exposure]   report: wrote {_pdf}",
                             flush=True,
@@ -2453,16 +2477,29 @@ def _run_reporter(
                         if isinstance(
                             _pdf_err, subprocess.CalledProcessError,
                         ) and _pdf_err.stderr:
-                            _stderr_tail = (
-                                _pdf_err.stderr.decode(
-                                    errors="replace",
-                                )[-400:]
-                            )
+                            stderr = _pdf_err.stderr
+                            if isinstance(stderr, bytes):
+                                stderr = stderr.decode(errors="replace")
+                            _stderr_tail = str(stderr)[-400:]
                         print(
                             f"[long-exposure]   report: PDF render "
                             f"failed ({type(_pdf_err).__name__}); "
                             f"MD is authoritative. {_stderr_tail}",
                             flush=True,
+                        )
+                        telemetry.emit(
+                            "report_pdf_render_end",
+                            phase="report",
+                            cycle=cycle,
+                            agent="reporter",
+                            provider=config.get("llm_provider"),
+                            model=config.get("model"),
+                            status="error",
+                            data={
+                                "mode": reporter_mode,
+                                "path": str(_pdf),
+                                "error_class": type(_pdf_err).__name__,
+                            },
                         )
 
         # In merge mode, atomically write the synthesis to merge_report.md
@@ -2474,6 +2511,16 @@ def _run_reporter(
                 _write_merge_report(
                     Path(merge_report_path), output_text, config,
                     cycle_range_str,
+                )
+                telemetry.emit(
+                    "fanout_merge_report_written",
+                    phase="fanout",
+                    cycle=cycle,
+                    agent="reporter",
+                    provider=config.get("llm_provider"),
+                    model=config.get("model"),
+                    status="ok",
+                    data={"path": str(merge_report_path), "bytes": len(output_text.encode("utf-8"))},
                 )
                 print(
                     f"[long-exposure]   merge_report written: {merge_report_path}",
@@ -2833,10 +2880,30 @@ def run_exploration(
     # Resumes (cycle > 1) and workspaces with an existing plan are no-ops
     # by design (docs/workspace-conventions.md). Clones inherit parent state
     # and skip bootstrap (the parent already ran it).
-    workspace_root = Path(config.get("working_directory") or os.getcwd())
+    workspace_root = paths.workspace_root(config.get("working_directory") or os.getcwd())
+    config["working_directory"] = str(workspace_root)
+    paths.ensure_layout(config)
     run_id = state.get("run_id") if state else None
     if not run_id:
         run_id = derive_run_id()
+    telemetry.configure(config, data_dir, run_id)
+    telemetry.emit(
+        "run_resume" if state else "run_start",
+        phase="run",
+        cycle=cycle,
+        provider=config.get("llm_provider"),
+        model=config.get("model"),
+        status="ok",
+        data={
+            "score_path": str(score_path),
+            "config_path": str(config_path) if config_path else None,
+            "state_path": str(state_path),
+            "output_dir": str(output_dir),
+            "task_hash": telemetry.hash_value(task),
+            "flow": flow,
+            "is_clone": _is_clone(),
+        },
+    )
     if not _is_clone():
         try:
             _bs = bootstrap_workspace(
@@ -2901,6 +2968,15 @@ def run_exploration(
                 print(f"[long-exposure] {pool.format_pool_summary()}", flush=True)
         except Exception as _pool_err:  # pool is advisory — never block startup
             print(f"[long-exposure] Pool init warning: {_pool_err}", flush=True)
+    telemetry.emit(
+        "account_usage_snapshot",
+        phase="provider",
+        cycle=cycle,
+        provider=config.get("llm_provider"),
+        model=config.get("model"),
+        status="ok",
+        data={"accounts": telemetry.redact_account_usage(_snapshot_account_usage())},
+    )
 
     total_failure_streak = 0
     cycles_since_last_report = 0
@@ -3027,6 +3103,20 @@ def run_exploration(
                 flow_this_cycle = flow
         else:
             flow_this_cycle = flow
+        telemetry.emit(
+            "cycle_start",
+            phase="cycle",
+            cycle=cycle,
+            provider=config.get("llm_provider"),
+            model=config.get("model"),
+            status="started",
+            data={
+                "flow": flow_this_cycle,
+                "post_merge_pending": post_merge_pending,
+                "in_post_merge_cycle": in_post_merge_cycle,
+                "is_clone": _is_clone(),
+            },
+        )
 
         # Check for live guidance from user
         guidance = _consume_guide_file(data_dir)
@@ -3141,6 +3231,13 @@ def run_exploration(
                     agent_sessions=agent_sessions,
                     agent_summaries=agent_summaries,
                 )
+                telemetry.emit_agent_result(
+                    agent_name,
+                    result,
+                    cycle=cycle,
+                    provider=config.get("llm_provider"),
+                    model=config.get("model"),
+                )
 
                 if result["status"] == "rate_limit":
                     rotation_triggered = True
@@ -3254,6 +3351,26 @@ def run_exploration(
                                 # tunables (min_clone_cycles_before_preempt,
                                 # barrier_preempt_timeout_seconds).
                                 loop_cfg=loop_cfg,
+                            )
+                            telemetry.emit(
+                                "fanout_end",
+                                phase="fanout",
+                                cycle=cycle,
+                                provider=config.get("llm_provider"),
+                                model=config.get("model"),
+                                status="ok",
+                                data={
+                                    "fork_id": _fanout.get("fork_id"),
+                                    "branches": len(_branches),
+                                    "outcomes": [
+                                        {
+                                            "clone_k": o.get("clone_k"),
+                                            "state": o.get("state"),
+                                            "deliverable_status": o.get("deliverable_status"),
+                                        }
+                                        for o in (_fanout.get("outcomes") or [])
+                                    ],
+                                },
                             )
                             # Collapse: the aggregated merge becomes the next
                             # cycle's audit_report input for the researcher.
@@ -3548,6 +3665,22 @@ def run_exploration(
                    daily_sync_count=daily_sync_count)
 
         elapsed = time.monotonic() - cycle_start
+        telemetry.emit(
+            "cycle_end",
+            phase="cycle",
+            cycle=cycle,
+            provider=config.get("llm_provider"),
+            model=config.get("model"),
+            status="ok" if cycle_ok else "error",
+            data={
+                "duration_seconds": round(elapsed, 3),
+                "cycle_output_tokens": cycle_output_tokens,
+                "low_output_streak": low_output_streak,
+                "total_failure_streak": total_failure_streak,
+                "post_merge_pending": post_merge_pending,
+                "failures": consecutive_failures,
+            },
+        )
         print(f"[long-exposure] Cycle {cycle} done ({elapsed:.0f}s)", flush=True)
 
         # ---- Stage 3: Daily sync trigger ----
@@ -3728,6 +3861,20 @@ def run_exploration(
                    daily_sync_count=0,
                    daily_sync_in_progress=False)
         update_status_file(output_dir, cycle, "cleared", consecutive_failures)
+        telemetry.emit(
+            "run_end",
+            phase="run",
+            cycle=cycle,
+            provider=config.get("llm_provider"),
+            model=config.get("model"),
+            status="cleared",
+            data={
+                "topic_exhausted": topic_exhausted,
+                "stop_requested": _stop_requested,
+                "clear_requested": _clear_requested,
+                "failures": consecutive_failures,
+            },
+        )
         print(f"\n[long-exposure] Cleared after {cycle} cycles.", flush=True)
         print("[long-exposure] Context reset. Sessions.db history preserved.", flush=True)
         # Clone robustness: the root conductor's barrier is polling for
@@ -3900,6 +4047,20 @@ def run_exploration(
                    last_daily_sync_at=last_daily_sync_at,
                    daily_sync_count=daily_sync_count)
         update_status_file(output_dir, cycle, "stopped", consecutive_failures)
+        telemetry.emit(
+            "run_end",
+            phase="run",
+            cycle=cycle,
+            provider=config.get("llm_provider"),
+            model=config.get("model"),
+            status="cleared" if _clear_requested else "stopped",
+            data={
+                "topic_exhausted": topic_exhausted,
+                "stop_requested": _stop_requested,
+                "clear_requested": _clear_requested,
+                "failures": consecutive_failures,
+            },
+        )
         print(f"\n[long-exposure] Stopped after {cycle} cycles.", flush=True)
         print("[long-exposure] State preserved. Run again to resume.", flush=True)
 

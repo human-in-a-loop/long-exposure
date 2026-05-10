@@ -32,11 +32,12 @@ Three principles govern every choice in this layer:
 
 When a fresh run starts (cycle 1, no pre-existing
 `plan_of_record.md`), `workspace_bootstrap.ensure_skeleton` creates
-seven standard folders:
+the standard folders:
 
 ```
 <workspace>/
-├── reports/      periodic + final reports
+├── reports/      cycle reports and final-reporter scratch
+├── audits/       final-auditor scratch and sidecar JSONL files
 ├── scripts/      worker-authored code
 ├── tests/        auditor-authored test artifacts
 ├── data/         curated source data
@@ -131,7 +132,7 @@ Required fields:
 | `ts` | ISO8601 | When the event was emitted |
 | `run_id` | string | Run identifier |
 | `cycle` | int | Cycle number within the run |
-| `agent` | string | `researcher` / `worker` / `auditor` / `human` / `harness` |
+| `agent` | string | `researcher` / `worker` / `auditor` / `manager` / `human` / `harness` |
 | `milestone_id` | string | The milestone touched, OR `_plan/<change>` for plan revisions, OR `_run/<event>` for run-level events |
 | `status` | enum | See "Status taxonomy" below |
 | `confidence` | object | `{level, rationale, assessor}` |
@@ -148,7 +149,7 @@ Optional fields:
 | `reopen_conditions` | string | What would cause a deferred / superseded milestone to reopen |
 | `artifacts` | list | Workspace paths produced by this event |
 
-### Status taxonomy (seven values)
+### Status taxonomy (eight values)
 
 These are **immutable** — the same vocabulary across in-cycle audits
 and final audits:
@@ -157,6 +158,7 @@ and final audits:
 |---|---|
 | `not-started` | Milestone declared, no work yet |
 | `in-progress` | Active work, no closure |
+| `action_required` | Manager or auditor requires a specific next-cycle action before normal continuation |
 | `validated` | Closed positively; evidence supports the milestone |
 | `deferred` | Closed without progress, blocked on something not in scope |
 | `reopened` | Re-opened after closure, usually because new evidence contradicts prior closure |
@@ -343,16 +345,16 @@ Walks the workspace and surfaces:
 
 - Files outside the allowed-at-root set.
 - Reports in wrong folders (e.g., `report_*.md` at workspace root
-  instead of `reports/`).
+  instead of `reports/cycles/`).
 - Scripts at root.
 - Large binaries at root.
 - Stale-looking files outside `stale/`.
 
 Allowlist for root: `MANIFEST.md`, `STRUCTURE.md`, `plan_of_record.md`,
 `promise_ledger.jsonl`, `final_report.{md,pdf}`,
-`final_audit_report.{md,pdf}`, `final_audit_summary.json`, plus
-intermediate drafts produced by the final reporter
-(`final_report_outline.md`, `final_report_draft.md`).
+`final_audit_report.{md,pdf}`, `final_audit_summary.json`, and
+the final-output commit markers. Legacy root-stage artifacts are
+reported as notes during the layout transition.
 
 The validator scopes orphan detection to managed paths only:
 standard folders + domain folders declared in STRUCTURE.md +
@@ -388,19 +390,20 @@ Each agent's role text in `exploration-score.yaml` carries a
 | Researcher (subsequent) | Read STRUCTURE.md and plan_of_record.md; emit `_plan/...` events for any changes. |
 | Worker | Scripts → `scripts/`; data → `data/`; tests → `tests/`; figures co-located with source data, NOT a separate `figures/` folder. List artifacts in ledger. |
 | Auditor | Test artifacts → `tests/`; run `promise_check` and `org_check`; cite milestone IDs. |
-| Reporter | Periodic reports → `reports/`. CRITICAL: write content to disk, not just `[OUTPUT]` block. |
-| Final reporter | `final_report.md` at workspace root (curator contract); intermediate drafts at root too. |
-| Final auditor | `final_audit_report.md` and `final_audit_summary.json` at root. |
+| Reporter | Periodic reports → `reports/cycles/`. CRITICAL: write content to disk, not just `[OUTPUT]` block. |
+| Final reporter | `final_report.md` at workspace root (curator contract); intermediate drafts under `reports/final/`. |
+| Final auditor | `final_audit_report.md` and `final_audit_summary.json` at root; scratch and sidecars under `audits/final/`. |
 | Curator | Reads MANIFEST.md "## Key Files"; writes CURATION.yaml; outputs ZIP package. |
 
 ---
 
-## Periodic reports → `reports/` folder
+## Periodic reports → `reports/cycles/` folder
 
 Per Stage 3 §0.5, the periodic reporter writes
-`report_cycles_<N>-<M>.{md,pdf}` to `<workspace>/reports/`. Final
-reports stay at workspace root because the curator contract expects
-them there. `org_check` tolerates both placements.
+`report_cycles_<N>-<M>.{md,pdf}` to `<workspace>/reports/cycles/`.
+Final reports stay at workspace root because the curator contract
+expects them there. `org_check` notes legacy root-stage artifacts but
+new runs route scratch under `reports/final/` and `audits/final/`.
 
 ---
 

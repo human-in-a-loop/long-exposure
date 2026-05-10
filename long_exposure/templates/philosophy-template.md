@@ -21,6 +21,10 @@ Testing:
 Documentation:
 {doc_scope}
 
+== ADDITIONAL DISCIPLINE ==
+
+{additional_discipline}
+
 == SELF-CORRECTION SIGNAL ==
 
 {discomfort_signal}

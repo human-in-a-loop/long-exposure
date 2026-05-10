@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from long_exposure import provider as _provider
+from long_exposure import telemetry
 
 
 # Lazy-import delegators for names defined in long_exposure.exploration.
@@ -1241,6 +1242,18 @@ def _run_fanout_conductor(
         f"{len(branches)} branches ===",
         flush=True,
     )
+    telemetry.emit(
+        "fanout_started",
+        phase="fanout",
+        provider=(config or {}).get("llm_provider") if config else None,
+        model=(config or {}).get("model") if config else None,
+        status="started",
+        data={
+            "fork_id": fork_id,
+            "branches": len(branches),
+            "root_instance_dir": str(root_instance_dir),
+        },
+    )
     for k, br in enumerate(branches):
         print(
             f"[long-exposure]   clone-{k}: {br['objective'][:80]}... "
@@ -1742,6 +1755,26 @@ def _run_fanout_conductor(
         f"({sum(1 for o in outcomes if o['state'] == 'done')}/"
         f"{len(branches)} clean completions)",
         flush=True,
+    )
+    telemetry.emit(
+        "fanout_collapsed",
+        phase="fanout",
+        provider=(config or {}).get("llm_provider") if config else None,
+        model=(config or {}).get("model") if config else None,
+        status="ok",
+        data={
+            "fork_id": fork_id,
+            "branches": len(branches),
+            "outcomes": [
+                {
+                    "clone_k": o.get("clone_k"),
+                    "state": o.get("state"),
+                    "deliverable_status": o.get("deliverable_status"),
+                    "deliverable_path": o.get("deliverable_path"),
+                }
+                for o in outcomes
+            ],
+        },
     )
 
     return {

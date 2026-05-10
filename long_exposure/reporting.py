@@ -16,13 +16,23 @@ runs once at end-of-exploration and is freestanding.
 from __future__ import annotations
 
 import json as _json
+import os
 import re as _re
-import subprocess
 import time as _time
+from datetime import datetime, timezone
 from pathlib import Path
 
-from long_exposure.limits import WALL_CAP_SECONDS
+from long_exposure import paths
+from long_exposure.limits import (
+    DELTA_DETECT_MIN_BYTES,
+    FINAL_STAGE_TOKEN_THRESHOLD,
+    WALL_CAP_SECONDS,
+)
 from long_exposure.orchestrator import ClaudeRateLimitError
+from long_exposure.report_formatting import (
+    normalize_report_file,
+    render_report_pdf,
+)
 
 
 # Lazy-import delegators for names defined in long_exposure.exploration.
@@ -73,18 +83,16 @@ def _is_stop_requested() -> bool:
 
 def _estimate_prior_report_tokens(working_dir: str | Path) -> tuple[int, list[str]]:
     """Estimate total tokens in prior report .md files. Returns (tokens, paths)."""
-    working_dir = Path(working_dir)
-    report_paths = sorted(working_dir.rglob("report_cycles_*.md"))
     total_chars = 0
-    paths = []
-    for p in report_paths:
+    report_paths = []
+    for p in paths.iter_cycle_report_paths(working_dir):
         try:
             total_chars += len(p.read_text())
-            paths.append(str(p))
+            report_paths.append(str(p))
         except OSError:
             pass
     # Rough token estimate: ~4 chars per token
-    return total_chars // 4, paths
+    return total_chars // 4, report_paths
 
 
 def _final_report_expected_file(
@@ -92,16 +100,92 @@ def _final_report_expected_file(
 ) -> Path | None:
     """Return the file path that MUST exist after a final-report stage.
 
-    Stage 1 (Outline)  → final_report_outline.md
-    Body stages        → final_report_draft.md
-    Final stage        → final_report.md
+    Stage 1 (Outline)  → reports/final/outline.md
+    Body stages        → reports/final/draft.md
+    Final stage        → final_report.md at workspace root
     """
-    wd = Path(working_dir)
     if stage == 1:
-        return wd / "final_report_outline.md"
+        return paths.final_report_outline_path(working_dir)
     if stage == total_stages:
-        return wd / "final_report.md"
-    return wd / "final_report_draft.md"
+        return paths.final_report_path(working_dir)
+    return paths.final_report_draft_path(working_dir)
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+        return st.st_size, st.st_mtime_ns
+    except OSError:
+        return None
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{int(_time.time() * 1000)}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def _marker_metadata(marker_path: Path) -> dict | None:
+    if not marker_path.exists():
+        return None
+    try:
+        data = _json.loads(marker_path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (_json.JSONDecodeError, OSError):
+        return {}
+
+
+def _committed_baseline(path: Path, marker_path: Path) -> tuple[bool, str, float | None]:
+    """Detect a delta baseline, preferring explicit commit markers."""
+    marker = _marker_metadata(marker_path)
+    if marker is not None and path.exists():
+        ts = marker.get("committed_at")
+        try:
+            boundary = datetime.fromisoformat(str(ts)).timestamp() if ts else marker_path.stat().st_mtime
+        except (OSError, ValueError):
+            boundary = None
+        return True, "marker", boundary
+    try:
+        if path.exists() and path.stat().st_size > DELTA_DETECT_MIN_BYTES:
+            return True, "legacy_size", None
+    except OSError:
+        pass
+    return False, "none", None
+
+
+def _write_commit_marker(marker_path: Path, *, run_id: str | None, mode: str, token_count: int) -> None:
+    payload = {
+        "committed_at": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "mode": mode,
+        "input_tokens": int(token_count),
+    }
+    try:
+        _atomic_write_text(marker_path, _json.dumps(payload, indent=2) + "\n")
+    except OSError as e:
+        print(f"[long-exposure]   Commit marker write skipped: {e}", flush=True)
+
+
+def _write_run_mode(path: Path, payload: dict) -> None:
+    try:
+        _atomic_write_text(path, _json.dumps(payload, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def _estimate_delta_report_tokens(report_paths: list[str], boundary_ts: float | None) -> int:
+    if boundary_ts is None:
+        return 0
+    chars = 0
+    for raw in report_paths:
+        p = Path(raw)
+        try:
+            if p.stat().st_mtime > boundary_ts:
+                chars += len(p.read_text())
+        except OSError:
+            continue
+    return chars // 4
 
 
 def _load_audit_summary(path: Path) -> tuple[str, str]:
@@ -129,15 +213,17 @@ def _load_audit_summary(path: Path) -> tuple[str, str]:
         return (text, "(audit summary not a JSON object)")
 
     distrib = data.get("milestone_status_distribution") or {}
-    findings = data.get("findings") or {}
+    if not isinstance(distrib, dict):
+        distrib = {}
+    findings = _coerce_findings_counts(data)
     parts = []
     if distrib:
-        ordered = sorted(distrib.items(), key=lambda kv: -int(kv[1] or 0))
+        ordered = sorted(distrib.items(), key=lambda kv: -_coerce_int(kv[1]))
         parts.append(", ".join(f"{v} {k}" for k, v in ordered if v))
     if findings:
         sev_str = " ".join(
             f"{k}={findings.get(k, 0)}"
-            for k in ("CRITICAL", "MODERATE", "MINOR")
+            for k in ("CRITICAL", "MODERATE", "MINOR", "OTHER")
             if findings.get(k) is not None
         )
         if sev_str:
@@ -149,6 +235,37 @@ def _load_audit_summary(path: Path) -> tuple[str, str]:
         parts.append("wall_cap_exceeded")
     headline = " · ".join(parts) if parts else "(audit summary present but empty)"
     return (text, headline)
+
+
+def _coerce_int(value) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return 0
+
+
+def _coerce_findings_counts(data: dict) -> dict:
+    counts = {"CRITICAL": 0, "MODERATE": 0, "MINOR": 0, "OTHER": 0}
+    source = data.get("findings")
+    if isinstance(source, dict):
+        for key, value in source.items():
+            bucket = key if key in counts else "OTHER"
+            counts[bucket] += _coerce_int(value)
+    elif isinstance(source, list):
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+            sev = item.get("severity")
+            bucket = sev if sev in counts else "OTHER"
+            counts[bucket] += 1
+    elif isinstance(data.get("severity_breakdown"), dict):
+        for key, value in data["severity_breakdown"].items():
+            bucket = key if key in counts else "OTHER"
+            counts[bucket] += _coerce_int(value)
+    return {key: value for key, value in counts.items() if value}
 
 
 def _extract_report_content(
@@ -192,7 +309,7 @@ def _rescue_stage_file(
 ) -> bool:
     """If the agent failed to write the expected file, write it from output.
 
-    For body stages, appends to final_report_draft.md.
+    For body stages, appends to reports/final/draft.md.
     For outline/finalize, writes/overwrites the target file.
     Returns True if a rescue write was performed.
     """
@@ -230,48 +347,6 @@ def _rescue_stage_file(
         return False
 
 
-_HEADER_TEX = """\
-% Unicode glyph coverage. Tectonic uses XeTeX, which can render any
-% Unicode codepoint via fontspec, but pandoc's default LaTeX template
-% selects Latin Modern (T1) — no Greek, no math symbols in text mode.
-% A literal `φ` in the markdown would crash with rc=43 ("Missing
-% character: There is no φ (U+03C6) in font [lmroman10-regular]").
-% DejaVu covers the full Unicode BMP and ships with every modern Linux.
-\\usepackage{fontspec}
-\\setmainfont{DejaVu Serif}
-\\setsansfont{DejaVu Sans}
-\\setmonofont{DejaVu Sans Mono}
-
-% Allow line breaks in URLs
-\\usepackage{xurl}
-
-% Microtypographic improvements — character protrusion and font expansion
-\\usepackage{microtype}
-
-% Global overflow tolerance
-\\tolerance=2000
-\\emergencystretch=3em
-\\setlength{\\hfuzz}{5pt}
-
-% Tables: smaller font + sloppy line breaking for narrow columns.
-\\usepackage{etoolbox}
-\\AtBeginEnvironment{longtable}{\\small\\sloppy}
-\\AtBeginEnvironment{quote}{\\sloppy}
-
-% Note: a previous version of this header redefined \\texttt to wrap
-% its argument in \\seqsplit so long inline code could break across
-% lines. That redefinition crashed (rc=43, "Missing number, treated
-% as zero") on pandoc-emitted control sequences containing
-% backslash-caret combinations inside backtick code — seqsplit's
-% per-character splitting can't traverse `\\^` cleanly. The override
-% was load-bearing only for pretty-breaking very long identifiers; we
-% accept occasional overfull-hbox warnings on those (microtype +
-% \\sloppy + \\hfuzz=5pt absorb most cases) in exchange for the
-% renderer not crashing on any markdown that contains carets or
-% backslashes inside backtick code.
-"""
-
-
 def render_pdf(working_dir: str, stem: str = "final_report") -> bool:
     """Deterministic PDF render — called by the orchestrator, not the agent.
 
@@ -291,27 +366,13 @@ def render_pdf(working_dir: str, stem: str = "final_report") -> bool:
         )
         return False
 
-    # Write header.tex for pandoc -H include
-    header_path = wd / "header.tex"
-    header_existed = header_path.exists()
-    if not header_existed:
-        header_path.write_text(_HEADER_TEX)
-
-    cmd = [
-        "pandoc", str(md_path),
-        "-o", str(pdf_path),
-        "--pdf-engine=tectonic",
-        "--toc",
-        "--number-sections",
-        "-H", str(header_path),
-        "-V", "geometry:margin=1in",
-        "-V", "fontsize=11pt",
-        "-V", "documentclass=article",
-        "-V", "colorlinks=true",
-    ]
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300, cwd=working_dir,
+        normalize_report_file(md_path, fallback_title=stem.replace("_", " ").title())
+        proc = render_report_pdf(
+            md_path,
+            pdf_path,
+            cwd=working_dir,
+            timeout=300,
         )
         if proc.returncode == 0:
             size_kb = pdf_path.stat().st_size // 1024
@@ -343,10 +404,6 @@ def render_pdf(working_dir: str, stem: str = "final_report") -> bool:
         except Exception:
             pass
         return False
-    finally:
-        # Clean up header.tex only if we created it
-        if not header_existed and header_path.exists():
-            header_path.unlink()
 
 
 # Backward-compatible alias — the old name is referenced by exploration.py's
@@ -389,19 +446,38 @@ def _run_final_reporter(
     final_report.md and final_report.pdf are always produced when the
     agent generates valid content.
     """
-    working_dir = config.get("working_directory", "/tmp")
+    working_dir = str(paths.workspace_root(config.get("working_directory") or "/tmp"))
+    config["working_directory"] = working_dir
+    paths.ensure_layout(config)
 
     total_tokens, report_paths = _estimate_prior_report_tokens(working_dir)
     if not report_paths:
         print("[long-exposure] No prior reports found — skipping final report.", flush=True)
         return last_session_id
 
-    # Stage 3 §4.4: explicit cap removed so multi-day runs with ~1M tokens
-    # of prior reports get the stages they need. Wall-cap (WALL_CAP_SECONDS)
-    # remains the real ceiling.
-    num_body_stages = max(1, total_tokens // 20_000)
+    final_path = paths.final_report_path(config)
+    marker_path = paths.final_report_commit_marker_path(config)
+    delta_mode, delta_source, boundary_ts = _committed_baseline(final_path, marker_path)
+    mode = "delta" if delta_mode else "fresh"
+    delta_tokens = _estimate_delta_report_tokens(report_paths, boundary_ts) if delta_mode else 0
+    budget_tokens = max(delta_tokens, 1) if delta_mode and boundary_ts is not None else total_tokens
+
+    # Stage count scales with the relevant artifact set: whole workspace for
+    # fresh runs, files newer than the prior committed baseline for deltas.
+    num_body_stages = max(1, budget_tokens // FINAL_STAGE_TOKEN_THRESHOLD)
     total_stages = num_body_stages + 2  # outline + body stages + finalize
-    outline_path = str(Path(working_dir) / "final_report_outline.md")
+    outline_path = str(paths.final_report_outline_path(config))
+    _write_run_mode(paths.final_report_run_mode_path(config), {
+        "agent": "final_reporter",
+        "mode": mode,
+        "detection_source": delta_source,
+        "canonical_path": str(final_path),
+        "commit_marker": str(marker_path),
+        "baseline_boundary_ts": boundary_ts,
+        "total_report_tokens": total_tokens,
+        "budget_tokens": budget_tokens,
+        "stages": total_stages,
+    })
 
     # Audit-summary ingestion (Plan 2 Phase 3). The full JSON is injected
     # verbatim (agent can quote/parse) AND we pre-compute a one-line headline
@@ -409,7 +485,7 @@ def _run_final_reporter(
     # the robust + simple fix for gap 1.3 — text remains the substrate, the
     # headline is an additive fallback. If the JSON is malformed, the headline
     # surfaces "(parse failed)" and the reporter narrates conservatively.
-    _audit_summary_path = Path(working_dir) / "final_audit_summary.json"
+    _audit_summary_path = paths.final_audit_summary_path(config)
     _audit_summary_text, _audit_headline = _load_audit_summary(_audit_summary_path)
 
     # Wall-cap (Plan 2 §7.7) — shared with the final auditor. Document/finalize
@@ -424,9 +500,25 @@ def _run_final_reporter(
         f"~{total_tokens:,} tokens",
         flush=True,
     )
+    if delta_mode:
+        print(
+            f"[long-exposure] Delta final-report mode via {delta_source}; "
+            f"budget ~{budget_tokens:,} tokens",
+            flush=True,
+        )
     print(f"[long-exposure] Stages: {total_stages} (1 outline + {num_body_stages} body + 1 finalize)", flush=True)
 
     prior_reports_str = "\n".join(f"  {p}" for p in report_paths)
+    if delta_mode:
+        prior_reports_str = (
+            "DELTA MODE: A committed baseline final_report.md already exists at "
+            f"{final_path}. Preserve unchanged sections unless the listed cycle "
+            "reports explicitly revise them. Stage 1 should identify changed "
+            "sections; body stages should update only those sections; finalize "
+            "must emit the full revised final_report.md with frontmatter, "
+            "abstract framing, section order, and figure references preserved.\n\n"
+            + prior_reports_str
+        )
 
     # Persistent session — resumes across stages, auto-compacts when needed
     final_sessions: dict = {}
@@ -435,6 +527,7 @@ def _run_final_reporter(
     # Rescue state carried to the next stage's prompt (Fix 2).
     # Set when the FILE GATE fires, consumed and cleared on the next iteration.
     pending_rescue_warning: str | None = None
+    final_stage_touched = False
 
     for stage in range(1, total_stages + 1):
         # Check for stop signal between stages
@@ -466,6 +559,7 @@ def _run_final_reporter(
             stage = total_stages  # advance the loop variable to finalize
 
         expected_path = _final_report_expected_file(stage, total_stages, working_dir)
+        expected_before = _file_signature(expected_path) if expected_path else None
 
         stage_results = dict(results)
         stage_results["stage"] = f"{stage} of {total_stages}"
@@ -473,6 +567,10 @@ def _run_final_reporter(
         stage_results["expected_file"] = str(expected_path) if expected_path else "(none)"
         stage_results["rescue_warning"] = pending_rescue_warning or "(none)"
         stage_results["outline_path"] = outline_path
+        stage_results["draft_path"] = str(paths.final_report_draft_path(config))
+        stage_results["final_report_path"] = str(paths.final_report_path(config))
+        stage_results["report_glob"] = paths.cycle_reports_glob(config)
+        stage_results["final_report_dir"] = str(paths.final_report_scratch_dir(config))
         stage_results["prior_reports"] = prior_reports_str
         stage_results["working_dir"] = working_dir
         stage_results["final_audit_summary"] = _audit_summary_text
@@ -554,6 +652,34 @@ def _run_final_reporter(
                         f"stage-{stage} content before writing the current "
                         f"stage's file."
                     )
+                elif _file_signature(expected) == expected_before:
+                    if stage == total_stages:
+                        print(
+                            f"[long-exposure]   FILE GATE: {expected.name} "
+                            "unchanged during finalize stage.",
+                            flush=True,
+                        )
+                        if (not delta_mode
+                                and _rescue_stage_file(stage, total_stages, expected, output_text)):
+                            final_stage_touched = True
+                            print(
+                                f"[long-exposure]   FILE GATE: rescued "
+                                f"{expected.name} from output.",
+                                flush=True,
+                            )
+                        pending_rescue_warning = (
+                            f"STAGE {stage} FILE GATE FAILED. The expected "
+                            f"file {expected} already existed but was not "
+                            "changed during the finalize stage. Re-write it "
+                            "with the full revised final report."
+                        )
+                    elif stage == 1:
+                        print(
+                            f"[long-exposure]   FILE GATE: {expected.name} "
+                            "unchanged during outline stage.",
+                            flush=True,
+                        )
+                        _rescue_stage_file(stage, total_stages, expected, output_text)
                 # For body stages, also rescue if the file existed before
                 # but the agent didn't append (content went to OUTPUT instead)
                 elif 1 < stage < total_stages:
@@ -579,6 +705,9 @@ def _run_final_reporter(
                                 f"directly to {expected} (create or append) — "
                                 f"do not put it in the [OUTPUT] block."
                             )
+
+                if stage == total_stages and _file_signature(expected) != expected_before:
+                    final_stage_touched = True
 
             # Auto-compact — same pattern as standard reporter
             if total_ctx >= compact_at:
@@ -610,6 +739,7 @@ def _run_final_reporter(
             # Clear session and retry once with a fresh start
             final_sessions.pop("final_reporter", None)
             print(f"[long-exposure]   Cleared session. Retrying stage {stage}...", flush=True)
+            retry_before = _file_signature(expected_path) if expected_path else None
 
             result = _call_agent_with_rotation(
                 agent_name="final_reporter",
@@ -653,6 +783,14 @@ def _run_final_reporter(
                         f"with the correct stage-{stage} content before "
                         f"writing the current stage's file."
                     )
+                elif expected and stage == total_stages and _file_signature(expected) == retry_before:
+                    print(
+                        f"[long-exposure]   FILE GATE (retry): {expected.name} "
+                        "unchanged during finalize stage.",
+                        flush=True,
+                    )
+                elif expected and stage == total_stages:
+                    final_stage_touched = True
 
                 # Auto-compact on retry path too
                 if total_ctx >= compact_at:
@@ -685,9 +823,9 @@ def _run_final_reporter(
         agent_summaries.update(final_summaries)
 
     # --- FINAL GATE: ensure .md and .pdf exist ---
-    final_md = Path(working_dir) / "final_report.md"
-    final_pdf = Path(working_dir) / "final_report.pdf"
-    draft_md = Path(working_dir) / "final_report_draft.md"
+    final_md = paths.final_report_path(config)
+    final_pdf = paths.final_report_pdf_path(config)
+    draft_md = paths.final_report_draft_path(config)
 
     if not final_md.exists() and draft_md.exists():
         # Finalize stage failed to assemble — promote draft as final
@@ -696,15 +834,32 @@ def _run_final_reporter(
             "— promoting draft.",
             flush=True,
         )
-        draft_md.rename(final_md)
+        try:
+            _atomic_write_text(final_md, draft_md.read_text())
+        except OSError as e:
+            print(f"[long-exposure]   FINAL GATE: draft promotion failed: {e}", flush=True)
 
-    if final_md.exists():
+    if final_md.exists() and delta_mode and not final_stage_touched:
+        print(
+            "[long-exposure]   Final report unchanged in delta mode; "
+            "leaving prior baseline and commit marker untouched.",
+            flush=True,
+        )
+    elif final_md.exists():
+        try:
+            normalize_report_file(final_md, fallback_title="Final Report")
+        except OSError as e:
+            print(
+                f"[long-exposure]   Final report normalization skipped: {e}",
+                flush=True,
+            )
         size_kb = final_md.stat().st_size // 1024
         print(f"[long-exposure]   Final report: {final_md.name} ({size_kb} KB)", flush=True)
 
         if not final_pdf.exists():
             print("[long-exposure]   FINAL GATE: PDF missing — rendering now.", flush=True)
             _render_final_pdf(working_dir)
+        _write_commit_marker(marker_path, run_id=results.get("run_id") or score_inputs.get("run_id"), mode=mode, token_count=budget_tokens)
     else:
         print(
             "[long-exposure]   FINAL GATE: final_report.md not produced. "
@@ -714,4 +869,3 @@ def _run_final_reporter(
 
     print(f"\n[long-exposure] Final report complete.", flush=True)
     return last_session_id
-

@@ -26,21 +26,21 @@ report and traceable record out.**
 ## Conceptual map
 
 ```
-                       CLI: long-exposure {start|stop|resume|clear}
+                       CLI: long-exposure {launch|status|guide|start|stop|resume|clear}
                                       │
                                       ▼
               ┌─────────────────────────────────────────────┐
               │ exploration.py — deterministic cycle loop   │
               │  (researcher → worker → auditor; reporter   │
-              │   every N; daily-sync every 24h; signal     │
-              │   polling at cycle boundary; rotation       │
-              │   on rate-limit OR every 24h; auto-compact  │
-              │   at 90%)                                   │
+              │   every N; daily-sync every 24h; manager    │
+              │   notices; signal polling at cycle boundary;│
+              │   rotation on rate-limit OR every 24h;      │
+              │   auto-compact at 90%)                      │
               └─────────────────────────────────────────────┘
                 ▲                  │                       │
                 │                  ▼                       │
                 │       conductor.py / orchestrator.py     │
-                │       (claude -p subprocess; assemble    │
+                │       (provider CLI subprocess; assemble │
                 │        4-layer prompt; agent-teams       │
                 │        within turn; rate-limit detect)   │
                 │                  │                       │
@@ -113,16 +113,45 @@ ledger, reports).
 | **Auditor** | audit | Validates worker's output, runs `promise_check` and `org_check`, produces canonical confidence verdicts, decides VALIDATED / CONTINUE / PIVOT | `audit_report` |
 
 The audit report feeds back to the researcher on the next cycle. There
-is no meta-orchestrator agent. The conductor (`exploration.py`) is the
-control loop.
+is no in-cycle meta-orchestrator agent. The conductor (`exploration.py`)
+is the control loop.
+
+### Cron-polled manager
+
+`long-exposure-manager` is an optional sidecar poller for long-running
+campaigns. It is not in `flow:` and does not gate the cycle loop. A cron
+job can invoke it periodically; it reads deterministic counters first
+(`promise_check`, ledger streaks, manager history, state age), writes a
+manager assessment log every poll, and only calls the `manager` agent
+when the verdict is `act` or `escalate`.
+
+Manager interventions route through existing tolerant channels:
+`_manager/*` ledger events and the one-shot `data/long-exposure.guide`
+file consumed by the next researcher cycle. If the manager process
+crashes or wedges, the main cycle continues unaffected.
+
+Every manager poll also appends a compact structured notice to
+`data/manager_notifications.jsonl`. Launchers and `long-exposure status`
+read that file to surface manager awareness without coupling the cron sidecar
+to a specific Claude/Codex/Gemini interface.
+
+Typical cron form:
+
+```bash
+long-exposure-manager --instance-dir /path/to/instance --no-agent
+```
+
+Omit `--no-agent` in production if the score defines the `manager` agent;
+the poller still stays deterministic for healthy/watch polls and calls the
+agent only for `act` or `escalate` verdicts.
 
 ### Reporter and end-of-run agents
 
 These don't run every cycle. They have their own conditions:
 
 - **Reporter** — every `loop.report_interval` cycles (default 3),
-  consolidates the cycle range into `reports/report_cycles_NNN-MMM.md`
-  and the matching PDF.
+  consolidates the cycle range into
+  `reports/cycles/report_cycles_NNN-MMM.md` and the matching PDF.
 - **Final auditor + final reporter + curator** — run at end-of-run
   (topic exhaustion / max_cycles / stop) AND on daily-sync cadence
   (default every 24h). See `end-of-run-pipeline.md`.
@@ -183,15 +212,20 @@ Two key invariants:
 
 | Concern | Module | Doc |
 |---|---|---|
+| Operator command surface, launcher, status, adapters | `long_exposure/cli.py` | `usage-guide.md` |
+| Environment setup and doctor checks | `long_exposure/tools/setup_env.py` | `local-setup.md` |
 | Cycle loop, signal handling, lifecycle | `long_exposure/exploration.py` | this doc + `usage-guide.md` |
-| `claude -p` subprocess, env handling, rate-limit detection | `long_exposure/orchestrator.py` | `multi-account-pool.md` |
+| Provider CLI subprocess, env handling, rate-limit detection | `long_exposure/orchestrator.py` | `multi-account-pool.md` |
 | Score loading, agent prompt assembly | `long_exposure/conductor.py`, `orchestrator.py` | `configuration-reference.md` |
 | Multi-account pool, slot lifecycle, freshness promotion | `long_exposure/pool.py` | `multi-account-pool.md` |
 | Parallel-cycle fan-out, barrier, merge synthesis, graceful preemption | `long_exposure/fanout.py` | `parallelism.md` |
 | Auto-compact, sessions.db schema, FTS5 search, depth-aware XML summaries | `auto_compact/{db,compact,proximity}.py` | `persistence-and-gems.md` |
-| Reporter, final reporter, file-gate rescue, PDF render | `long_exposure/reporting.py` | `end-of-run-pipeline.md` |
+| Workspace artifact routing | `long_exposure/paths.py` | `workspace-conventions.md` |
+| Reporter, final reporter, file-gate rescue, PDF render | `long_exposure/reporting.py`, `report_formatting.py` | `end-of-run-pipeline.md` |
 | Final auditor, reconciliation events | `long_exposure/auditing.py` | `end-of-run-pipeline.md` |
 | Curator, ZIP package | `long_exposure/curator.py` | `end-of-run-pipeline.md` |
+| Cron-polled manager sidecar | `long_exposure/manager.py` | this doc + `usage-guide.md` |
+| Opt-in passive telemetry | `long_exposure/telemetry.py` | `telemetry.md` |
 | Workspace bootstrap, plan-of-record, ledger | `long_exposure/workspace_bootstrap.py`, `tools/` | `workspace-conventions.md` |
 | MCP search server (exposes session search to agents) | `long_exposure/mcp_search_server.py` | `persistence-and-gems.md` |
 | Off-nominal events log | `long_exposure/health_events.py` | (see source comments) |
@@ -208,5 +242,6 @@ Two key invariants:
 - **Context that survives compaction** → `persistence-and-gems.md`
 - **What happens at end of run** → `end-of-run-pipeline.md`
 - **Workspace structure, POR, ledger** → `workspace-conventions.md`
+- **Passive telemetry for later improvement analysis** → `telemetry.md`
 - **Figures as first-class deliverables** → `figures.md`
 - **Soft-guidance philosophy** → `soft-guidance.md`

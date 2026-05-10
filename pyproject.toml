@@ -29,7 +29,10 @@ dependencies = [
 figures-arch = ["diagrams>=0.23"]
 
 [project.scripts]
-long-exposure = "long_exposure.exploration:main"
+long-exposure = "long_exposure.cli:main"
+long-exposure-manager = "long_exposure.manager:main"
+long-exposure-setup = "long_exposure.tools.setup_env:setup_main"
+long-exposure-doctor = "long_exposure.tools.setup_env:doctor_main"
 auto-compact = "auto_compact.cli:main"
 figure = "long_exposure.tools.figure:main"
 wolfram-batch = "long_exposure.tools.wolfram_batch:main"

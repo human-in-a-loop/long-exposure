@@ -17,6 +17,8 @@ long-exposure does, see the project [README](../README.md).
    / `clear`, daily controls, working directory, monitoring.
 3. **[`configuration-reference.md`](configuration-reference.md)** —
    every config and score YAML knob with defaults and tradeoffs.
+4. **[`telemetry.md`](telemetry.md)** — optional passive telemetry for
+   future run analysis.
 
 ### "I want to understand how it works"
 
@@ -46,6 +48,7 @@ long-exposure does, see the project [README](../README.md).
 | [`usage-guide.md`](usage-guide.md) | Daily controls, instances, monitoring | Operating |
 | [`local-setup.md`](local-setup.md) | Install, deps, directory layout, verify | First time |
 | [`configuration-reference.md`](configuration-reference.md) | Every YAML knob (config + score) with effort/budget mapping | Configuring |
+| [`telemetry.md`](telemetry.md) | Disabled-by-default local telemetry, rollups, privacy defaults | Run improvement analysis |
 | [`parallelism.md`](parallelism.md) | Fan-out + agent-teams + depth=1 rationale | Scaling |
 | [`multi-account-pool.md`](multi-account-pool.md) | Pool state machine, freshness promotion, slot lifecycle, rate-limit detection | Multi-account |
 | [`persistence-and-gems.md`](persistence-and-gems.md) | sessions.db, auto-compact, gems, MCP search | Context lifecycle |

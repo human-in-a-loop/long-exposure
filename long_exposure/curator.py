@@ -59,6 +59,8 @@ _PACKAGE_HARD_EXCLUDE_NAMES = {
     "long-exposure.stop",
     "long-exposure.clear",
     "long-exposure.guide",
+    "long-exposure.pause-for-user",
+    "manager.lock",
     # Legacy names retained one release for defense-in-depth: workspaces
     # mid-transition may still carry these.
     "exploration.stop",
@@ -72,6 +74,9 @@ _PACKAGE_HARD_EXCLUDE_SUFFIXES = {".tmp", ".zip", ".db", ".log"}
 _PACKAGE_HARD_EXCLUDE_PATTERNS = [
     _re.compile(r"^report_cycles_[^/]+\.md$"),
     _re.compile(r"^report_cycles_[^/]+\.pdf$"),
+    _re.compile(r"(^|/)reports/final(/|$)"),
+    _re.compile(r"(^|/)audits(/|$)"),
+    _re.compile(r"(^|/)manager_assessments(/|$)"),
 ]
 
 
@@ -87,7 +92,7 @@ def _is_package_hard_excluded(rel_path: str) -> bool:
     if Path(rel_path).suffix in _PACKAGE_HARD_EXCLUDE_SUFFIXES:
         return True
     for pat in _PACKAGE_HARD_EXCLUDE_PATTERNS:
-        if pat.match(name):
+        if pat.match(name) or pat.search(rel_path):
             return True
     return False
 
@@ -656,4 +661,3 @@ def _run_curator(
 
     print(f"\n[long-exposure] Curation complete.", flush=True)
     return last_session_id
-

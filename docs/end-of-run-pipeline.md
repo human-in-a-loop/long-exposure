@@ -43,8 +43,8 @@ Runs every `report_interval` cycles. Reads:
 
 Writes:
 
-- `<workspace>/reports/report_cycles_NNN-MMM.md`.
-- `<workspace>/reports/report_cycles_NNN-MMM.pdf` via `render_pdf`.
+- `<workspace>/reports/cycles/report_cycles_NNN-MMM.md`.
+- `<workspace>/reports/cycles/report_cycles_NNN-MMM.pdf` via `render_pdf`.
 
 The reporter's role text instructs it to write its content into the
 workspace using its declared `Write` permissions; the harness
@@ -124,7 +124,8 @@ record of the same content. Schema:
   "run_id": "run-<TIMESTAMP>",
   "milestone_status_distribution": {
     "validated": N, "in-progress": N, "deferred": N,
-    "reopened": N, "superseded": N, "invalidated": N, "not-started": N
+    "reopened": N, "superseded": N, "invalidated": N,
+    "not-started": N, "action_required": N
   },
   "plan_milestone_state": {
     "M-ID": {
@@ -150,7 +151,7 @@ record of the same content. Schema:
 When the audit detects a milestone that was silently superseded
 (e.g., the worker started over without emitting a `superseded` event),
 the auditor stages a reconciliation finding to
-`<workspace>/final_audit_findings.jsonl`. **All staged findings are
+`<workspace>/audits/final/findings.jsonl`. **All staged findings are
 committed to `promise_ledger.jsonl` in a single batch at the document
 stage** — never incrementally. This guarantees:
 
@@ -214,8 +215,8 @@ real ceiling.
 
 | Stage | Output |
 |---|---|
-| **outline** (1) | `<workspace>/final_report_outline.md` — narrative skeleton |
-| **body** (×N) | Appends sections to `<workspace>/final_report_draft.md` |
+| **outline** (1) | `<workspace>/reports/final/outline.md` — narrative skeleton |
+| **body** (×N) | Appends sections to `<workspace>/reports/final/draft.md` |
 | **finalize** (1) | Consolidates draft into `<workspace>/final_report.md` |
 
 The reporter's session persists across stages (each stage is one
@@ -229,8 +230,8 @@ Auto-compact within the reporter's session triggers at 90% as usual.
 | `directive` | original task |
 | `stage`, `total_stages`, `expected_file` | per-stage staging |
 | `rescue_warning` | set if previous stage's file-gate fired |
-| `outline_path` | workspace path to outline (after stage 1) |
-| `prior_reports` | mtime-filtered list of `report_cycles_*.md` files (see daily-sync below) |
+| `outline_path`, `draft_path` | workspace paths under `reports/final/` |
+| `prior_reports` | list of cycle report files from current and legacy routing |
 | `working_dir` | workspace root |
 | `final_audit_summary` | the JSON from the final auditor |
 | `final_audit_headline` | the one-line headline computed by the harness |
@@ -285,7 +286,7 @@ selects entries. It writes `CURATION.yaml` with `include` list +
 hard exclude list:
 
 - Process artifacts: `sessions.db`, signal files, per-cycle reports.
-- Intermediate drafts: `final_report_draft.md`, `final_report_outline.md`.
+- Intermediate drafts under `reports/final/`.
 - Previous packages: `<slug>_package*.zip`.
 
 Entries with `role: figure` are staged under `figures/` in the bundle
@@ -481,8 +482,9 @@ idempotent commit) are unit-tested.
 
 ## PDF rendering (Stage 8 — unified)
 
-`reporting.render_pdf(working_dir, stem)` is the single canonical
-PDF rendering path, used for:
+`report_formatting.normalize_report_markdown` and
+`reporting.render_pdf(working_dir, stem)` are the canonical report
+formatting path, used for:
 
 - `final_report.{md,pdf}`
 - `final_audit_report.{md,pdf}`
@@ -494,22 +496,35 @@ PDF rendering path, used for:
 pandoc <stem>.md
   -o <stem>.pdf
   --pdf-engine=tectonic
-  --toc
-  --number-sections
-  -H header.tex
+  --resource-path <workspace>:<report-dir>:.
   -V geometry:margin=1in
-  -V fontsize=11pt
+  -V fontsize=10pt
   -V documentclass=article
+  -V mainfont="DejaVu Serif"
+  -V monofont="DejaVu Sans Mono"
+  -V monofontoptions="Scale=0.82"
   -V colorlinks=true
+  -V linestretch=1.05
+  -H header.tex
+  --toc
+  --toc-depth=2
+  --highlight-style=tango
 ```
 
-`header.tex` is written once (then optionally cleaned up) with a
-LaTeX preamble that includes:
+Before rendering, Markdown is normalized deterministically:
 
-- DejaVu fonts for Unicode coverage (XeTeX via tectonic).
-- `xurl` for line-breaking long URLs.
-- `microtype` for typographic refinement.
-- Table overflow tolerance.
+- YAML frontmatter is added or updated with a title, date, `toc: true`,
+  `toc-depth: 2`, `numbersections: false`, and `fontsize: 10pt`.
+- Blank lines are inserted before ATX headings outside fenced code blocks,
+  preventing Pandoc from swallowing headings into preceding lists.
+
+`header.tex` is written as a temporary include and removed after render.
+Its LaTeX preamble includes:
+
+- `fvextra` with wrapped, framed code blocks and Pandoc `Highlighting`
+  recustomization.
+- `xurl`, `microtype`, and underscore breakpoints for long URLs and paths.
+- Figure sizing, caption defaults, and section barriers to limit float drift.
 
 ### Failure handling
 

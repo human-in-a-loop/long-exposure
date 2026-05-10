@@ -68,6 +68,7 @@ PHILOSOPHY_EFFORT_MAP = {
     "efficient": "medium",
     "research": "high",
     "audit": "high",
+    "oversight": "high",
     "reporter": "medium",
     "custom": "high",  # safe default for unknown custom philosophies
 }
@@ -133,7 +134,9 @@ PHILOSOPHY_PRESETS = {
         "explore_depth": (
             "Be exhaustive within the problem scope. Read every relevant file. Map\n"
             "dependencies. Build a mental model of the system before you touch it.\n"
-            "Exploration is not overhead — it is the work."
+            "Exploration is not overhead — it is the work. Exhaustive means\n"
+            "understanding the mechanism space, not just sweeping the configuration\n"
+            "space of one approach."
         ),
         "plan_detail": (
             "Structure the plan as hypotheses to test, not tasks to complete. Each\n"
@@ -167,6 +170,79 @@ PHILOSOPHY_PRESETS = {
             "Spend tokens on understanding. Thorough exploration and detailed\n"
             "documentation are first-class outputs, not overhead. The only waste\n"
             "is verbosity that doesn't add insight — be precise, not voluminous."
+        ),
+        "mechanism_first_discipline": (
+            "Before any cycle that proposes an empirical test (configuration tweak,\n"
+            "regularization addition, boundary-condition modification, parameter\n"
+            "sweep), state the mechanism hypothesis the test discriminates: 'I think\n"
+            "X causes Y because Z. This test rules X in if A, and rules X out if B.'\n"
+            "If you cannot write that sentence, the test is not ready; analyze first.\n\n"
+            "After N>=3 same-class failures (same exception class, same hang\n"
+            "signature, same finding ID, or same milestone stuck in progress), the\n"
+            "next deliverable is a first-principles analytical probe, not another\n"
+            "empirical variant. Mechanism analysis counts as advancement.\n\n"
+            "Before adding a regularization term, source term, or boundary change,\n"
+            "evaluate its expression symbolically at every special point in the\n"
+            "domain (t=0, J=0, B=0, epsilon floor, geometric symmetry axes, relevant\n"
+            "parameter limits). State the result. A term that vanishes exactly where\n"
+            "it must act is not regularizing that point."
+        ),
+        "confounded_variables_discipline": (
+            "When a system has multiple independent axes (constitutive law,\n"
+            "geometry, boundary conditions, solver configuration, mesh, data\n"
+            "selection), do not keep one axis at full complexity while repeatedly\n"
+            "varying another and then claim attribution. When a finding accumulates\n"
+            "multiple cycles or sources, simplify or vary one orthogonal axis before\n"
+            "continuing the same-axis sweep. This is bisection applied to models."
+        ),
+    },
+    "oversight": {
+        "budget": "medium",
+        "speed": "medium",
+        "quality": "high",
+        "complexity": "medium",
+        "voice": (
+            "You are a process auditor, not the campaign scientist. You detect\n"
+            "patterns of investigation across cycles: axis fixation, mechanism\n"
+            "deferral, plan drift, and repeated ineffective interventions. You\n"
+            "intervene rarely and surgically because over-intervention degrades the\n"
+            "researcher's autonomy."
+        ),
+        "explore_depth": (
+            "Read deterministic counters first and prose second. Counters, validator\n"
+            "results, ledger history, state age, and prior manager interventions are\n"
+            "your primary evidence. Descend into cycle prose only to verify or refute\n"
+            "a counter signal."
+        ),
+        "plan_detail": (
+            "Frame interventions as the cheapest correction for the detected pattern:\n"
+            "live guidance first, directive patch only when guidance is insufficient,\n"
+            "pause-for-user only after repeated failed interventions or corrupt state."
+        ),
+        "execute_style": (
+            "Produce structured outputs the poller can route. Every intervention must\n"
+            "include a concise manager event class, the detected pattern, the required\n"
+            "next-cycle behavior, and evidence. Free-form advice is acceptable only as\n"
+            "the human-readable part of a structured event."
+        ),
+        "test_rigor": (
+            "Track intervention history. If the same pattern was acted on within the\n"
+            "last two manager polls and persists, treat the prior intervention as\n"
+            "failed and escalate instead of repeating similar guidance."
+        ),
+        "doc_scope": (
+            "Every poll leaves a manager assessment record. A no-op poll still states\n"
+            "which counters were checked and why no intervention was needed."
+        ),
+        "discomfort_signal": (
+            "Feel discomfort when you adjudicate per-cycle scientific merit, when you\n"
+            "patch a directive where a guidance hint would suffice, or when you emit\n"
+            "prose without a structured event that the auditor can trace."
+        ),
+        "token_guidance": (
+            "Spend tokens on diagnosis and compact intervention wording, not on\n"
+            "re-analyzing the science. The cycle auditor owns per-cycle validation;\n"
+            "you own multi-cycle process discipline."
         ),
     },
     "audit": {
@@ -346,6 +422,95 @@ PHILOSOPHY_PRESETS = {
 }
 
 FRAMEWORK_PRESETS = {
+    "oversight": {
+        "transition_rule": "strict",
+        "regression_policy": "one_step",
+        "skip_policy": "never",
+        "max_regressions": 1,
+        "trivial_task_rule": (
+            "Even a healthy poll must pass through assess and log. Diagnose and\n"
+            "intervene may be brief no-op stages when deterministic counters are green."
+        ),
+        "stages": [
+            {
+                "name": "assess",
+                "purpose": (
+                    "Read the manager snapshot and counters. Identify whether the\n"
+                    "poll is healthy, watch, act, or escalate."
+                ),
+                "gates": [
+                    "Have I read the deterministic counter snapshot first?",
+                    "Have I identified prior manager interventions on the same pattern?",
+                    "Have I separated process discipline from per-cycle scientific judgment?",
+                ],
+                "output": "Assessment verdict with cited counters.",
+                "anti_patterns": [
+                    {
+                        "name": "The Silent Lurker",
+                        "description": "Reading state without leaving an assessment record.",
+                    },
+                ],
+                "philosophy_scaling": "oversight: Counter-first and concise.",
+            },
+            {
+                "name": "diagnose",
+                "purpose": (
+                    "Determine the root process pattern and the cheapest correction."
+                ),
+                "gates": [
+                    "Is the detected issue multi-cycle rather than a normal auditor concern?",
+                    "Is there concrete evidence for the pattern?",
+                    "Would no intervention, watch-only logging, or a simple hint suffice?",
+                ],
+                "output": "Pattern diagnosis and intervention class.",
+                "anti_patterns": [
+                    {
+                        "name": "The Cycle Encroacher",
+                        "description": "Overruling the cycle auditor on scientific merit.",
+                    },
+                    {
+                        "name": "The Helicopter Parent",
+                        "description": "Intervening on every poll instead of preserving autonomy.",
+                    },
+                ],
+                "philosophy_scaling": "oversight: Prefer the least disruptive correction.",
+            },
+            {
+                "name": "intervene",
+                "purpose": (
+                    "Produce a structured intervention only when the verdict requires it."
+                ),
+                "gates": [
+                    "Is the guidance actionable for the next researcher brief?",
+                    "Is there a structured event class and evidence trail?",
+                    "If this pattern was recently acted on, am I escalating instead of repeating?",
+                ],
+                "output": "Structured manager event plus optional live-guidance text.",
+                "anti_patterns": [
+                    {
+                        "name": "The Cassandra",
+                        "description": "Warning without a concrete remediation.",
+                    },
+                    {
+                        "name": "The Repeat Offender",
+                        "description": "Repeating an intervention after the prior one failed.",
+                    },
+                ],
+                "philosophy_scaling": "oversight: Intervention text should be short and binding.",
+            },
+            {
+                "name": "log",
+                "purpose": "Write a durable assessment record for this poll.",
+                "gates": [
+                    "Does the log state what was read?",
+                    "Does it explain why action was or was not taken?",
+                ],
+                "output": "Manager assessment log entry.",
+                "anti_patterns": [],
+                "philosophy_scaling": "oversight: Every poll logs, including no-op polls.",
+            },
+        ],
+    },
     "staged": {
         "transition_rule": "strict",
         "regression_policy": "one_step",
@@ -434,6 +599,56 @@ FRAMEWORK_PRESETS = {
                     "  you're overcomplicating it.\n"
                     "research: Plan as hypotheses to test. Include instrumentation\n"
                     "  and expected observations."
+                ),
+            },
+            {
+                "name": "mechanism_check",
+                "purpose": (
+                    "Before executing, verify that the plan discriminates a mechanism\n"
+                    "rather than merely varying another setting. Catch same-axis\n"
+                    "fixation, confounded variables, and regularizers that vanish at\n"
+                    "the point where they are supposed to act."
+                ),
+                "gates": [
+                    "If this is the 3rd+ attempt on the same finding or milestone, have I produced an explicit mathematical or mechanistic statement of the shared failure?",
+                    "If the plan adds a regularization, source, or boundary modification, have I evaluated it at domain special points and parameter limits?",
+                    "Have I listed at least two alternative mechanism hypotheses with falsification criteria?",
+                    "Is this experiment varying a previously unvaried axis, or have I justified why another same-axis variation is still informative?",
+                ],
+                "output": (
+                    "Mechanism statement, falsification criteria, special-point checks,\n"
+                    "and an axis log naming the primary axis varied and axes held\n"
+                    "constant."
+                ),
+                "anti_patterns": [
+                    {
+                        "name": "The Bisection Skip",
+                        "description": (
+                            "Varying axis X for the third time without holding X steady and\n"
+                            "probing axis Y. If Y is binding, all X experiments fail alike."
+                        ),
+                    },
+                    {
+                        "name": "The Mechanism Deferral",
+                        "description": (
+                            "'I'll figure out why after it works.' When work is failing,\n"
+                            "mechanism understanding is the path to working."
+                        ),
+                    },
+                    {
+                        "name": "The Vanishing Regularizer",
+                        "description": (
+                            "Adding a term whose coefficient is zero at the boundary,\n"
+                            "symmetry axis, zero field, initial time, or parameter limit\n"
+                            "where it was supposed to act."
+                        ),
+                    },
+                ],
+                "philosophy_scaling": (
+                    "efficient: Mandatory at cycle 3+ of the same finding; otherwise\n"
+                    "  keep it brief.\n"
+                    "research: Mandatory every cycle. This is part of exploration and\n"
+                    "  may consume up to 30% of the cycle budget."
                 ),
             },
             {
@@ -1334,9 +1549,28 @@ def load_config(path: str | Path | None = None) -> dict:
         "cli_timeout": 0,
         "context_proximity": dict(DEFAULT_CONTEXT_PROXIMITY),
         "relevance_profiles": dict(DEFAULT_RELEVANCE_PROFILES),
+        "telemetry": {
+            "enabled": False,
+            "level": "standard",
+            "include_prompt_text": False,
+            "include_response_text": False,
+            "include_tool_stdout": False,
+            "max_text_field_chars": 2000,
+            "max_event_bytes": 65536,
+            "redact_paths": False,
+            "redact_env": True,
+        },
     }
     for key, default in defaults.items():
         config.setdefault(key, default)
+    if isinstance(defaults.get("telemetry"), dict):
+        telemetry_defaults = dict(defaults["telemetry"])
+        telemetry_cfg = config.get("telemetry")
+        if not isinstance(telemetry_cfg, dict):
+            telemetry_cfg = {}
+        for key, default in telemetry_defaults.items():
+            telemetry_cfg.setdefault(key, default)
+        config["telemetry"] = telemetry_cfg
     _provider.configure_provider(config)
     config["llm_provider"] = _provider.current_provider()
     if _provider.is_codex():
@@ -1789,6 +2023,19 @@ def assemble_system_prompt(
 
     phil_vars["philosophy_name"] = config["philosophy"]
     phil_vars["model_tier"] = config["model_tier"]
+    extra_discipline = []
+    for key in (
+        "mechanism_first_discipline",
+        "confounded_variables_discipline",
+    ):
+        val = str(phil_vars.get(key) or "").strip()
+        if val:
+            extra_discipline.append(val)
+    phil_vars["additional_discipline"] = (
+        "\n\n".join(extra_discipline)
+        if extra_discipline else
+        "No additional discipline beyond the baseline philosophy."
+    )
 
     prompt_parts.append(fill_simple_vars(philosophy_template, phil_vars))
 
@@ -2493,6 +2740,12 @@ def _extract_codex_envelope(stdout: str, final_text: str, duration_ms: int) -> d
         except json.JSONDecodeError:
             continue
         saw_event = True
+        # Codex JSONL has changed shape across CLI versions. Some builds emit
+        # flat events (`{"type": ...}`), while others wrap the payload under
+        # `msg`. Accept both so a harmless CLI schema wrapper does not erase
+        # session continuity or usage accounting.
+        if isinstance(event.get("msg"), dict):
+            event = event["msg"]
         if event.get("type") == "thread.started":
             thread_id = event.get("thread_id") or thread_id
         elif event.get("type") == "turn.completed":

@@ -36,6 +36,7 @@ from pathlib import Path
 STATUS_VALUES = {
     "not-started",
     "in-progress",
+    "action_required",
     "validated",
     "deferred",
     "reopened",
@@ -45,7 +46,14 @@ STATUS_VALUES = {
 
 CONFIDENCE_LEVELS = {"high", "medium", "low", "provisional"}
 
-ASSESSORS = {"auditor", "researcher", "worker", "human", "final_auditor"}
+ASSESSORS = {
+    "auditor",
+    "researcher",
+    "worker",
+    "human",
+    "manager",
+    "final_auditor",
+}
 
 REQUIRED_EVENT_FIELDS = (
     "event_id",
@@ -59,7 +67,7 @@ REQUIRED_EVENT_FIELDS = (
     "narrative",
 )
 
-RESERVED_NAMESPACES = ("_plan/", "_run/", "_archive/", "_orphan/")
+RESERVED_NAMESPACES = ("_plan/", "_run/", "_archive/", "_orphan/", "_manager/")
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +405,114 @@ def _check_confidence_calibration(
 
 
 # ---------------------------------------------------------------------------
+# Multi-cycle investigation discipline — surface, never enforce.
+# ---------------------------------------------------------------------------
+
+
+_TERMINAL_STATUSES = {"validated", "deferred", "superseded", "invalidated"}
+_MECHANISM_RE = re.compile(
+    r"<mechanism\b|mechanism\s+statement|falsification_criteria|"
+    r"special_points_evaluated",
+    re.IGNORECASE,
+)
+
+
+def _non_reserved_events(events: list[dict]) -> list[dict]:
+    return [
+        ev for ev in events
+        if not _is_reserved(str(ev.get("milestone_id") or ""))
+    ]
+
+
+def _events_since_latest_terminal(evs: list[dict]) -> list[dict]:
+    evs = sorted(evs, key=lambda e: (e.get("ts", ""), e.get("_line", 0)))
+    latest_terminal_idx = -1
+    for i, ev in enumerate(evs):
+        if ev.get("status") in _TERMINAL_STATUSES:
+            latest_terminal_idx = i
+    return evs[latest_terminal_idx + 1:]
+
+
+def _has_mechanism_evidence(evs: list[dict]) -> bool:
+    for ev in evs:
+        haystack = "\n".join(
+            str(ev.get(key) or "")
+            for key in ("narrative", "scope", "reopen_conditions")
+        )
+        conf = ev.get("confidence")
+        if isinstance(conf, dict):
+            haystack += "\n" + str(conf.get("rationale") or "")
+        if _MECHANISM_RE.search(haystack):
+            return True
+    return False
+
+
+def _check_cycles_per_finding(events: list[dict], findings: Findings) -> None:
+    """Warn when a milestone/finding has accumulated many active cycles.
+
+    This intentionally derives from the existing ledger instead of requiring a
+    new finding database. The manager agent uses the same signal as a counter;
+    promise_check only surfaces it for the auditor and human.
+    """
+    by_mid: dict[str, list[dict]] = {}
+    for ev in _non_reserved_events(events):
+        mid = str(ev.get("milestone_id") or "")
+        if mid:
+            by_mid.setdefault(mid, []).append(ev)
+
+    for mid, evs in sorted(by_mid.items()):
+        active = _events_since_latest_terminal(evs)
+        cycles = {
+            ev.get("cycle")
+            for ev in active
+            if isinstance(ev.get("cycle"), int)
+        }
+        in_progress_cycles = {
+            ev.get("cycle")
+            for ev in active
+            if ev.get("status") in {"in-progress", "reopened", "action_required"}
+            and isinstance(ev.get("cycle"), int)
+        }
+        if len(in_progress_cycles) >= 3 and not _has_mechanism_evidence(active):
+            findings.warn(
+                f"{mid!r}: {len(in_progress_cycles)} active cycle(s) since latest "
+                "terminal event with no mechanism marker in ledger narratives; "
+                "next researcher brief should include a <mechanism> block or an "
+                "analytical probe"
+            )
+        elif len(cycles) >= 5:
+            findings.note(
+                f"{mid!r}: {len(cycles)} active cycle(s) since latest terminal event"
+            )
+
+
+def _check_manager_interventions(events: list[dict], findings: Findings) -> None:
+    manager_events = [
+        ev for ev in events
+        if str(ev.get("milestone_id") or "").startswith("_manager/")
+    ]
+    if not manager_events:
+        return
+    manager_events.sort(key=lambda e: (e.get("ts", ""), e.get("_line", 0)))
+    recent = manager_events[-3:]
+    recent_action = [
+        ev for ev in recent
+        if ev.get("status") == "action_required"
+    ]
+    if len(recent_action) >= 2:
+        classes = [
+            str(ev.get("milestone_id") or "").split("/", 1)[-1]
+            for ev in recent_action
+        ]
+        if len(set(classes)) == 1:
+            findings.warn(
+                f"manager intervention {classes[-1]!r} repeated "
+                f"{len(recent_action)} time(s) in the last 3 manager events; "
+                "if the pattern persists, escalate rather than repeat guidance"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Deliberate non-implementation: markdown YAML frontmatter check.
 #
 # Plan 4 §4.2 prescribes YAML frontmatter on every agent-authored .md file.
@@ -566,6 +682,8 @@ def run(workspace: Path, *, strict: bool = False) -> Findings:
     _check_lifecycle(events, findings)
     _check_plan_mtime(plan_path, events, findings)
     _check_confidence_calibration(events, findings, strict=strict)
+    _check_cycles_per_finding(events, findings)
+    _check_manager_interventions(events, findings)
     _check_artifact_coherence(workspace, events, findings)
 
     findings.note(f"events: {len(events)}, plan milestones: {len(plan_milestones)}")

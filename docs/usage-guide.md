@@ -8,39 +8,47 @@ For the conceptual map and how the subsystems compose, see
 [`architecture-overview.md`](architecture-overview.md). For environment setup,
 see [`local-setup.md`](local-setup.md). This guide focuses on day-to-day use.
 
-There are three ways to drive it, in order of preference:
+There are four ways to drive it, in order of preference:
 
 | Interface | When to use | Form |
 |---|---|---|
-| **`/long-exposure` from Claude Code** | Preferred — day-to-day use | `/long-exposure <directive>` |
-| **`long-exposure` CLI binary** | Terminal / scripted use | `long-exposure start "<directive>"` |
+| **`long-exposure launch`** | Provider-neutral day-to-day use from any terminal or LLM CLI shell | `long-exposure launch "<directive>"` |
+| **CLI adapter / slash command** | Claude/Codex/Gemini session convenience | route to `long-exposure launch "<directive>"` |
+| **`long-exposure start`** | Lower-level scripted conductor call | `long-exposure start "<directive>"` |
 | **`python3 -m long_exposure.exploration`** | Fallback when the console script isn't installed | `python3 -m long_exposure.exploration start ...` |
 
-The three interfaces call the same code. Unless noted, every flag and
-subcommand is identical across them. This guide leads with the slash-command
-form and shows the CLI form alongside; the `python3 -m ...` form works the
-same way and is omitted for brevity.
+The launcher and adapters call the same conductor code. The launcher adds
+preflight checks, status visibility, and manager-notice awareness; `start` is
+kept as a stable low-level command for scripts.
 
 ---
 
 ## Quick Start
 
-**From within Claude Code:**
+**Provider-neutral launcher:**
+
+```bash
+long-exposure launch "Explore the foundations of microlocal analysis"
+```
+
+**From within Claude Code, when the adapter is installed:**
 
 ```
 /long-exposure Explore the foundations of microlocal analysis
 ```
 
-The slash command is a one-shot launcher: it dispatches immediately with no
-confirmation prompt and no directive re-parsing. It forks `long-exposure
-start "<your directive>"` in the background (detached via `nohup`), appends
-stdout+stderr to a predictable log file, and prints the PID plus a
-`tail -f` hint. For example:
+CLI adapters should be thin routing layers. They should invoke
+`long-exposure launch "<directive>"` rather than duplicating launch logic in
+prompts or shell fragments.
 
+To install project-local adapter files where supported:
+
+```bash
+long-exposure cli-install --target all --directory .
 ```
-[long-exposure] started pid=12345 log=/path/to/long-exposure/long_exposure/data/long-exposure.run.log
-[long-exposure] tail: tail -f /path/to/long-exposure/long_exposure/data/long-exposure.run.log
-```
+
+This writes deterministic routing files for Claude, Codex, and Gemini with
+overwrite safeguards. Use `--force` only when you want backups plus overwrite.
 
 The run goes until you stop it (Ctrl+C on the tail, stop signal, or topic
 exhaustion).
@@ -73,8 +81,9 @@ pre-edited score, but you'll usually want to pass the directive inline.
 
 | Interface | Command |
 |---|---|
-| Claude Code | `/long-exposure <directive>` |
-| CLI | `long-exposure start "<directive>"` |
+| Provider-neutral launcher | `long-exposure launch "<directive>"` |
+| Claude/Codex/Gemini adapter | route to `long-exposure launch "<directive>"` |
+| Low-level CLI | `long-exposure start "<directive>"` |
 | Module | `python3 -m long_exposure.exploration start "<directive>"` |
 
 Starting with a directive **archives and clears** any existing state file
@@ -167,6 +176,12 @@ Send guidance that will be read by agents at the start of the next cycle —
 without stopping the run:
 
 ```bash
+long-exposure guide "Focus on convergence proofs for the heat equation"
+```
+
+Equivalent signal-file form:
+
+```bash
 echo "Focus on convergence proofs for the heat equation" \
      > long_exposure/data/long-exposure.guide
 ```
@@ -174,6 +189,25 @@ echo "Focus on convergence proofs for the heat equation" \
 The file is consumed once and deleted. You can write to it at any time,
 including while a cycle is in flight — it's picked up at the next cycle
 boundary.
+
+### Status and manager notices
+
+Print the latest deterministic status file and the newest manager poll notice:
+
+```bash
+long-exposure status
+```
+
+For named instances:
+
+```bash
+long-exposure --instance-dir ~/agent-instances/<name> status
+```
+
+Manager polls append structured notices to
+`<instance-dir>/manager_notifications.jsonl`. Cron jobs and interactive
+launchers read the same file, so manager awareness does not depend on which
+LLM CLI launched the run.
 
 For a **permanent** change of direction, use `resume "<new directive>"`
 instead (stops the run cleanly, saves state, then reruns with the new
@@ -439,12 +473,10 @@ work and the pre-emptive rotation skips. Configurable via
 [`multi-account-pool.md`](multi-account-pool.md) and
 [`end-of-run-pipeline.md`](end-of-run-pipeline.md) for details.
 
-If you started the run via `/long-exposure` inside Claude Code, the child
-process is detached — these log lines do **not** stream back into the
-Claude Code transcript. Follow them in a terminal with the `tail -f`
-command the launcher prints at start time (log path is
-`long_exposure/data/long-exposure.run.log`, or
-`<instance-dir>/long-exposure.run.log` when `--instance-dir` is set).
+If you launched in the foreground with `long-exposure launch`, these lines
+stream in the same terminal or CLI transcript. If a CLI adapter chooses to
+detach the process, follow the status with `long-exposure status` or tail the
+adapter's log path directly.
 
 ---
 
@@ -462,6 +494,7 @@ Default single-session layout:
 | `long_exposure/data/long-exposure.stop` | Signal file: stop after current agent |
 | `long_exposure/data/long-exposure.clear` | Signal file: stop + archive state |
 | `long_exposure/data/long-exposure.guide` | Guidance text injected into next cycle |
+| `long_exposure/data/manager_notifications.jsonl` | Structured manager poll notices |
 | `long_exposure/data/health_events.jsonl` | Off-nominal events log (silent fallbacks, rescues, retries) — `tail -n 50` to surface what went wrong silently |
 | `~/.claude-pool-state.json` | Multi-account pool state (slot holders, rate-limit timestamps) |
 | `~/.claude-accounts-state.json` | Legacy single-account rotation index |
@@ -469,8 +502,9 @@ Default single-session layout:
 
 When `--instance-dir DIR` is set, the per-instance equivalents live under
 `DIR/`: `DIR/exploration_state.json`, `DIR/output/`, `DIR/mcp_config.json`,
-and `DIR/long-exposure.stop` / `.clear` / `.guide`. `sessions.db` and the
-account-state files stay at their shared locations.
+and `DIR/long-exposure.stop` / `.clear` / `.guide` /
+`manager_notifications.jsonl`. `sessions.db` and the account-state files stay
+at their shared locations.
 
 ---
 
@@ -505,16 +539,16 @@ Editing the score file's `task:` field affects only *fresh* starts with no
 override — it does NOT redirect an in-flight or resumed exploration. To
 change direction on an existing run, prefer one of:
 
-- `/long-exposure resume "<new directive>"` — redirect, keep context.
-- `/long-exposure clear` + `/long-exposure <new directive>` — fresh start,
+- `long-exposure resume "<new directive>"` — redirect, keep context.
+- `long-exposure clear` + `long-exposure launch "<new directive>"` — fresh start,
   preserved sessions.db gems.
 
 If you do want the score YAML to be the source of truth, clear state first:
 
 ```
-/long-exposure clear
-/long-exposure
+long-exposure clear
+long-exposure launch
 ```
 
-(The no-arg `/long-exposure` with state absent falls through to the
-score YAML's `task:` field.)
+(A no-arg `launch` or `start` with state absent falls through to the score
+YAML's `task:` field.)

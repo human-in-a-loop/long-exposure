@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-STANDARD_FOLDERS = ("reports", "scripts", "tests", "data", "docs", "tools", "stale")
+STANDARD_FOLDERS = ("reports", "audits", "scripts", "tests", "data", "docs", "tools", "stale")
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 
@@ -60,6 +60,11 @@ def ensure_skeleton(workspace: Path) -> list[str]:
                 created.append(folder)
             except OSError:
                 pass
+    try:
+        from long_exposure.paths import ensure_layout
+        ensure_layout(workspace)
+    except OSError:
+        pass
     return created
 
 
