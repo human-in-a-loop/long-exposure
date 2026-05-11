@@ -1,5 +1,6 @@
 import json
 import os
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -153,15 +154,65 @@ class TelemetryTests(unittest.TestCase):
                 cycle=2,
                 provider="local",
                 model="test",
+                context_window=20,
             )
             summary = telemetry.summarize(root)
             saved = json.loads((root / "telemetry" / "rollups" / "summary.json").read_text())
             lessons = (root / "telemetry" / "lessons" / "lessons_summary.md").read_text()
+            events_text = (root / "telemetry" / "events.jsonl").read_text()
+            summary_md = (root / "telemetry" / "rollups" / "summary.md").read_text()
 
         self.assertEqual(summary["events"], 1)
         self.assertEqual(summary["usage"]["input_tokens"], 4)
+        self.assertEqual(summary["context"]["max_tokens"], 9)
+        self.assertEqual(
+            summary["snapshot"]["events_sha256"],
+            hashlib.sha256(events_text.encode("utf-8")).hexdigest(),
+        )
+        self.assertIn("events.jsonl", summary["snapshot"]["events_path"])
+        self.assertIn("Event snapshot SHA-256", summary_md)
         self.assertEqual(saved["by_agent"]["worker"], 1)
         self.assertIn("Agent Review Prompt", lessons)
+
+    def test_summarize_honors_config_output_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "custom-telemetry"
+            telemetry.configure(
+                {"telemetry": {"enabled": True, "output_dir": str(out_dir)}},
+                root,
+                "run-x",
+            )
+            telemetry.emit("run_start", phase="run", status="ok")
+            summary = telemetry.summarize(root, config={"telemetry": {"output_dir": str(out_dir)}})
+            saved = json.loads((out_dir / "rollups" / "summary.json").read_text())
+
+        self.assertEqual(summary["events"], 1)
+        self.assertEqual(saved["events"], 1)
+
+    def test_summarize_counts_usage_aliases(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            telemetry.configure({"telemetry": {"enabled": True}}, root, "run-x")
+            telemetry.emit_agent_result(
+                "worker",
+                {
+                    "status": "ok",
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 2,
+                        "cached_input_tokens": 3,
+                        "reasoning_output_tokens": 4,
+                    },
+                    "outputs": {},
+                },
+                context_window=10,
+            )
+            summary = telemetry.summarize(root)
+
+        self.assertEqual(summary["usage"]["cache_read_input_tokens"], 3)
+        self.assertEqual(summary["usage"]["reasoning_output_tokens"], 4)
+        self.assertEqual(summary["context"]["max_tokens"], 3)
 
     def test_cli_telemetry_summarize(self):
         with tempfile.TemporaryDirectory() as td:
@@ -170,6 +221,49 @@ class TelemetryTests(unittest.TestCase):
             telemetry.emit("run_start", phase="run", status="ok")
             with patch("builtins.print") as mock_print:
                 rc = cli.main(["--instance-dir", str(root), "telemetry", "summarize"])
+        self.assertEqual(rc, 0)
+        printed = "\n".join(str(c.args[0]) for c in mock_print.call_args_list)
+        self.assertIn('"events": 1', printed)
+
+    def test_cli_telemetry_summarize_honors_config_output_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "custom-telemetry"
+            config_path = root / "config.yaml"
+            config_path.write_text(f"telemetry:\n  output_dir: {out_dir}\n")
+            telemetry.configure(
+                {"telemetry": {"enabled": True, "output_dir": str(out_dir)}},
+                root,
+                "run-x",
+            )
+            telemetry.emit("run_start", phase="run", status="ok")
+            with patch("builtins.print") as mock_print:
+                rc = cli.main([
+                    "--config",
+                    str(config_path),
+                    "--instance-dir",
+                    str(root),
+                    "telemetry",
+                    "summarize",
+                ])
+
+        self.assertEqual(rc, 0)
+        printed = "\n".join(str(c.args[0]) for c in mock_print.call_args_list)
+        self.assertIn('"events": 1', printed)
+
+    def test_cli_telemetry_summarize_dir_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "custom-telemetry"
+            telemetry.configure(
+                {"telemetry": {"enabled": True, "output_dir": str(out_dir)}},
+                root,
+                "run-x",
+            )
+            telemetry.emit("run_start", phase="run", status="ok")
+            with patch("builtins.print") as mock_print:
+                rc = cli.main(["telemetry", "summarize", "--telemetry-dir", str(out_dir)])
+
         self.assertEqual(rc, 0)
         printed = "\n".join(str(c.args[0]) for c in mock_print.call_args_list)
         self.assertIn('"events": 1', printed)

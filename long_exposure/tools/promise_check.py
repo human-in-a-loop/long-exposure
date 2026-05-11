@@ -52,6 +52,7 @@ ASSESSORS = {
     "worker",
     "human",
     "manager",
+    "harness",
     "final_auditor",
 }
 
@@ -590,6 +591,8 @@ def _check_artifact_coherence(
 
     for ev in events:
         for path in ev.get("artifacts") or []:
+            if Path(path).is_absolute():
+                continue
             referenced.add(_canon(path))
         sup = ev.get("supersedes_path")
         mid = ev.get("milestone_id") or ""

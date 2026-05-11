@@ -44,7 +44,7 @@ Legacy single-session runs use `long_exposure/data/telemetry/`.
 
 - run start/resume/end metadata
 - cycle start/end, duration, failure counters, low-output counters
-- agent call status, duration, output keys, token usage
+- agent call status, duration, output keys, token usage, and context-window ratio
 - provider/model metadata
 - account usage snapshots when available
 - reporter markdown/PDF status
@@ -62,11 +62,19 @@ flag is enabled.
 
 ```bash
 long-exposure --instance-dir DIR telemetry summarize
+long-exposure --config config.yaml --instance-dir DIR telemetry summarize
+long-exposure telemetry summarize --telemetry-dir /path/to/telemetry
 ```
 
-This reads `DIR/telemetry/events.jsonl` and writes deterministic rollups under
-`DIR/telemetry/rollups/`, plus a deterministic lessons shell under
-`DIR/telemetry/lessons/` for later human or agent review.
+This reads `events.jsonl` and writes deterministic rollups under
+`rollups/`, plus a deterministic lessons shell under `lessons/` for later
+human or agent review. Summary input precedence is:
+
+1. `--telemetry-dir`
+2. `telemetry.output_dir` from `--config`
+3. `<instance-dir>/telemetry`
+4. the process-level configured telemetry directory
+5. `long_exposure/data/telemetry`
 
 ## Configuration
 
@@ -84,7 +92,15 @@ telemetry:
   redact_env: true
 ```
 
-`output_dir` defaults to `<instance-dir>/telemetry`.
+`output_dir` defaults to `<instance-dir>/telemetry`. If it is set, both live
+event writing and `telemetry summarize --config ...` use that directory.
+
+Rollups include provider/model counts, event/status/agent counts, token usage
+with common provider cache aliases normalized, and the highest observed
+`context_ratio`. They also include snapshot provenance: the event file path,
+SHA-256 of the exact `events.jsonl` text summarized, and first/last event
+timestamps. Context-limit pressure is treated as an analysis signal only; it
+does not change live routing.
 
 The `include_*` flags are explicit privacy opt-ins:
 

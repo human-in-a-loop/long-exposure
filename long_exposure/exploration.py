@@ -43,6 +43,7 @@ from long_exposure.conductor import (
     parse_outputs,
 )
 from long_exposure.workspace_bootstrap import (
+    append_ledger_event,
     bootstrap_workspace,
     derive_run_id,
     summarize_ledger,
@@ -309,12 +310,17 @@ RUNTIME_INPUTS: frozenset[str] = frozenset({
     "expected_file",
     "rescue_warning",
     "outline_path",
+    "draft_path",
+    "final_report_path",
+    "report_glob",
+    "final_report_dir",
     "prior_reports",
     "final_audit_summary",
     "final_audit_headline",
     "wall_cap_hit",
     "findings_file",
     "lesson_candidates_file",
+    "audit_dir",
     # Curator inputs
     "clone_artifacts",
     # Seed inputs that may not appear in score-level `seed:` mapping if the
@@ -2160,6 +2166,54 @@ def _write_merge_report(
     _atomic_write_text(Path(merge_path), fm + body)
 
 
+def _first_markdown_heading(path: Path) -> str:
+    try:
+        for line in path.read_text(errors="replace").splitlines():
+            text = line.strip()
+            if text.startswith("#"):
+                return text.lstrip("#").strip() or path.name
+    except OSError:
+        pass
+    return path.name
+
+
+def _fanout_artifact_index(
+    config: dict,
+    cycle_range_start: int,
+    cycle_range_end: int,
+) -> str:
+    """Build a deterministic root-report index for branch cycle artifacts."""
+    try:
+        root = paths.workspace_root(config)
+        artifacts: list[Path] = []
+        for cyc in range(cycle_range_start, cycle_range_end + 1):
+            cycle_dir = paths.fanout_cycle_dir(config, cyc)
+            if cycle_dir.exists():
+                artifacts.extend(p for p in sorted(cycle_dir.glob("*.md")) if p.is_file())
+        if not artifacts:
+            return ""
+        lines = [
+            "",
+            "## Fan-Out Artifact Index",
+            "",
+            "Branch artifacts detected for this report window:",
+        ]
+        for path in artifacts:
+            try:
+                rel = path.relative_to(root)
+            except ValueError:
+                rel = path
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            title = _first_markdown_heading(path)
+            lines.append(f"- `{rel}` ({size} bytes): {title}")
+        return "\n".join(lines) + "\n"
+    except Exception:
+        return ""
+
+
 def _install_clone_local_log(instance_dir: Path) -> None:
     """Tee clone's stdout/stderr to <instance_dir>/clone_local.log.
 
@@ -2179,6 +2233,63 @@ def _install_clone_local_log(instance_dir: Path) -> None:
         sys.stdout = _TeeStream(sys.stdout, fh)
         sys.stderr = _TeeStream(sys.stderr, fh)
     except OSError:
+        pass
+
+
+def _append_report_artifact_event(
+    config: dict,
+    score_inputs: dict,
+    *,
+    cycle: int,
+    cycle_range_start: int,
+    cycle_range_end: int,
+    reporter_mode: str,
+    artifacts: list[Path],
+) -> None:
+    """Ledger-link deterministic report artifacts without blocking the run."""
+    try:
+        workspace = paths.workspace_root(config).resolve()
+        rel_artifacts: list[str] = []
+        for artifact in artifacts:
+            try:
+                path = Path(artifact).resolve()
+                if not path.exists():
+                    continue
+                rel_artifacts.append(path.relative_to(workspace).as_posix())
+            except (OSError, ValueError):
+                continue
+        if not rel_artifacts:
+            return
+
+        append_ledger_event(workspace, {
+            "event_id": str(uuid.uuid4()),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": (
+                (score_inputs or {}).get("run_id")
+                or (config or {}).get("run_id")
+                or "run-unknown"
+            ),
+            "cycle": int(cycle or cycle_range_end or 0),
+            "agent": "harness",
+            "milestone_id": (
+                f"_run/report_cycles_{cycle_range_start}-{cycle_range_end}"
+            ),
+            "status": "validated",
+            "confidence": {
+                "level": "high",
+                "rationale": (
+                    f"{reporter_mode} report artifact written by the harness"
+                ),
+                "assessor": "harness",
+            },
+            "narrative": (
+                "Deterministic report artifact registration for audit "
+                "and orphan-artifact checks."
+            ),
+            "artifacts": rel_artifacts,
+            "reporter_mode": reporter_mode,
+        })
+    except Exception:
         pass
 
 
@@ -2347,6 +2458,7 @@ def _run_reporter(
         cycle=cycle,
         provider=config.get("llm_provider"),
         model=config.get("model"),
+        context_window=context_window,
     )
 
     if result["status"] == "ok":
@@ -2411,6 +2523,15 @@ def _run_reporter(
                     _reports_dir = Path(_wd)  # fall back to root
                 _md = paths.cycle_report_md(config, _basename)
                 try:
+                    if not _is_clone():
+                        artifact_index = _fanout_artifact_index(
+                            config, cycle_range_start, cycle_range_end,
+                        )
+                        if (
+                            artifact_index
+                            and "## Fan-Out Artifact Index" not in output_text
+                        ):
+                            output_text = output_text.rstrip() + "\n" + artifact_index
                     formatted_report = normalize_report_markdown(
                         output_text,
                         fallback_title=(
@@ -2448,6 +2569,7 @@ def _run_reporter(
 
                 if _md_ok:
                     _pdf = paths.cycle_report_pdf(config, _basename)
+                    _report_artifacts = [_md]
                     try:
                         _render_report_pdf(_md, _pdf, _wd)
                         telemetry.emit(
@@ -2464,6 +2586,7 @@ def _run_reporter(
                             f"[long-exposure]   report: wrote {_pdf}",
                             flush=True,
                         )
+                        _report_artifacts.append(_pdf)
                     except (
                         subprocess.CalledProcessError,
                         subprocess.TimeoutExpired,
@@ -2501,6 +2624,15 @@ def _run_reporter(
                                 "error_class": type(_pdf_err).__name__,
                             },
                         )
+                    _append_report_artifact_event(
+                        config,
+                        score_inputs,
+                        cycle=cycle,
+                        cycle_range_start=cycle_range_start,
+                        cycle_range_end=cycle_range_end,
+                        reporter_mode=reporter_mode,
+                        artifacts=_report_artifacts,
+                    )
 
         # In merge mode, atomically write the synthesis to merge_report.md
         # with YAML frontmatter (fork_id, clone_k, verdict, deliverable_path,
@@ -3237,6 +3369,7 @@ def run_exploration(
                     cycle=cycle,
                     provider=config.get("llm_provider"),
                     model=config.get("model"),
+                    context_window=context_window,
                 )
 
                 if result["status"] == "rate_limit":

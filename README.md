@@ -58,6 +58,11 @@ uv run long-exposure-setup --yes
 # or: pip install -e . && long-exposure-setup --skip-uv-sync --yes
 ```
 
+`long-exposure-setup` runs the Python dependency sync, reports which checkout
+is active, checks the configured provider CLI, and installs/checks `pandoc` and
+`tectonic` where the platform package manager supports it. For a non-mutating
+environment check, run `long-exposure-doctor --config long_exposure/config.yaml`.
+
 Edit `long_exposure/config.yaml` → set `working_directory` to the project dir agents should read and write.
 
 Then launch the run. The provider-neutral launcher is the default operator
@@ -492,7 +497,10 @@ long-exposure/
 
 **Dependencies:**
 - one provider CLI: `claude`, `codex`, or `gemini`
-- `pyyaml`, `anthropic`, `prompt_toolkit` — installed via pip
+- `pyyaml`, `anthropic`, `prompt_toolkit` — installed via pip. `anthropic`
+  is required because the bundled `auto-compact` CLI imports it; normal
+  long-exposure runs use the configured provider CLI and do not require an
+  Anthropic API key for that path.
 - `auto_compact` — bundled (formerly a sibling package)
 
 ## Bundled auto-compact
@@ -517,6 +525,8 @@ All commands accept optional `--score`, `--config`, `--output`, `--state`, `--in
 | `long-exposure stop` | Send stop signal — finishes current agent, saves state |
 | `long-exposure status` | Print the latest status and manager notice |
 | `long-exposure guide "note"` | Queue live guidance for the next cycle |
+| `long-exposure manager poll --no-agent` | Run one deterministic manager sidecar poll |
+| `long-exposure telemetry summarize` | Summarize opt-in local telemetry events |
 | `Ctrl+C` | Same as `stop`, when watching the terminal |
 | `long-exposure clear` | Stop + archive state + clear context for new topic |
 | `long-exposure resume` | Continue from saved state, with the directive saved at stop time |

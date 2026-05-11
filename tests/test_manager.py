@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from long_exposure import cli
+from long_exposure.exploration import DEFAULT_SCORE_PATH, load_exploration_score
 from long_exposure.manager import (
     VERDICT_ACT,
     VERDICT_HEALTHY,
@@ -34,6 +36,10 @@ def _event(cycle, milestone_id, status="in-progress", narrative="progress"):
 
 
 class ManagerTests(unittest.TestCase):
+    def test_default_score_validates_manager_and_final_runtime_inputs(self):
+        score = load_exploration_score(DEFAULT_SCORE_PATH)
+        self.assertIn("manager", score["agents"])
+
     def test_promise_check_accepts_manager_action_required(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
@@ -83,6 +89,27 @@ class ManagerTests(unittest.TestCase):
 
         self.assertEqual(decision.verdict, VERDICT_ACT)
         self.assertEqual(decision.event_class, "mechanism-overdue")
+
+    def test_snapshot_tolerates_malformed_confidence_field(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "workspace"
+            data = root / "data"
+            ws.mkdir()
+            data.mkdir()
+            bad = _event(1, "F-1")
+            bad["confidence"] = "high"
+            (ws / "promise_ledger.jsonl").write_text(json.dumps(bad) + "\n")
+            state = data / "exploration_state.json"
+            state.write_text(json.dumps({"cycle": 1, "run_id": "run-test"}))
+
+            snapshot = build_manager_snapshot(
+                workspace=ws,
+                state_path=state,
+                data_dir=data,
+            )
+
+        self.assertEqual(snapshot["ledger"]["events"], 1)
 
     def test_poll_writes_log_ledger_and_guidance_without_agent(self):
         with tempfile.TemporaryDirectory() as td:
@@ -153,6 +180,15 @@ class ManagerTests(unittest.TestCase):
             ]
             self.assertEqual(events[-1]["agent"], "manager")
             self.assertEqual(events[-1]["status"], "action_required")
+            self.assertNotIn("artifacts", events[-1])
+            self.assertIn("process_artifacts", events[-1])
+            self.assertIn("manager_assessments", events[-1]["process_artifacts"][0])
+            findings = promise_check.run(ws)
+            self.assertFalse(findings.errors)
+            self.assertFalse([
+                warning for warning in findings.warnings
+                if "manager_assessments" in warning
+            ])
 
     def test_poll_falls_back_when_manager_agent_fails(self):
         with tempfile.TemporaryDirectory() as td:
@@ -226,6 +262,20 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(_is_package_hard_excluded("manager.lock"))
         self.assertTrue(_is_package_hard_excluded("long-exposure.pause-for-user"))
         self.assertTrue(_is_package_hard_excluded("data/manager_assessments/poll.md"))
+
+    def test_unified_cli_manager_poll_fails_gracefully(self):
+        with tempfile.TemporaryDirectory() as td:
+            inst = Path(td) / "instance"
+            with patch(
+                "long_exposure.cli.run_manager_poll",
+                side_effect=RuntimeError("boom"),
+            ):
+                rc = cli.main([
+                    "--instance-dir", str(inst),
+                    "manager", "poll", "--no-agent",
+                ])
+
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

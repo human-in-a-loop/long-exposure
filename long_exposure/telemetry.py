@@ -243,6 +243,36 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _usage_value(usage: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        if key in usage:
+            return _safe_int(usage.get(key))
+    return 0
+
+
+def _usage_counter(usage: dict[str, Any]) -> Counter:
+    return Counter({
+        "input_tokens": _usage_value(usage, "input_tokens"),
+        "output_tokens": _usage_value(usage, "output_tokens"),
+        "cache_read_input_tokens": _usage_value(
+            usage, "cache_read_input_tokens", "cached_input_tokens"
+        ),
+        "cache_creation_input_tokens": _usage_value(usage, "cache_creation_input_tokens"),
+        "reasoning_output_tokens": _usage_value(usage, "reasoning_output_tokens"),
+    })
+
+
+def _context_tokens_from_usage(usage: dict[str, Any]) -> int:
+    counts = _usage_counter(usage)
+    cache_read = _safe_int(usage.get("cache_read_input_tokens"))
+    return (
+        counts["input_tokens"]
+        + counts["output_tokens"]
+        + cache_read
+        + counts["cache_creation_input_tokens"]
+    )
+
+
 def emit(
     event_type: str,
     *,
@@ -302,10 +332,27 @@ def emit_agent_result(
     cycle: int | None = None,
     provider: str | None = None,
     model: str | None = None,
+    context_window: int | None = None,
 ) -> None:
     try:
         usage = result.get("usage") or {}
         outputs = result.get("outputs") or {}
+        data = {
+            "duration_ms": result.get("duration_ms", 0),
+            "usage": usage,
+            "output_keys": sorted(outputs.keys()),
+            "error_class": (
+                type(result.get("error")).__name__
+                if result.get("error") is not None else None
+            ),
+            "error_preview": str(result.get("error") or "")[:300],
+        }
+        if context_window:
+            context_tokens = _context_tokens_from_usage(usage)
+            window = max(int(context_window), 1)
+            data["context_window"] = window
+            data["context_tokens"] = context_tokens
+            data["context_ratio"] = context_tokens / window
         emit(
             "agent_call_end",
             phase="agent",
@@ -314,31 +361,45 @@ def emit_agent_result(
             provider=provider,
             model=model,
             status=result.get("status"),
-            data={
-                "duration_ms": result.get("duration_ms", 0),
-                "usage": usage,
-                "output_keys": sorted(outputs.keys()),
-                "error_class": (
-                    type(result.get("error")).__name__
-                    if result.get("error") is not None else None
-                ),
-                "error_preview": str(result.get("error") or "")[:300],
-            },
+            data=data,
         )
     except Exception:
         return
 
 
-def summarize(instance_dir: Path | str | None = None) -> dict[str, Any]:
+def _summary_base_dir(
+    instance_dir: Path | str | None = None,
+    *,
+    telemetry_dir: Path | str | None = None,
+    config: dict[str, Any] | None = None,
+) -> Path:
+    if telemetry_dir:
+        return Path(telemetry_dir).expanduser()
+    cfg = _telemetry_cfg(config)
+    if cfg.get("output_dir"):
+        return Path(str(cfg["output_dir"])).expanduser()
+    if instance_dir:
+        return Path(instance_dir) / "telemetry"
+    if _base_dir is not None:
+        return _base_dir
+    return Path("long_exposure/data/telemetry")
+
+
+def summarize(
+    instance_dir: Path | str | None = None,
+    *,
+    telemetry_dir: Path | str | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Read local telemetry events and write a deterministic rollup."""
     try:
-        base = Path(instance_dir) / "telemetry" if instance_dir else _base_dir
-        if base is None:
-            base = Path("long_exposure/data/telemetry")
+        base = _summary_base_dir(instance_dir, telemetry_dir=telemetry_dir, config=config)
         events_path = base / "events.jsonl"
         events = []
+        raw_text = ""
         if events_path.exists():
-            for raw in events_path.read_text().splitlines():
+            raw_text = events_path.read_text()
+            for raw in raw_text.splitlines():
                 if not raw.strip():
                     continue
                 try:
@@ -358,6 +419,13 @@ def summarize(instance_dir: Path | str | None = None) -> dict[str, Any]:
                 "by_agent": {},
                 "by_provider": {},
                 "usage": {},
+                "context": {},
+                "snapshot": {
+                    "events_path": str(events_path),
+                    "events_sha256": hashlib.sha256(b"").hexdigest(),
+                    "first_event_ts": None,
+                    "last_event_ts": None,
+                },
             }
         by_type = Counter(str(ev.get("event_type")) for ev in events)
         by_status = Counter(str(ev.get("status")) for ev in events if ev.get("status") is not None)
@@ -365,12 +433,26 @@ def summarize(instance_dir: Path | str | None = None) -> dict[str, Any]:
         by_provider = Counter(str(ev.get("provider")) for ev in events if ev.get("provider") is not None)
         cycles = [ev.get("cycle") for ev in events if isinstance(ev.get("cycle"), int)]
         usage = Counter()
+        context_max = {"ratio": 0.0, "tokens": 0, "agent": None, "cycle": None}
         for ev in events:
             data = ev.get("data") or {}
             u = data.get("usage") if isinstance(data, dict) else None
             if isinstance(u, dict):
-                for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
-                    usage[key] += _safe_int(u.get(key))
+                usage.update(_usage_counter(u))
+            if isinstance(data, dict):
+                ratio = data.get("context_ratio")
+                if isinstance(ratio, (int, float)) and ratio >= context_max["ratio"]:
+                    context_max = {
+                        "ratio": float(ratio),
+                        "tokens": _safe_int(data.get("context_tokens")),
+                        "agent": ev.get("agent"),
+                        "cycle": ev.get("cycle"),
+                    }
+        event_ts = [
+            str(ev.get("ts"))
+            for ev in events
+            if ev.get("ts") is not None
+        ]
         summary = {
             "schema_version": SCHEMA_VERSION,
             "generated_at": _utc_iso(),
@@ -384,7 +466,21 @@ def summarize(instance_dir: Path | str | None = None) -> dict[str, Any]:
             "by_status": dict(sorted(by_status.items())),
             "by_agent": dict(sorted(by_agent.items())),
             "by_provider": dict(sorted(by_provider.items())),
-            "usage": dict(usage),
+            "usage": {k: v for k, v in sorted(usage.items()) if v},
+            "context": {
+                "max_ratio": context_max["ratio"],
+                "max_tokens": context_max["tokens"],
+                "max_agent": context_max["agent"],
+                "max_cycle": context_max["cycle"],
+            },
+            "snapshot": {
+                "events_path": str(events_path),
+                "events_sha256": hashlib.sha256(
+                    raw_text.encode("utf-8", errors="replace")
+                ).hexdigest(),
+                "first_event_ts": min(event_ts) if event_ts else None,
+                "last_event_ts": max(event_ts) if event_ts else None,
+            },
         }
         rollups = base / "rollups"
         rollups.mkdir(parents=True, exist_ok=True)
@@ -394,6 +490,7 @@ def summarize(instance_dir: Path | str | None = None) -> dict[str, Any]:
             "",
             f"- Events: {summary['events']}",
             f"- Cycle range: {summary['cycles']['min']} - {summary['cycles']['max']}",
+            f"- Event snapshot SHA-256: {summary['snapshot']['events_sha256']}",
             "",
             "## Event Types",
         ]
@@ -429,6 +526,10 @@ def summarize(instance_dir: Path | str | None = None) -> dict[str, Any]:
         if summary["by_type"].get("manager_poll_end"):
             lesson_lines.append(
                 "- Manager: review verdict distribution and whether guidance was followed."
+            )
+        if summary["context"]["max_ratio"]:
+            lesson_lines.append(
+                "- Context: review agents with high context ratios before they approach compaction."
             )
         if summary["by_type"].get("report_pdf_render_end"):
             lesson_lines.append(

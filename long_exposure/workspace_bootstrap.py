@@ -349,6 +349,8 @@ def summarize_ledger(workspace: Path, max_chars: int = 32_000) -> str:
         mid = ev.get("milestone_id", "?")
         status = ev.get("status", "?")
         conf = ev.get("confidence") or {}
+        if not isinstance(conf, dict):
+            conf = {}
         level = conf.get("level", "?")
         cycle = ev.get("cycle", "?")
         agent = ev.get("agent", "?")

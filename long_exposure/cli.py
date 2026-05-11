@@ -131,15 +131,19 @@ def _tail(args: argparse.Namespace) -> int:
 def _manager_poll(args: argparse.Namespace) -> int:
     instance_dir = resolve_instance_dir(args.instance_dir)
     state_path = _state_path(args.state, instance_dir)
-    return run_manager_poll(
-        score_path=Path(args.score or MANAGER_DEFAULT_SCORE_PATH),
-        config_path=Path(args.config) if args.config else None,
-        state_path=state_path,
-        instance_dir=instance_dir,
-        force_agent=args.force_agent,
-        no_agent=args.no_agent,
-        allow_pause_signal=args.allow_pause_signal,
-    )
+    try:
+        return run_manager_poll(
+            score_path=Path(args.score or MANAGER_DEFAULT_SCORE_PATH),
+            config_path=Path(args.config) if args.config else None,
+            state_path=state_path,
+            instance_dir=instance_dir,
+            force_agent=args.force_agent,
+            no_agent=args.no_agent,
+            allow_pause_signal=args.allow_pause_signal,
+        )
+    except Exception as exc:
+        print(f"long-exposure manager poll: failed gracefully: {exc}", file=sys.stderr)
+        return 0
 
 
 def _manager_loop(
@@ -157,7 +161,10 @@ def _manager_loop(
 
 def _launch(args: argparse.Namespace) -> int:
     if not args.skip_doctor:
-        rc = doctor_main(["--json"])
+        doctor_args = ["--json"]
+        if args.config:
+            doctor_args.extend(["--config", args.config])
+        rc = doctor_main(doctor_args)
         if rc != 0 and not args.allow_doctor_failure:
             print(
                 "[long-exposure] Preflight failed; rerun with "
@@ -315,7 +322,12 @@ Manager notices are surfaced through `long-exposure status` from
 
 def _telemetry_summarize(args: argparse.Namespace) -> int:
     instance_dir = resolve_instance_dir(args.instance_dir)
-    summary = telemetry.summarize(instance_dir)
+    config = load_config(Path(args.config) if args.config else None)
+    summary = telemetry.summarize(
+        instance_dir,
+        telemetry_dir=getattr(args, "telemetry_dir", None),
+        config=config,
+    )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0 if "error" not in summary else 1
 
@@ -362,7 +374,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_mgr = sub.add_parser("manager", help="Manager sidecar commands")
     mgr_sub = p_mgr.add_subparsers(dest="manager_command", required=True)
-    p_poll = mgr_sub.add_parser("poll", help="Run one manager poll")
+    p_poll = mgr_sub.add_parser(
+        "poll",
+        help="Run one manager poll",
+        epilog=(
+            "Examples:\n"
+            "  long-exposure --instance-dir DIR manager poll --no-agent\n"
+            "  long-exposure --config config.yaml --score score.yaml "
+            "--instance-dir DIR manager poll"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_poll.add_argument("--force-agent", action="store_true")
     p_poll.add_argument("--no-agent", action="store_true")
     p_poll.add_argument("--allow-pause-signal", action="store_true")
@@ -374,7 +396,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_telem = sub.add_parser("telemetry", help="Telemetry utilities")
     telem_sub = p_telem.add_subparsers(dest="telemetry_command", required=True)
-    telem_sub.add_parser("summarize", help="Summarize local telemetry events")
+    p_telem_sum = telem_sub.add_parser(
+        "summarize",
+        help="Summarize local telemetry events",
+        epilog=(
+            "Examples:\n"
+            "  long-exposure --instance-dir DIR telemetry summarize\n"
+            "  long-exposure --config config.yaml --instance-dir DIR telemetry summarize\n"
+            "  long-exposure telemetry summarize --telemetry-dir DIR"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_telem_sum.add_argument(
+        "--telemetry-dir",
+        default=None,
+        help="Read telemetry from this directory instead of config or instance defaults",
+    )
     return parser
 
 

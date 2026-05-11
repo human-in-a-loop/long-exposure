@@ -14,7 +14,7 @@ conceptual map, see [`architecture-overview.md`](architecture-overview.md).
 | A supported provider CLI on `$PATH`: **[Claude Code CLI](https://docs.claude.com/en/docs/claude-code)**, Codex CLI, or Gemini CLI | Model backend for `llm_provider: claude`, `codex`, or `gemini` | Yes |
 | **`pyyaml`** | Config + score YAML parsing | Yes (pip-installed) |
 | **`prompt_toolkit`** | Interactive orchestrator REPL | Yes (pip-installed) |
-| **`anthropic`** | Used by `auto_compact` standalone CLI only — long-exposure itself does not call the SDK | No (optional) |
+| **`anthropic`** | Python dependency installed with the package because the bundled `auto_compact` standalone CLI imports it. Long-exposure itself does not call the SDK through this path. | Yes (pip-installed); no Anthropic API key is required for normal provider-CLI runs |
 | **`pandoc`** + **[`tectonic`](https://tectonic-typesetting.github.io/)** | PDF rendering of in-cycle and final reports | Yes for standard report output. `long-exposure-setup` installs/checks them where the platform package manager supports it. If absent at runtime, markdown still lands and PDF render failures are surfaced. |
 | **Wolfram Engine** | Wolfram Language scripts the worker may run | Optional — set `wolfram_path: ""` in `config.yaml` if absent |
 | **`matplotlib`** (Python) | `figure plot` subcommand backend (quantitative data plots). Hard dep since Plan E. | Yes (auto-installed by `uv sync` / `pip install -e .`) |
@@ -105,7 +105,8 @@ long-exposure-setup --skip-uv-sync --yes
 ```
 
 `long-exposure-setup` runs `uv sync` unless `--skip-uv-sync` is passed,
-checks Python imports, checks `pandoc` and `tectonic`, and installs missing
+checks Python imports, reports the active package provenance, checks the
+configured provider CLI, checks `pandoc` and `tectonic`, and installs missing
 system binaries through the detected package manager when supported:
 `apt-get`, `dnf`, `yum`, `pacman`, `zypper`, `brew`, or `winget`.
 If the platform is unsupported, it prints the exact missing tools and exits
@@ -130,6 +131,16 @@ long-exposure-doctor
 # JSON output is useful for CI, issue reports, or agentic debugging.
 long-exposure-doctor --json
 
+# Use the same provider config that the run will use.
+long-exposure-doctor --config long_exposure/config.yaml
+```
+
+The doctor prints the Python executable, imported package root, editable install
+metadata, `PYTHONPATH` conflicts, the selected provider CLI status, and missing
+required tools. It fails for a missing selected provider CLI; other installed
+provider CLIs are reported for awareness only.
+
+```bash
 # 2. Claude CLI works in non-interactive mode
 claude -p "say ok" --output-format json
 
@@ -160,6 +171,9 @@ from long_exposure.exploration import load_exploration_score
 load_exploration_score('long_exposure/exploration-score.yaml')
 print('score validates')
 "
+
+# 5. Focused local test suite
+uv run python -m unittest discover -s tests -v
 
 # Optional Wolfram smoke. `wolfram-batch` is bundled with long-exposure
 # and is compatible with `wolfram -script FILE.wls`.

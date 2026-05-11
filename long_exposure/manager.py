@@ -132,12 +132,18 @@ def _active_milestone_streaks(events: list[dict[str, Any]]) -> dict[str, dict[st
             for ev in active
             if isinstance(ev.get("cycle"), int)
         })
-        mechanism_text = "\n".join(
-            str(ev.get("narrative") or "")
-            + "\n"
-            + str((ev.get("confidence") or {}).get("rationale") or "")
-            for ev in active
-        ).lower()
+        mechanism_parts = []
+        for ev in active:
+            confidence = ev.get("confidence")
+            rationale = (
+                confidence.get("rationale")
+                if isinstance(confidence, dict)
+                else ""
+            )
+            mechanism_parts.append(
+                str(ev.get("narrative") or "") + "\n" + str(rationale or "")
+            )
+        mechanism_text = "\n".join(mechanism_parts).lower()
         has_mechanism = any(
             marker in mechanism_text
             for marker in (
@@ -450,14 +456,14 @@ def _append_manager_event(
             "assessor": "manager",
         },
         "narrative": intervention_text or decision.pattern,
-        "artifacts": [
-            assessment_path.relative_to(workspace).as_posix()
-            if assessment_path.is_relative_to(workspace)
-            else str(assessment_path)
-        ],
         "manager_verdict": decision.verdict,
         "evidence": decision.evidence,
+        "manager_assessment_path": str(assessment_path),
     }
+    try:
+        event["artifacts"] = [assessment_path.relative_to(workspace).as_posix()]
+    except ValueError:
+        event["process_artifacts"] = [str(assessment_path)]
     append_ledger_event(workspace, event)
 
 

@@ -14,16 +14,25 @@ import os
 import platform
 import shlex
 import shutil
+import site
 import subprocess
 import sys
 from dataclasses import dataclass
+from urllib.parse import unquote, urlparse
 from pathlib import Path
+
+import yaml
 
 
 REQUIRED_BINARIES = ("pandoc", "tectonic")
 OPTIONAL_BINARIES = ("dot", "d2")
 PYTHON_IMPORTS = ("yaml", "prompt_toolkit", "matplotlib")
 OPTIONAL_PYTHON_IMPORTS = ("diagrams",)
+PROVIDER_BINARIES = {
+    "claude": "claude",
+    "codex": "codex",
+    "gemini": "gemini",
+}
 
 
 @dataclass(frozen=True)
@@ -43,6 +52,94 @@ class CommandResult:
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _site_package_dirs() -> list[Path]:
+    candidates = []
+    for raw in [*site.getsitepackages(), site.getusersitepackages()]:
+        p = Path(raw)
+        if p.exists():
+            candidates.append(p)
+    return candidates
+
+
+def _file_url_to_path(url: str) -> Path | None:
+    parsed = urlparse(url)
+    if parsed.scheme != "file":
+        return None
+    return Path(unquote(parsed.path)).expanduser().resolve()
+
+
+def _editable_roots() -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for sp in _site_package_dirs():
+        for pth in sp.glob("_editable*long_exposure*.pth"):
+            for raw in pth.read_text().splitlines():
+                line = raw.strip()
+                if not line or line.startswith("import "):
+                    continue
+                candidate = Path(line).expanduser().resolve()
+                if (candidate / "long_exposure").is_dir():
+                    key = str(candidate)
+                    if key not in seen:
+                        seen.add(key)
+                        roots.append(candidate)
+        for direct in sp.glob("long_exposure-*.dist-info/direct_url.json"):
+            try:
+                data = json.loads(direct.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            url = data.get("url") if isinstance(data, dict) else None
+            candidate = _file_url_to_path(str(url or ""))
+            if candidate and (candidate / "long_exposure").is_dir():
+                key = str(candidate)
+                if key not in seen:
+                    seen.add(key)
+                    roots.append(candidate)
+    return roots
+
+
+def _pythonpath_roots() -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for raw in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser().resolve()
+        if (candidate / "long_exposure").is_dir():
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                roots.append(candidate)
+    return roots
+
+
+def package_provenance() -> dict:
+    root = _repo_root().resolve()
+    editable = _editable_roots()
+    pythonpath_roots = _pythonpath_roots()
+    warnings: list[str] = []
+    if editable and root not in editable:
+        warnings.append(
+            "Imported long_exposure does not match editable install metadata; "
+            "PYTHONPATH or shell environment may be shadowing this checkout."
+        )
+    shadowing = [p for p in pythonpath_roots if p != root]
+    if shadowing:
+        warnings.append(
+            "PYTHONPATH contains another long_exposure checkout before the "
+            "active package root: " + ", ".join(str(p) for p in shadowing)
+        )
+    return {
+        "executable": sys.executable,
+        "package_file": str(Path(__file__).resolve()),
+        "package_root": str(root),
+        "editable_roots": [str(p) for p in editable],
+        "pythonpath": os.environ.get("PYTHONPATH", ""),
+        "pythonpath_roots": [str(p) for p in pythonpath_roots],
+        "warnings": warnings,
+    }
 
 
 def _which(name: str) -> str | None:
@@ -87,8 +184,47 @@ def _import_ok(name: str) -> tuple[bool, str]:
     return True, "import ok"
 
 
-def probe_environment() -> dict:
+def _load_provider(config_path: Path | None = None) -> str:
+    cfg_path = config_path or (_repo_root() / "long_exposure" / "config.yaml")
+    try:
+        data = yaml.safe_load(cfg_path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        data = {}
+    raw = os.environ.get("LONG_EXPOSURE_LLM_PROVIDER") or data.get("llm_provider") or "claude"
+    provider = str(raw).strip().lower()
+    aliases = {
+        "anthropic": "claude",
+        "claude-code": "claude",
+        "openai": "codex",
+        "codex-cli": "codex",
+        "google": "gemini",
+        "google-gemini": "gemini",
+        "gemini-cli": "gemini",
+        "openai-compatible": "local",
+        "openai_compatible": "local",
+        "custom": "local",
+        "byo": "local",
+    }
+    return aliases.get(provider, provider if provider in {"claude", "codex", "gemini", "local"} else "claude")
+
+
+def _provider_probe(provider: str) -> dict:
+    binary = PROVIDER_BINARIES.get(provider)
+    required = provider in PROVIDER_BINARIES
+    ok = _which(binary) is not None if binary else True
+    detail = _version(binary) if binary else "local provider: no CLI binary required"
+    return {
+        "provider": provider,
+        "binary": binary,
+        "required": required,
+        "ok": ok,
+        "detail": detail,
+    }
+
+
+def probe_environment(config_path: Path | None = None) -> dict:
     system = platform.system().lower()
+    provider = _load_provider(config_path)
     binary_probes = [
         Probe(name, _which(name) is not None, _version(name))
         for name in REQUIRED_BINARIES
@@ -113,6 +249,13 @@ def probe_environment() -> dict:
             "python": sys.version.split()[0],
             "repo_root": str(_repo_root()),
         },
+        "provenance": package_provenance(),
+        "provider_cli": _provider_probe(provider),
+        "other_provider_clis": [
+            _provider_probe(name)
+            for name in ("claude", "codex", "gemini")
+            if name != provider
+        ],
         "tools": [p.__dict__ for p in binary_probes],
         "optional_tools": [p.__dict__ for p in optional_probes],
         "python_imports": [p.__dict__ for p in python_probes],
@@ -125,10 +268,14 @@ def probe_environment() -> dict:
 
 
 def missing_required(report: dict) -> list[str]:
-    return [
+    missing = [
         p["name"] for p in report["tools"]
         if not p["ok"]
     ]
+    provider = report.get("provider_cli") or {}
+    if provider.get("required") and not provider.get("ok"):
+        missing.append(str(provider.get("binary") or provider.get("provider")))
+    return missing
 
 
 def _sudo_prefix() -> list[str]:
@@ -210,6 +357,17 @@ def _print_report(report: dict, *, json_output: bool = False) -> None:
     print(f"  repo: {report['platform']['repo_root']}")
     print(f"  python: {report['platform']['python']}")
     print(f"  uv: {'OK' if report['uv']['ok'] else 'missing'} - {report['uv']['detail']}")
+    print(f"  executable: {report.get('provenance', {}).get('executable', sys.executable)}")
+    for warning in report.get("provenance", {}).get("warnings", []):
+        print(f"  WARNING: {warning}")
+    provider = report.get("provider_cli") or {}
+    if provider:
+        mark = "OK" if provider.get("ok") else "missing"
+        req = "required" if provider.get("required") else "optional"
+        print(
+            f"  provider CLI ({provider.get('provider')}): {mark} "
+            f"({req}) - {provider.get('detail')}"
+        )
     print("")
     print("Required system tools:")
     for probe in report["tools"]:
@@ -284,6 +442,7 @@ def setup_main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--check", action="store_true", help="Only inspect; do not install.")
     parser.add_argument("--json", action="store_true", help="Emit the final report as JSON.")
+    parser.add_argument("--config", default=None, help="Config file used to choose provider CLI checks.")
     parser.add_argument("--yes", "-y", action="store_true", help="Run non-interactively.")
     parser.add_argument(
         "--skip-uv-sync",
@@ -303,17 +462,22 @@ def setup_main(argv: list[str] | None = None) -> int:
         if not uv_ok:
             print("uv sync did not complete; continuing with environment probe.")
 
-    report = probe_environment()
+    config_path = Path(args.config) if args.config else None
+    report = probe_environment(config_path)
     missing = missing_required(report)
-    if missing and not args.check:
-        install_system_tools(missing, yes=args.yes)
-        report = probe_environment()
+    system_missing = [
+        p["name"] for p in report["tools"]
+        if not p["ok"]
+    ]
+    if system_missing and not args.check:
+        install_system_tools(system_missing, yes=args.yes)
+        report = probe_environment(config_path)
         missing = missing_required(report)
 
     _print_report(report, json_output=args.json)
     if missing:
         print(
-            "\nMissing required report-rendering tools: "
+            "\nMissing required tools: "
             + ", ".join(missing),
             file=sys.stderr,
         )

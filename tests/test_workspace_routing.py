@@ -8,7 +8,7 @@ from long_exposure import paths
 from long_exposure.auditing import _run_final_auditor
 from long_exposure.exploration import _run_reporter
 from long_exposure.reporting import _run_final_reporter
-from long_exposure.tools import org_check
+from long_exposure.tools import org_check, promise_check
 
 
 def _ok_result(output_name: str, text: str = "# Stage\n\ncontent") -> dict:
@@ -58,6 +58,7 @@ class WorkspaceRoutingTests(unittest.TestCase):
                 patch("long_exposure.exploration._store_agent_output",
                       return_value="session"),
                 patch("long_exposure.exploration._render_report_pdf"),
+                patch("long_exposure.exploration._is_clone", return_value=False),
             ):
                 _run_reporter(
                     agent_def, "task", config, {"run_id": "run-test"}, {},
@@ -67,6 +68,98 @@ class WorkspaceRoutingTests(unittest.TestCase):
             self.assertTrue((root / "reports" / "cycles" / "report_cycles_1-1.md").exists())
             self.assertFalse((root / "reports" / "report_cycles_1-1.md").exists())
             self.assertFalse((root / "report_cycles_1-1.md").exists())
+
+    def test_cycle_reporter_registers_report_artifacts_in_ledger(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = {"working_directory": str(root)}
+            agent_def = {"outputs": ["report"]}
+
+            def fake_pdf(md_path, pdf_path, cwd):
+                Path(pdf_path).write_text("pdf")
+
+            with (
+                patch("long_exposure.exploration._call_agent_with_rotation",
+                      return_value=_ok_result("report", "# Report\n\nbody")),
+                patch("long_exposure.exploration._store_agent_output",
+                      return_value="session"),
+                patch("long_exposure.exploration._render_report_pdf", fake_pdf),
+                patch("long_exposure.exploration._is_clone", return_value=False),
+            ):
+                _run_reporter(
+                    agent_def, "task", config, {"run_id": "run-test"}, {},
+                    {}, {}, None, 1, None, 1, 1, [], 1000, 900,
+                )
+
+            events = [
+                json.loads(line)
+                for line in (root / "promise_ledger.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(events[-1]["agent"], "harness")
+            self.assertEqual(events[-1]["confidence"]["assessor"], "harness")
+            self.assertEqual(events[-1]["milestone_id"], "_run/report_cycles_1-1")
+            self.assertEqual(events[-1]["artifacts"], [
+                "reports/cycles/report_cycles_1-1.md",
+                "reports/cycles/report_cycles_1-1.pdf",
+            ])
+            findings = promise_check.run(root)
+            self.assertFalse(findings.errors)
+            self.assertFalse([
+                warning for warning in findings.warnings
+                if "report_cycles_1-1" in warning
+            ])
+
+    def test_cycle_reporter_appends_branch_artifact_index_for_root_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = {"working_directory": str(root)}
+            paths.ensure_layout(config)
+            branch_report = root / "reports" / "cycles" / "cycle1" / "worker.md"
+            branch_report.parent.mkdir(parents=True, exist_ok=True)
+            branch_report.write_text("# Worker Finding\n\nsubstantive branch output")
+            agent_def = {"outputs": ["report"]}
+
+            with (
+                patch("long_exposure.exploration._call_agent_with_rotation",
+                      return_value=_ok_result("report", "# Report\n\nbody")),
+                patch("long_exposure.exploration._store_agent_output",
+                      return_value="session"),
+                patch("long_exposure.exploration._render_report_pdf"),
+                patch("long_exposure.exploration._is_clone", return_value=False),
+            ):
+                _run_reporter(
+                    agent_def, "task", config, {"run_id": "run-test"}, {},
+                    {}, {}, None, 1, None, 1, 1, [], 1000, 900,
+                )
+
+            report = (root / "reports" / "cycles" / "report_cycles_1-1.md").read_text()
+            self.assertIn("Fan-Out Artifact Index", report)
+            self.assertIn("reports/cycles/cycle1/worker.md", report)
+            self.assertIn("Worker Finding", report)
+
+    def test_clone_cycle_reporter_uses_clone_suffix(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = {"working_directory": str(root), "instance_dir": str(root)}
+            agent_def = {"outputs": ["report"]}
+
+            with (
+                patch("long_exposure.exploration._call_agent_with_rotation",
+                      return_value=_ok_result("report", "# Report\n\nbody")),
+                patch("long_exposure.exploration._store_agent_output",
+                      return_value="session"),
+                patch("long_exposure.exploration._render_report_pdf"),
+                patch("long_exposure.exploration._is_clone", return_value=True),
+                patch("long_exposure.exploration._get_clone_k", return_value=2),
+            ):
+                _run_reporter(
+                    agent_def, "task", config, {"run_id": "run-test"}, {},
+                    {}, {}, None, 1, None, 1, 1, [], 1000, 900,
+                )
+
+            self.assertTrue(
+                (root / "reports" / "cycles" / "report_cycles_1-1_clone_2.md").exists()
+            )
 
     def test_final_reporter_uses_scratch_dir_and_commit_marker(self):
         with tempfile.TemporaryDirectory() as td:

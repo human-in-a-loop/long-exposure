@@ -148,6 +148,7 @@ Optional fields:
 | `dependencies` | list | Milestone IDs this depends on |
 | `reopen_conditions` | string | What would cause a deferred / superseded milestone to reopen |
 | `artifacts` | list | Workspace paths produced by this event |
+| `process_artifacts` | list | Non-workspace run artifacts, such as manager assessment logs |
 
 ### Status taxonomy (eight values)
 
@@ -177,7 +178,7 @@ wasn't an error." Invalidated means "X was wrong all along."
 {
   "level": "high|medium|low|provisional",
   "rationale": "one-line reason",
-  "assessor": "researcher|worker|auditor|...|self|external"
+  "assessor": "researcher|worker|auditor|manager|harness|human|final_auditor"
 }
 ```
 
@@ -226,7 +227,9 @@ python -m long_exposure.tools.ledger_append \
 ```
 
 Auto-routes via `resolve_ledger_path`. Worker and auditor role text
-references this helper.
+references this helper. The helper validates the required ledger
+schema before appending so malformed agent JSON is rejected at the
+entry point rather than discovered later by `promise_check`.
 
 ---
 
@@ -264,6 +267,11 @@ new_files = after - before
 
 The auditor verifies listed artifacts match what's actually present
 via `promise_check`.
+
+`artifacts` is only for paths inside the workspace. Sidecar files that
+support operation but are not workspace deliverables, such as cron
+manager assessments under the instance directory, go in
+`process_artifacts` and are not checked by the workspace artifact walk.
 
 ### Markdown frontmatter (soft-guidance)
 
@@ -404,6 +412,21 @@ Per Stage 3 §0.5, the periodic reporter writes
 Final reports stay at workspace root because the curator contract
 expects them there. `org_check` notes legacy root-stage artifacts but
 new runs route scratch under `reports/final/` and `audits/final/`.
+
+Fan-out clones append a clone suffix to periodic report basenames:
+`report_cycles_<N>-<M>_clone_<K>.{md,pdf}`. This prevents sibling
+clones from clobbering the same filename in a shared workspace.
+
+Root periodic reports also add a deterministic `Fan-Out Artifact Index`
+when branch artifacts exist under `reports/cycles/cycle<N>/`. The index
+lists branch markdown artifacts, sizes, and first headings so substantive
+branch findings remain discoverable even if the root reporter writes a
+brief synthesis.
+
+After the harness writes a periodic report, it appends a `_run/report_*`
+ledger event with the report markdown and any successfully rendered PDF
+listed in `artifacts`. This keeps cycle reports auditable without asking
+the reporter agent to produce its own bookkeeping event.
 
 ---
 

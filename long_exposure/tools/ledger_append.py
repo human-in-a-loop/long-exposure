@@ -19,9 +19,59 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import uuid
 from pathlib import Path
 
+from long_exposure.tools.promise_check import (
+    ASSESSORS,
+    CONFIDENCE_LEVELS,
+    REQUIRED_EVENT_FIELDS,
+    STATUS_VALUES,
+)
 from long_exposure.workspace_bootstrap import append_ledger_event
+
+
+def _valid_uuid(value: object) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _validate_event(event: dict) -> list[str]:
+    errors: list[str] = []
+    for field in REQUIRED_EVENT_FIELDS:
+        if field not in event:
+            errors.append(f"missing required field {field!r}")
+
+    if "event_id" in event and not _valid_uuid(event.get("event_id")):
+        errors.append("event_id is not a valid UUID")
+
+    status = event.get("status")
+    if status is not None and status not in STATUS_VALUES:
+        errors.append(f"status {status!r} is not in the unified vocabulary")
+
+    confidence = event.get("confidence")
+    if confidence is not None:
+        if not isinstance(confidence, dict):
+            errors.append("confidence must be an object")
+        else:
+            if confidence.get("level") not in CONFIDENCE_LEVELS:
+                errors.append("confidence.level is not recognized")
+            if not str(confidence.get("rationale") or "").strip():
+                errors.append("confidence.rationale is empty")
+            if confidence.get("assessor") not in ASSESSORS:
+                errors.append("confidence.assessor is not recognized")
+
+    artifacts = event.get("artifacts")
+    if artifacts is not None and (
+        not isinstance(artifacts, list)
+        or not all(isinstance(item, str) for item in artifacts)
+    ):
+        errors.append("artifacts must be a list of strings")
+
+    return errors
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,6 +91,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not isinstance(event, dict):
         print("ledger_append: event must be a JSON object", file=sys.stderr)
+        return 2
+    validation_errors = _validate_event(event)
+    if validation_errors:
+        print("ledger_append: invalid event:", file=sys.stderr)
+        for error in validation_errors:
+            print(f"  - {error}", file=sys.stderr)
         return 2
 
     workspace = Path(args.workspace).resolve()

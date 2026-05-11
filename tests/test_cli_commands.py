@@ -32,6 +32,33 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(captured["state_path"], inst / "exploration_state.json")
         self.assertEqual(captured["output_dir"], inst / "output")
 
+    def test_launch_passes_config_to_doctor(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = root / "config.yaml"
+            cfg.write_text("llm_provider: codex\n")
+            seen = {}
+
+            def fake_doctor(argv):
+                seen["argv"] = argv
+                return 0
+
+            with (
+                patch("long_exposure.cli.doctor_main", side_effect=fake_doctor),
+                patch("long_exposure.cli.load_config",
+                      return_value={"llm_provider": "codex", "working_directory": str(root)}),
+                patch("long_exposure.cli.exploration.run_exploration"),
+            ):
+                rc = cli.main([
+                    "--config", str(cfg),
+                    "--instance-dir", str(root / "instance"),
+                    "launch",
+                    "task",
+                ])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["argv"], ["--json", "--config", str(cfg)])
+
     def test_resume_from_archive_restores_state_before_running(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
