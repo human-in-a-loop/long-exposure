@@ -1,7 +1,7 @@
 # config.yaml
 
 # === Model ===
-llm_provider: claude                  # claude | codex | gemini | local (local is an unsupported extension point)
+llm_provider: codex                   # claude | codex | gemini | local (local is an unsupported extension point)
 model: opus                          # alias (sonnet, opus, haiku) or full name
 codex_model: gpt-5.5                  # used when llm_provider: codex unless agent overrides model
 gemini_model: gemini-3-flash-preview  # used when llm_provider: gemini unless agent overrides model
@@ -80,7 +80,7 @@ anti_patterns_enabled: true
 # for soft directory boundaries enforced via instructions.
 # Leave empty for no path restriction. Set to your project dir before
 # running a real exploration.
-working_directory: ""
+working_directory: "/path/to/workspace"
 
 # Command for Wolfram Language scripts. Leave empty if you don't have
 # Wolfram installed — agents will be instructed not to use it.

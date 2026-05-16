@@ -51,20 +51,16 @@ ALLOWED_AT_ROOT_FILES = {
     "uv.lock",
     "requirements.txt",
     ".gitignore",
-    # Final synthesis outputs — written at workspace root by the harness
-    # and curator-contract; matches the final reporter's and final
-    # auditor's file-gate placement. Per-cycle reports go to
-    # reports/cycles/; end-of-run synthesis stays at root.
-    "final_report.md",
-    "final_report.pdf",
-    "final_audit_report.md",
-    "final_audit_report.pdf",
-    "final_report.committed",
-    "final_audit_report.committed",
-    "final_audit_summary.json",
 }
 
 LEGACY_ROOT_STAGE_PATTERNS = (
+    "final_report.md",
+    "final_report.pdf",
+    "final_report.committed",
+    "final_audit_report.md",
+    "final_audit_report.pdf",
+    "final_audit_report.committed",
+    "final_audit_summary.json",
     "final_report_outline.md",
     "final_report_draft.md",
     "final_audit_explore.md",
@@ -85,8 +81,8 @@ ALLOWED_AT_ROOT_DIRS = {
 }
 
 # Filenames that suggest periodic reports — they should live in reports/cycles/.
-# `final_report*` and `final_audit_report*` are NOT in this set: they live at
-# workspace root by harness contract (curator + file gate).
+# `final_report*` and `final_audit_report*` are NOT in this set: canonical
+# final-stage outputs live under reports/final/ and audits/final/.
 REPORT_FILENAME_PATTERNS = ("report_cycles_",)
 
 # Suffixes that suggest scripts/data — they should not live at root.
@@ -97,7 +93,7 @@ LARGE_BINARY_SUFFIXES = (".mph", ".bin", ".dat", ".npz", ".h5", ".hdf5", ".mat")
 # root and NOT under tools/ or docs/. Image suffixes that should trigger an
 # orphan-figure warning when found in unconventional locations. PDFs are
 # excluded — final_report.pdf and final_audit_report.pdf legitimately live
-# at root via the existing ALLOWED_AT_ROOT_FILES whitelist.
+# under managed final-stage folders.
 IMAGE_SUFFIXES = (".png", ".svg", ".jpg", ".jpeg", ".gif")
 
 
@@ -173,7 +169,8 @@ def run(workspace: Path) -> Findings:
         ):
             findings.note(
                 f"legacy root stage artifact: {f.name} "
-                "(new runs write scratch under reports/final/ or audits/final/)"
+                "(new runs write final-stage artifacts under reports/final/ "
+                "or audits/final/)"
             )
             continue
         # Reports at root → should be in reports/
@@ -232,8 +229,7 @@ def run(workspace: Path) -> Findings:
                 f"periodic report under docs/: {p.relative_to(workspace).as_posix()} "
                 f"(future runs should write to reports/cycles/)"
             )
-    # final_report at workspace root is tolerated by ALLOWED_AT_ROOT_FILES;
-    # but if it's in docs/, it's a misplacement.
+    # final_report under docs/ is a misplacement.
     for p in (workspace / "docs").rglob("final_report.md") if (workspace / "docs").exists() else []:
         findings.warn(f"final_report.md under docs/: {p.relative_to(workspace).as_posix()}")
 

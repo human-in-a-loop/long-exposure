@@ -16,25 +16,25 @@ conceptual map, see [`architecture-overview.md`](architecture-overview.md).
 | **`prompt_toolkit`** | Interactive orchestrator REPL | Yes (pip-installed) |
 | **`anthropic`** | Python dependency installed with the package because the bundled `auto_compact` standalone CLI imports it. Long-exposure itself does not call the SDK through this path. | Yes (pip-installed); no Anthropic API key is required for normal provider-CLI runs |
 | **`pandoc`** + **[`tectonic`](https://tectonic-typesetting.github.io/)** | PDF rendering of in-cycle and final reports | Yes for standard report output. `long-exposure-setup` installs/checks them where the platform package manager supports it. If absent at runtime, markdown still lands and PDF render failures are surfaced. |
+| **`rsvg-convert`** | Optional direct SVG conversion for report figures | Optional. The PDF renderer uses same-stem PNG fallbacks or artifact links for SVG embeds, so missing `rsvg-convert` should not block standard report generation. On Debian/Ubuntu, it is provided by `librsvg2-bin`. |
 | **Wolfram Engine** | Wolfram Language scripts the worker may run | Optional — set `wolfram_path: ""` in `config.yaml` if absent |
-| **`matplotlib`** (Python) | `figure plot` subcommand backend (quantitative data plots). Hard dep since Plan E. | Yes (auto-installed by `uv sync` / `pip install -e .`) |
+| **`matplotlib`** (Python) | `figure plot` subcommand backend (quantitative data plots). | Yes (auto-installed by `uv sync` / `pip install -e .`) |
 | **D2 binary** ([install](https://d2lang.com/tour/install/)) | `figure flow` subcommand backend (flowcharts, sequence, state, ERD, structural diagrams) | Optional but needed for any `figure flow` invocation. PNG rendering pulls headless Chromium (~165 MB, one-time) on first invocation |
 | **`diagrams`** (Python; mingrammer/diagrams) | `figure arch` subcommand backend (cloud / system architecture with iconography) — Python side | Optional. `uv sync --extra figures-arch` installs it. |
-| **`graphviz`** system binary (`dot`) | `figure arch` layout engine (the `diagrams` library invokes `dot`) — system side | Optional but required alongside `diagrams`. `apt install graphviz` (Debian/Ubuntu), `brew install graphviz` (macOS), or set `GRAPHVIZ_DOT=/path/to/dot`. ~10 MB. See Plan F. |
+| **`graphviz`** system binary (`dot`) | `figure arch` layout engine (the `diagrams` library invokes `dot`) — system side | Optional but required alongside `diagrams`. `apt install graphviz` (Debian/Ubuntu), `brew install graphviz` (macOS), or set `GRAPHVIZ_DOT=/path/to/dot`. ~10 MB. |
 
 The auto-compact package is bundled in the same repo; no separate
 install needed.
 
 ### Installing the optional `figure` CLI dependencies
 
-If you'll use the `figure` CLI for first-class figure outputs (Plan C),
-install the renderer dependencies. As of Plan E matplotlib
-is a hard dep and is installed by `uv sync` automatically; only D2 and
-the arch backend remain operator-side.
+If you'll use the `figure` CLI for first-class figure outputs, install the
+renderer dependencies. Matplotlib is a hard dependency installed by `uv sync`;
+only D2 and the arch backend remain operator-side.
 
 #### `figure plot` (matplotlib) — already installed
 
-Hard dep since Plan E; `uv sync` puts it in the venv.
+`uv sync` puts it in the venv.
 Skip ahead.
 
 #### `figure flow` (D2)
@@ -53,7 +53,7 @@ echo 'a -> b' | ~/.local/bin/d2 - /tmp/_warm.png && rm /tmp/_warm.*
 # Python library — opt-in extra
 uv sync --extra figures-arch
 
-# System binary — required by the diagrams layout engine (Plan F)
+# System binary — required by the diagrams layout engine
 sudo apt-get install graphviz       # Debian / Ubuntu
 # brew install graphviz             # macOS
 # pacman -S graphviz                # Arch
@@ -350,11 +350,11 @@ recommended — see [`multi-account-pool.md`](multi-account-pool.md).
 | `<workspace>/STRUCTURE.md` | Workspace folder layout (researcher-authored cycle 1) | Researcher agent |
 | `<workspace>/MANIFEST.md` | Curated artifact list | Reporter / curator agents |
 | `<workspace>/reports/cycles/` | Periodic reports | Reporter agent |
-| `<workspace>/reports/final/` | Final reporter scratch | Final reporter agent |
-| `<workspace>/audits/final/` | Final auditor scratch and sidecars | Final auditor agent |
-| `<workspace>/final_report.{md,pdf}` | End-of-run synthesis | Final reporter agent |
-| `<workspace>/final_audit_report.{md,pdf}` | Run-scope audit | Final auditor agent |
-| `<workspace>/final_audit_summary.json` | Structured audit record | Final auditor agent |
+| `<workspace>/reports/final/` | Final reporter scratch and canonical report artifacts | Final reporter agent |
+| `<workspace>/audits/final/` | Final auditor scratch, sidecars, and canonical audit artifacts | Final auditor agent |
+| `<workspace>/reports/final/final_report.{md,pdf}` | End-of-run synthesis | Final reporter agent |
+| `<workspace>/audits/final/final_audit_report.{md,pdf}` | Run-scope audit | Final auditor agent |
+| `<workspace>/audits/final/final_audit_summary.json` | Structured audit record | Final auditor agent |
 | `<workspace>/<slug>_package.zip` | Curator's handoff bundle | Curator agent |
 
 ---
@@ -366,11 +366,11 @@ long-exposure-doctor
 ```
 
 Each backend prints `OK` or `missing`. Use this after install to spot
-gaps fast: a `missing` row for `dot` means install graphviz (Plan F);
-a `missing` for `diagrams` means run `uv sync --extra figures-arch`
-(Plan E); a `missing` for `matplotlib` means `uv sync` failed
-(matplotlib is now a hard dep, Plan E); a `missing` for `d2` means run
-the install script in [Installing the optional `figure` CLI dependencies](#installing-the-optional-figure-cli-dependencies).
+gaps fast: a `missing` row for `dot` means install graphviz; a `missing`
+for `diagrams` means run `uv sync --extra figures-arch`; a `missing` for
+`matplotlib` means `uv sync` failed (matplotlib is a hard dependency); a
+`missing` for `d2` means run the install script in
+[Installing the optional `figure` CLI dependencies](#installing-the-optional-figure-cli-dependencies).
 
 ---
 

@@ -32,6 +32,7 @@ def score_session(
     profile: dict,
     current_catalog: dict,
     now: datetime,
+    ancestor_set: set[str] | None = None,
 ) -> float:
     """Score a session's relevance to the current context.
 
@@ -85,6 +86,9 @@ def score_session(
     if is_lesson:
         score += 0.3
 
+    if ancestor_set and session.get("id") in ancestor_set:
+        score += profile.get("topic_weights", {}).get("_ancestor", 0)
+
     # --- Recency decay ---
     age_days = _age_in_days(session.get("created_at"), now)
     half_life = 30.0
@@ -103,6 +107,30 @@ def score_session(
     score *= recency
 
     return score
+
+
+def compute_ancestor_set(
+    sessions: list[dict],
+    start_id: str | None,
+    max_depth: int = 20,
+) -> set[str]:
+    """Walk parent_id pointers backward from start_id."""
+    if not start_id:
+        return set()
+    by_id = {s.get("id"): s for s in sessions if s.get("id")}
+    ancestors: set[str] = set()
+    visited: set[str] = set()
+    current = by_id.get(start_id)
+    for _ in range(max_depth):
+        if not current:
+            break
+        parent_id = current.get("parent_id")
+        if not parent_id or parent_id in visited:
+            break
+        visited.add(parent_id)
+        ancestors.add(parent_id)
+        current = by_id.get(parent_id)
+    return ancestors
 
 
 def extract_snippet(summary_xml: str | None, max_chars: int = 150) -> str:
@@ -148,6 +176,7 @@ def rank_sessions(
     exclude_id: str | None = None,
     fork_scope: str = "all",
     current_fork_id: str | None = None,
+    ancestor_anchor_id: str | None = None,
 ) -> list[dict]:
     """Rank sessions by relevance and return the top N.
 
@@ -166,6 +195,8 @@ def rank_sessions(
                            pre-fork root context).
         current_fork_id: The caller's fork_id; used only when
             fork_scope == "same_fork". None means "treat caller as root".
+        ancestor_anchor_id: Optional session ID whose parent chain receives
+            the opt-in `_ancestor` score bonus.
 
     Returns list of dicts with added 'score' and 'snippet' keys, sorted by score desc.
     """
@@ -176,9 +207,12 @@ def rank_sessions(
         )
 
     now = datetime.now(timezone.utc)
+    ancestor_set = compute_ancestor_set(sessions, ancestor_anchor_id)
     scored = []
 
     for session in sessions:
+        if session.get("record_type") == "lemma":
+            continue
         if exclude_id and session.get("id") == exclude_id:
             continue
         # Skip sessions with no catalog data
@@ -193,7 +227,7 @@ def rank_sessions(
                 and session_fork != current_fork_id:
             continue
 
-        s = score_session(session, profile, current_catalog, now)
+        s = score_session(session, profile, current_catalog, now, ancestor_set=ancestor_set)
         if s >= min_score:
             scored.append({
                 "id": session["id"],

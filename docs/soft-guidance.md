@@ -43,7 +43,7 @@ without gating.
 | **Framework template** (layer 2) | `long_exposure/templates/framework-template.md`; values from `orchestrator.FRAMEWORK_PRESETS` | All agents inheriting that framework |
 | **Operating protocol** (layer 3) | `long_exposure/templates/operating-protocol-template.md` | All agents in any score |
 | **Per-agent role text** | `long_exposure/exploration-score.yaml` (XML blocks under each agent's `role:`) | The specific agent in this score |
-| **Runtime-injected blocks** | Live guidance (cycle-by-cycle), agent-teams template (when active), context gems (proximity-ranked), parallel-cycle fan-out guidance | Per-call basis |
+| **Runtime-injected blocks** | Live guidance (cycle-by-cycle), agent-teams template (when active), context gems (proximity-ranked), parallel-cycle fan-out guidance, ledger-derived anti-patterns | Per-call basis |
 
 When deciding *where* to add a piece of soft-guidance, the test is
 **scope**:
@@ -57,10 +57,29 @@ When deciding *where* to add a piece of soft-guidance, the test is
 
 ---
 
-## Two canonical refinements
+## Weight tags and anti-pattern blocks
 
-Two single-line soft-guidance additions that encode research wisdom
-the system used to leave implicit. Both ship verbatim today.
+Some guidance lines use lightweight tags such as `[INVARIANT]`,
+`[PREFER]`, and `[AVOID]`. They are not parsed by Python and do not enforce
+behavior. They are semantic emphasis for the model: invariants are
+load-bearing, preferences are default posture, and avoids are known bad moves.
+Keep tags sparse; if every sentence is tagged, no sentence is emphasized.
+
+The cycle loop can also inject a `<campaign_anti_patterns>` block built from
+the promise ledger. It selects only milestones whose latest event is still
+`invalidated`, has high/medium confidence, and includes a rationale. The block
+is placed before operator live guidance, so an explicit operator guide can
+override it. Missing or malformed ledgers degrade to no block.
+
+This is still soft guidance. It prevents repeated mistakes by reminding agents
+about confirmed invalidated approaches; it does not hard-gate re-attempts.
+
+---
+
+## Canonical refinements
+
+Single-line soft-guidance additions that encode research wisdom the system used
+to leave implicit. These ship in the default score/templates today.
 
 ### Refinement A — Multiple-methods fan-out (researcher role)
 
@@ -181,7 +200,7 @@ existing block, not add a new one.
 
 ---
 
-## Code citations
+## Code references
 
 - Philosophy + framework presets: `long_exposure/orchestrator.py`
   (`PHILOSOPHY_PRESETS`, `FRAMEWORK_PRESETS`).
@@ -190,5 +209,7 @@ existing block, not add a new one.
 - Live guidance computation:
   `long_exposure/exploration.py:_compute_live_guidance` (and
   `_build_fanout_guidance` in `fanout.py`).
+- Campaign anti-pattern block: `long_exposure/anti_patterns.py` and
+  `exploration.py` (`_build_anti_patterns_block`).
 - Validator surfacing (not enforcement):
   `long_exposure/tools/{promise_check,org_check}.py`.

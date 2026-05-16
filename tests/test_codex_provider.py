@@ -5,7 +5,12 @@ from unittest.mock import patch
 
 from long_exposure import provider
 from long_exposure.exploration import _call_exploration_agent
-from long_exposure.orchestrator import _codex_permission_flags, _extract_codex_envelope, load_config
+from long_exposure.orchestrator import (
+    _codex_permission_flags,
+    _extract_codex_envelope,
+    _format_cli_failure_context,
+    load_config,
+)
 
 
 class CodexProviderTests(unittest.TestCase):
@@ -30,6 +35,16 @@ class CodexProviderTests(unittest.TestCase):
         self.assertNotIn("--yolo", flags)
         self.assertIn("-s", flags)
         self.assertIn("read-only", flags)
+
+    def test_cli_failure_context_includes_all_available_channels(self):
+        text = _format_cli_failure_context(
+            stderr="stderr detail",
+            stdout='{"type":"error"}',
+            envelope={"result": "structured detail"},
+        )
+        self.assertIn("stderr detail", text)
+        self.assertIn("structured detail", text)
+        self.assertIn('{"type":"error"}', text)
 
     def test_exploration_agent_builds_codex_fresh_command_and_records_thread(self):
         captured = {}

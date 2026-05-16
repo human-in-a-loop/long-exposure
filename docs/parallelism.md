@@ -56,9 +56,10 @@ The Python parser cannot enforce (a)–(c) directly — they require
 semantic judgment. What the parser **does** enforce structurally:
 
 1. **K must be in [2, dynamic_cap]**, where `dynamic_cap =
-   pool.fanout_cap()` (= `available_slots() - 1`) when the pool is
-   active, else `FANOUT_MAX_BRANCHES = 3`. K > cap is tail-clamped
-   and the dropped branches are surfaced to the next cycle's
+   pool.fanout_cap()` (= `available_slots() - 1`) when a single-provider
+   pool is active, `unified_pool.fanout_cap()` when Claude and Codex pools
+   are both configured, else `FANOUT_MAX_BRANCHES = 3`. K > cap is
+   tail-clamped and the dropped branches are surfaced to the next cycle's
    `live_guidance`. K < 2 rejects the whole block.
 2. **Output paths must be distinct** under `os.path.normpath`
    (catches `./a.md` vs `a.md`) AND must not be in ancestor/descendant
@@ -78,9 +79,30 @@ Cap: up to N branches (set by current account-pool capacity, not by you).
 ```
 
 `N = available_slots() - 1`, with one slot reserved for sequential
-root calls. With 5 accounts × 3 slots/account = 15 slots → cap 14.
-With 2 accounts → cap 5. Cooling accounts contribute 0; cold
+root calls. In unified-pool mode, the cap sums available Claude and
+Codex pool capacity. With 5 accounts × 3 slots/account = 15 slots →
+cap 14. With 2 accounts → cap 5. Cooling accounts contribute 0; cold
 accounts contribute their full capacity.
+
+### Branchial budget annotations
+
+Accepted fan-out proposals are annotated before dispatch by
+`branchial_budget.score_branches`. The scorer compares each branch
+objective against recent `sessions.db` catalog tokens and writes a
+report-only novelty classification:
+
+| Class | Meaning |
+|---|---|
+| `novel` | Low overlap with recent catalog tuples. |
+| `partial-retread` | Some overlap; likely related but not identical. |
+| `likely-retread` | High overlap with recent catalog tuples. |
+| `unknown` | Missing DB, empty objective, or no usable catalog tokens. |
+
+This signal never rejects or reorders branches. It appears in the
+fork manifest and in `data/branchial_budget.jsonl` so later reports can
+see whether fan-out expanded the search space or repeated prior work.
+Exact root-cycle tagging is deferred; fork id and manifest context are
+the current source of truth.
 
 ### Clone lifecycle
 
@@ -96,10 +118,13 @@ When the parser accepts a block:
    `results` (filtered to drop `live_guidance`). Propagates
    `parent_run_id` so clone-emitted ledger events share the run's
    counters.
-4. **Acquire a pool slot** for the clone (via `pool.acquire_slot`).
-   Set `CLAUDE_FORCE_ACCOUNT` in the clone's env to the slot's
-   account dir. Strip `CLAUDE_ACCOUNTS` from the clone's env — clones
-   never rotate; they're pinned at spawn.
+4. **Acquire a pool slot** for the clone. In single-provider mode this
+   routes through `pool.acquire_slot`; in unified Claude+Codex mode it
+   routes through `unified_pool.acquire_slot` and remembers which
+   provider owns the slot. Set the provider-specific force-account env
+   (`CLAUDE_FORCE_ACCOUNT` or `CODEX_FORCE_ACCOUNT`) in the clone's
+   environment and disable recursive unified pooling for the child.
+   Clones never rotate; they're pinned at spawn.
 5. **Popen the clone** as `python -m long_exposure.exploration ...
    resume` with `--instance-dir clone-<k>`. The clone is started in
    its own process group (`start_new_session=True`) so the parent can
@@ -121,7 +146,7 @@ The parent polls each clone's `merge_report.md` until either:
 - All clones have finished (organic termination, low-output exhaustion,
   rate-limit on pinned account).
 - Wall-clock cap hit: `FANOUT_CAP_SECONDS = 36000` (10h) per clone.
-- **Graceful barrier preemption** (Stage 9): a clone has done
+- **Graceful barrier preemption**: a clone has done
   ≥ `min_clone_cycles_before_preempt` cycles AND any other clone has
   already exited AND there is cold pool capacity sitting idle.
 
@@ -140,7 +165,7 @@ Hard-kill escalation if the clone ignores the graceful-stop signal:
 SIGTERM after 120s grace → SIGKILL after a further 10s, sent to the
 clone's process group.
 
-### Merge synthesis (Stage 2)
+### Merge synthesis
 
 After the barrier collapses, the parent:
 
@@ -151,8 +176,11 @@ After the barrier collapses, the parent:
    (default 4). Invokes the existing **reporter** agent (no new agent
    role per principle 4) with a synthesis prompt that compresses N
    merge_reports → one bounded `merge_synthesis.md` (~15–30k tokens
-   independent of N). Below the threshold, raw concatenation is the
-   substrate.
+   independent of N). The synthesis prompt also asks for a compact
+   `<branchial_diff>` JSON block describing where branches agreed,
+   diverged, and left conflicts unresolved. Below the threshold, raw
+   concatenation is the substrate and the divergence table falls back to
+   branch outcomes.
 4. **Run a single post-merge worker turn** with the synthesis (or raw
    concat) as the merge content. The cycle loop continues normally
    from the next cycle, with the post-merge worker's output rolled
@@ -162,6 +190,10 @@ Why the threshold: at K=3 the raw concat is ~30k tokens (within budget
 for the post-merge worker); at K=10 it's ~100k; at K=30 it's ~300k.
 Synthesis at K ≥ 4 keeps post-merge worker context bounded
 regardless of fan-out width.
+
+The conductor renders the parsed diff into `fork-<id>/fanout_divergence.md`
+and threads the table into the post-merge worker brief. Parse failures
+degrade to a state-only table; they do not fail the merge.
 
 The reporter is reused (not a new "merge synthesizer" agent) per the
 "reuse existing agents" principle. It's the same reporter that runs
@@ -176,6 +208,7 @@ disk.
 | Workspace files (output_artifact, side-effect data) | shared workspace root | yes — clones share workspace |
 | Clone's exploration_state.json | `clone-<k>/exploration_state.json` | optional — rotting fork dirs can be archived |
 | Clone's merge_report.md | `clone-<k>/merge_report.md` | yes — read by post-merge worker |
+| Fan-out divergence table | `fork-<id>/fanout_divergence.md` | yes — read by post-merge worker and reports |
 | Clone's promise_ledger shadow file | `clone-<k>/promise_ledger.jsonl` | yes — concatenated to root ledger by `concat_clone_ledgers` after barrier |
 | `sessions.db` writes | shared `sessions.db` (auto_compact path) | yes — single shared DB; WAL serialises writes |
 | Pool slot | reclaimed via clone-side atexit / parent barrier release / heartbeat sweep | three independent paths, no leaks |
@@ -374,9 +407,11 @@ the objective (e.g., "Group A — sub-task 1", "Group A — sub-task 2",
 2. Parser enforces structure (path collisions, K bounds, recursion);
    the model is trusted on independence semantics.
 3. Pool capacity dictates parallelism. There is no user-facing
-   branch-count knob. `fanout_cap = pool.available_slots() - 1`.
-4. Clones are pinned at spawn via `CLAUDE_FORCE_ACCOUNT`. They never
-   rotate; rate-limit on a pinned account exits the clone.
+   branch-count knob. `fanout_cap = available_slots - 1`, summed across
+   Claude and Codex pools when unified mode is active.
+4. Clones are pinned at spawn via provider-specific force-account env
+   vars. They never rotate; rate-limit on a pinned account exits the
+   clone.
 5. Clones share workspace and `sessions.db`. Output_artifact paths
    must be disjoint (parser enforces).
 6. Wall-cap is 10h per clone (safety floor). Graceful preemption
@@ -390,7 +425,7 @@ the objective (e.g., "Group A — sub-task 1", "Group A — sub-task 2",
 
 ---
 
-## Interaction with multi-account rotation (Plan B)
+## Interaction with multi-account rotation
 
 The cycle loop has two rotation triggers, both of which clear the
 parent's `agent_sessions` (Claude session UUIDs are per-account):
@@ -399,7 +434,7 @@ parent's `agent_sessions` (Claude session UUIDs are per-account):
   The handler marks the old primary cooling, calls `pool.promote_fresh`,
   hot-swaps `CLAUDE_FORCE_ACCOUNT`, and clears `agent_sessions`. The
   current cycle is restarted from the top.
-- **Planned 24h** (Plan B) — fires after the daily-sync block iff no
+- **Planned 24h** — fires after the daily-sync block iff no
   rotation has happened in the prior 24h. Calls `pool.promote_fresh`,
   hot-swaps `CLAUDE_FORCE_ACCOUNT`, and clears `agent_sessions`.
   Pre-emptive (no `mark_rate_limited`); the old primary stays
@@ -416,7 +451,7 @@ mechanics.
 
 ---
 
-## Figures from inside a fan-out (Plan C)
+## Figures from inside a fan-out
 
 Worker / auditor agents (including those running inside fan-out
 clones) generate figures through the unified `figure` CLI:
@@ -437,18 +472,23 @@ figure CLI reference.
 
 ---
 
-## Code citations
+## Code references
 
-- Parallel-cycle fan-out parser and gates: `long_exposure/fanout.py:282–424`.
-- Clone spawn / lifecycle: `fanout.py:574–842`.
-- Pool-aware fan-out cap: `fanout.py:92–106`; `pool.py:300–319`.
-- Barrier and graceful preemption: `fanout.py:1021–1291` (eligibility
-  check at `_should_preempt_barrier`).
-- Merge synthesis (Stage 2): `fanout.py:1372–1471`; `reporting.py`
-  (reporter reuse).
-- Post-merge worker brief: `exploration.py:2235–2262`.
+- Parallel-cycle fan-out parser and gates: `long_exposure/fanout.py`
+  (`_parse_fanout_block`, path validation helpers).
+- Branchial budget annotations: `long_exposure/branchial_budget.py`
+  and the researcher fan-out branch in `exploration.py`.
+- Clone spawn / lifecycle: `long_exposure/fanout.py`
+  (`_acquire_clone_pool_slot`, `_spawn_clone`, `_run_fanout_conductor`).
+- Pool-aware and unified fan-out cap: `fanout.py` (`_fanout_branch_cap`),
+  `pool.py` (`fanout_cap`), `unified_pool.py` (`fanout_cap`).
+- Barrier and graceful preemption: `fanout.py`
+  (`_should_preempt_barrier`, barrier polling loop).
+- Merge synthesis and branchial diff: `fanout.py`
+  (`MERGE_SYNTHESIS_PROMPT`, `_extract_branchial_diff`,
+  `_render_divergence_table`).
 - Clone bootstrap (slot re-tag, atexit): `exploration.py` clone
-  bootstrap block (look for `_is_clone()` block).
+  bootstrap block (look for `_is_clone()`).
 - Agent-teams runtime: lead's `claude -p` env contains
-  `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` when active. Template
-  block injected by `orchestrator.py:1734–1740`.
+  `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` when active; provider-specific
+  team guidance is assembled in `orchestrator.py`.

@@ -16,6 +16,18 @@ class SetupEnvTests(unittest.TestCase):
         }
         self.assertEqual(setup_env.missing_required(report), ["tectonic"])
 
+    def test_missing_required_ignores_optional_rsvg(self):
+        report = {
+            "tools": [
+                {"name": "pandoc", "ok": True},
+                {"name": "tectonic", "ok": True},
+            ],
+            "optional_tools": [
+                {"name": "rsvg-convert", "ok": False},
+            ],
+        }
+        self.assertEqual(setup_env.missing_required(report), [])
+
     def test_apt_install_command_uses_required_missing_tools(self):
         def fake_which(name):
             return "/usr/bin/apt-get" if name == "apt-get" else None
@@ -23,18 +35,44 @@ class SetupEnvTests(unittest.TestCase):
         with patch("platform.system", return_value="Linux"):
             with patch("long_exposure.tools.setup_env._which", fake_which):
                 with patch("long_exposure.tools.setup_env._sudo_prefix", return_value=["sudo"]):
-                    cmds, note = setup_env._pkg_manager_install_cmds(["pandoc", "tectonic"])
+                    cmds, note = setup_env._pkg_manager_install_cmds(
+                        ["pandoc", "tectonic", "rsvg-convert"]
+                    )
 
         self.assertIsNone(note)
         self.assertEqual(cmds[0], ["sudo", "apt-get", "update"])
         self.assertEqual(cmds[1], ["sudo", "apt-get", "install", "-y", "pandoc"])
         self.assertEqual(cmds[2], ["sudo", "apt-get", "install", "-y", "tectonic"])
+        self.assertEqual(cmds[3], ["sudo", "apt-get", "install", "-y", "librsvg2-bin"])
+
+    def test_brew_install_command_maps_rsvg_binary_to_package(self):
+        def fake_which(name):
+            return "/opt/homebrew/bin/brew" if name == "brew" else None
+
+        with patch("platform.system", return_value="Darwin"):
+            with patch("long_exposure.tools.setup_env._which", fake_which):
+                cmds, note = setup_env._pkg_manager_install_cmds(["rsvg-convert"])
+
+        self.assertIsNone(note)
+        self.assertEqual(cmds, [["brew", "install", "librsvg"]])
+
+    def test_winget_reports_manual_note_for_rsvg_binary(self):
+        def fake_which(name):
+            return "winget.exe" if name == "winget" else None
+
+        with patch("platform.system", return_value="Windows"):
+            with patch("long_exposure.tools.setup_env._which", fake_which):
+                cmds, note = setup_env._pkg_manager_install_cmds(["rsvg-convert"])
+
+        self.assertEqual(cmds, [])
+        self.assertIn("rsvg-convert", note)
 
     def test_unsupported_platform_returns_manual_note(self):
         with patch("platform.system", return_value="Plan9"):
-            cmds, note = setup_env._pkg_manager_install_cmds(["pandoc"])
+            cmds, note = setup_env._pkg_manager_install_cmds(["pandoc", "rsvg-convert"])
         self.assertEqual(cmds, [])
         self.assertIn("Install manually", note)
+        self.assertIn("rsvg-convert", note)
 
     def test_doctor_forces_check_mode(self):
         captured = {}

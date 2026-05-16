@@ -78,6 +78,7 @@ from long_exposure import pool
 from long_exposure import paths
 from long_exposure import provider as _provider
 from long_exposure import telemetry
+from long_exposure import unified_pool
 from auto_compact.db import init_db, store_session
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -158,6 +159,64 @@ def _resolve_output_dir(
 _stop_requested = False
 _clear_requested = False
 _graceful_stop_requested = False  # Stage 1 §6.4 — finish current cycle, then exit.
+_unified_root_holder: unified_pool.UnifiedHolder | None = None
+
+
+def _pin_unified_holder_env(holder: unified_pool.UnifiedHolder) -> None:
+    """Pin the current process to a unified-pool holder's provider/account."""
+    for prv in unified_pool.SUPPORTED_PROVIDERS_FOR_POOL:
+        os.environ.pop(_provider.force_account_env(prv), None)
+    os.environ["LONG_EXPOSURE_LLM_PROVIDER"] = holder.provider
+    os.environ[_provider.force_account_env(holder.provider)] = holder.account_dir
+
+
+def _release_unified_root_holder() -> None:
+    global _unified_root_holder
+    holder = _unified_root_holder
+    if holder is None:
+        return
+    try:
+        unified_pool.release_slot_by_holder(holder)
+    except Exception as exc:
+        print(f"[long-exposure] Unified pool release warning: {exc}", flush=True)
+    finally:
+        _unified_root_holder = None
+
+
+def _rotate_unified_root_after_rate_limit(
+    provider_preference: list[str] | None = None,
+) -> unified_pool.UnifiedHolder | None:
+    """Mark the current unified root account cooling and acquire a fresh slot."""
+    global _unified_root_holder
+    old = _unified_root_holder
+    if old is not None:
+        try:
+            with unified_pool.swap_active_provider(old.provider):
+                pool.mark_rate_limited(old.account_dir)
+        finally:
+            _release_unified_root_holder()
+    else:
+        # Defensive fallback for resumed/legacy unified state where the env is
+        # pinned but this process did not create a holder object.
+        cur_provider = _provider.current_provider()
+        force_env = _provider.force_account_env(cur_provider)
+        pinned = os.environ.get(force_env, "").strip()
+        if pinned:
+            with unified_pool.swap_active_provider(cur_provider):
+                pool.mark_rate_limited(pinned)
+
+    try:
+        holder = unified_pool.acquire_slot(
+            role="root",
+            pid=os.getpid(),
+            provider_preference=provider_preference,
+        )
+    except Exception as exc:
+        print(f"[long-exposure] Unified pool rotation failed: {exc}", flush=True)
+        return None
+    _unified_root_holder = holder
+    _pin_unified_holder_env(holder)
+    return holder
 
 
 def _on_signal(signum, frame):
@@ -317,6 +376,7 @@ RUNTIME_INPUTS: frozenset[str] = frozenset({
     "prior_reports",
     "final_audit_summary",
     "final_audit_headline",
+    "ledger_causal_summary",
     "wall_cap_hit",
     "findings_file",
     "lesson_candidates_file",
@@ -428,6 +488,7 @@ def save_state(path: Path, cycle: int, results: dict, failures: dict,
         "agent_sessions": agent_sessions or {},
         "agent_sessions_provider": _provider.current_provider(),
         "agent_sessions_account": _active_account_index(),
+        "unified_pool_active": unified_pool.is_unified_active(),
         "agent_summaries": agent_summaries or {},
         "post_merge_pending": post_merge_pending,
         "task": task,
@@ -653,6 +714,7 @@ def _run_daily_sync(
 def _should_run_final_synthesis(
     *,
     topic_exhausted: bool,
+    max_cycles_reached: bool = False,
     stop_requested: bool,
     clear_requested: bool,
 ) -> bool:
@@ -660,14 +722,38 @@ def _should_run_final_synthesis(
     reporter + curator). Captured here so all three call sites use exactly the
     same predicate (docs/end-of-run-pipeline.md).
 
-    Currently: run on natural exhaustion only — `_clear_requested` is the
+    Run on natural exhaustion or an operator stop. `_clear_requested` is the
     explicit carve-out (a clear archives state and the synthesis would be
-    stranded). `stop_requested` mid-cycle is handled separately by the cycle
-    loop saving state and exiting.
+    stranded). A stop signal is a graceful end-of-run request, so the final
+    auditor/reporter/curator should run after any in-flight cycle and periodic
+    report finish.
     """
     if clear_requested:
         return False
-    return bool(topic_exhausted)
+    return bool(topic_exhausted or max_cycles_reached or stop_requested)
+
+
+def _clear_stop_flag_for_final_synthesis(
+    *,
+    should_run_final: bool,
+    stop_requested: bool,
+    clear_requested: bool,
+) -> bool:
+    """Allow final stages to run after an operator stop.
+
+    The same module-level `_stop_requested` flag that exits the cycle loop is
+    also read by final_auditor/final_reporter between their stages. If it
+    remains set, a graceful stop can correctly enter end-of-run synthesis but
+    then immediately short-circuit the final audit/report stages. Once the
+    cycle loop is already exiting, clearing the flag is safe: we preserve the
+    original stop state in local variables for status/telemetry, while letting
+    the finalization pipeline complete.
+    """
+    global _stop_requested
+    if should_run_final and stop_requested and not clear_requested:
+        _stop_requested = False
+        return True
+    return False
 
 
 def load_state(path: Path) -> dict | None:
@@ -1325,9 +1411,12 @@ def _call_agent_with_rotation(
     accounts = _parse_accounts()
     is_forced, _ = _resolve_force_account(accounts)
 
-    if is_forced:
-        # Pinned (clone-side). Single attempt — rotation isn't allowed;
-        # the clone is bound to one account by design.
+    if is_forced and (_is_clone() or not (pool.is_active() or unified_pool.is_unified_active())):
+        # Pinned clone or manually pinned non-pool run. Single attempt:
+        # clone accounts are bound by design, and manual pins should not
+        # silently rotate away from the operator's chosen account. Root pool
+        # pins are different: the pool itself uses FORCE env vars to route
+        # calls, so they must remain eligible for pool-aware rotation.
         return _call_exploration_agent(
             agent_name=agent_name,
             agent_def=agent_def,
@@ -1335,8 +1424,10 @@ def _call_agent_with_rotation(
             **kwargs,
         )
 
-    pool_active = _pool.is_active()
-    if pool_active:
+    pool_active = _pool.is_active() or unified_pool.is_unified_active()
+    if unified_pool.is_unified_active():
+        max_attempts = max(1, unified_pool.callable_account_count())
+    elif pool_active:
         try:
             cold_count = sum(
                 1 for a in _pool.pool_state().get("accounts", [])
@@ -1359,6 +1450,31 @@ def _call_agent_with_rotation(
         if result["status"] != "rate_limit":
             return result
         sessions_dict.pop(agent_name, None)
+
+        if unified_pool.is_unified_active():
+            try:
+                old_provider = _provider.current_provider()
+                preference = [
+                    prv for prv in unified_pool.SUPPORTED_PROVIDERS_FOR_POOL
+                    if prv != old_provider
+                ] + [old_provider]
+                holder = _rotate_unified_root_after_rate_limit(preference)
+            except Exception as _err:
+                print(
+                    f"[long-exposure]   {agent_name} unified rotation failed "
+                    f"({_err}); returning last rate_limit",
+                    flush=True,
+                )
+                return result
+            if not holder:
+                return result
+            sessions_dict.clear()
+            print(
+                f"[long-exposure]   {agent_name} rotated (unified): "
+                f"{old_provider} -> {holder.provider}/{Path(holder.account_dir).name}",
+                flush=True,
+            )
+            continue
 
         if pool_active:
             try:
@@ -1681,6 +1797,11 @@ def _store_agent_output(
             keywords=agent_name,  # use agent name as keyword for identification
             fork_id=_get_fork_id(),  # None at root, UUID inside clones
         )
+        try:
+            from long_exposure import lemmas
+            lemmas.extract_and_store_lemmas(output_text, conn)
+        except Exception as e:
+            print(f"[lemmas] parse/store skipped: {e!r}", flush=True)
         return session_id
     except Exception as e:
         print(f"[long-exposure]   DB write failed: {e}", flush=True)
@@ -2112,6 +2233,30 @@ def _collect_sibling_pointers(own_instance_dir: Path) -> str | None:
         "</sibling_reports>",
     ]
     return "\n".join(block)
+
+
+def _build_anti_patterns_block(workspace: Path, config: dict) -> str | None:
+    try:
+        anti_cfg = config.get("anti_patterns", {})
+        if isinstance(anti_cfg, dict) and not anti_cfg.get("enabled", True):
+            return None
+        from long_exposure import anti_patterns
+        max_entries = (
+            int(anti_cfg.get("max_entries", anti_patterns.MAX_ENTRIES))
+            if isinstance(anti_cfg, dict) else anti_patterns.MAX_ENTRIES
+        )
+        max_chars = (
+            int(anti_cfg.get("max_rationale_chars", anti_patterns.MAX_RATIONALE_CHARS))
+            if isinstance(anti_cfg, dict) else anti_patterns.MAX_RATIONALE_CHARS
+        )
+        return anti_patterns.build_block(
+            workspace,
+            max_entries=max_entries,
+            max_rationale_chars=max_chars,
+        ) or None
+    except Exception as exc:
+        print(f"[anti-patterns] skipped: {exc!r}", flush=True)
+        return None
 
 
 def _compute_merge_frontmatter_fields(
@@ -3072,7 +3217,28 @@ def run_exploration(
     # root agents (sequential calls share this one slot). Clones inherit
     # CLAUDE_FORCE_ACCOUNT from their fanout-spawn env and are already
     # accounted in the ledger by the fanout conductor.
-    if not _is_clone() and pool.is_active():
+    if not _is_clone() and unified_pool.is_unified_active():
+        try:
+            unified_pool.init_all_pools()
+            holder = unified_pool.acquire_slot(
+                role="root",
+                pid=os.getpid(),
+                provider_preference=score.get("root_provider_preference"),
+            )
+            global _unified_root_holder
+            _unified_root_holder = holder
+            _pin_unified_holder_env(holder)
+            import atexit as _atexit
+            _atexit.register(_release_unified_root_holder)
+            print(
+                f"[long-exposure] Unified pool active: root pinned to "
+                f"{holder.provider}/{Path(holder.account_dir).name}",
+                flush=True,
+            )
+            print(f"[long-exposure] {unified_pool.format_unified_summary()}", flush=True)
+        except Exception as _pool_err:
+            print(f"[long-exposure] Unified pool init warning: {_pool_err}", flush=True)
+    elif not _is_clone() and pool.is_active():
         try:
             pool.init_pool()
             pool.thaw_eligible()
@@ -3115,6 +3281,7 @@ def run_exploration(
     cycle_session_log = []
     low_output_streak = 0  # consecutive cycles with < 200 total output tokens
     topic_exhausted = False  # set True when low-output streak triggers closure
+    max_cycles_reached = False
     LOW_OUTPUT_THRESHOLD = 2000  # tokens — exhausted cycles produce ~20-70
     LOW_OUTPUT_CLOSURE_COUNT = 2  # consecutive low-output cycles to trigger closure
 
@@ -3171,7 +3338,18 @@ def run_exploration(
         # Pool maintenance (root only, cheap): reclaim orphan slots whose
         # PID is dead, and thaw cooling accounts whose cooldown has elapsed.
         # Both ops short-circuit when the pool is inactive.
-        if not _is_clone() and pool.is_active():
+        if not _is_clone() and unified_pool.is_unified_active():
+            try:
+                _swept, _thawed = unified_pool.heartbeat_and_thaw_all()
+                if _swept or _thawed:
+                    print(
+                        f"[long-exposure] Unified pool maintenance: "
+                        f"swept={_swept}, thawed={_thawed}",
+                        flush=True,
+                    )
+            except Exception as _pool_err:
+                print(f"[long-exposure] Unified pool maintenance skipped ({_pool_err})", flush=True)
+        elif not _is_clone() and pool.is_active():
             try:
                 _swept = pool.heartbeat_sweep()
                 _thawed = pool.thaw_eligible()
@@ -3190,6 +3368,7 @@ def run_exploration(
 
         if max_cycles and cycle >= max_cycles:
             print(f"\n[long-exposure] Reached max cycles ({max_cycles}).", flush=True)
+            max_cycles_reached = True
             break
 
         cycle += 1
@@ -3212,6 +3391,7 @@ def run_exploration(
             results["research_brief"] = POST_MERGE_BRIEF_TEMPLATE.format(
                 k=_k_branches or "K",
                 fork_id=_fork_id_str,
+                divergence_table=results.get("fanout_divergence_table", ""),
                 merge=results.get("audit_report", "(merge content unavailable)"),
             )
             print(
@@ -3275,8 +3455,12 @@ def run_exploration(
             if (_is_clone() and not in_post_merge_cycle)
             else None
         )
+        anti_patterns_block = _build_anti_patterns_block(workspace_root, config)
 
-        parts = [p for p in (fanout_guide, sibling_block, guidance) if p]
+        parts = [
+            p for p in (fanout_guide, sibling_block, anti_patterns_block, guidance)
+            if p
+        ]
         if parts:
             results["live_guidance"] = "\n\n".join(parts)
             if guidance:
@@ -3458,6 +3642,28 @@ def run_exploration(
                             results.get("research_brief", "")
                         )
                         if _branches:
+                            try:
+                                from long_exposure import branchial_budget
+                                _annotations = branchial_budget.score_branches(
+                                    _branches,
+                                    db_path=config.get("compact_db"),
+                                )
+                                for _br, _ann in zip(_branches, _annotations):
+                                    _br["branchial_budget"] = _ann
+                                _summary = ", ".join(
+                                    f"c{_i}={_ann.get('novelty_class', 'unknown')}"
+                                    for _i, _ann in enumerate(_annotations)
+                                )
+                                print(
+                                    f"[long-exposure] branchial-budget: {_summary}",
+                                    flush=True,
+                                )
+                            except Exception as _bb_err:
+                                print(
+                                    "[long-exposure] branchial-budget skipped: "
+                                    f"{_bb_err!r}",
+                                    flush=True,
+                                )
                             _fanout = _run_fanout_conductor(
                                 branches=_branches,
                                 score_path=score_path,
@@ -3508,6 +3714,9 @@ def run_exploration(
                             # Collapse: the aggregated merge becomes the next
                             # cycle's audit_report input for the researcher.
                             results["audit_report"] = _fanout["aggregated_report"]
+                            results["fanout_divergence_table"] = (
+                                _fanout.get("divergence_table") or ""
+                            )
                             results["work_output"] = (
                                 f"[fan-out collapsed: fork "
                                 f"{_fanout['fork_id']} with "
@@ -3608,7 +3817,31 @@ def run_exploration(
             # regression (clones inherit parent's primary, all
             # land on acct4, retry indefinitely) was caused by exactly that
             # ordering. Pool path first; legacy is the fallback only.
-            if pool.is_active():
+            if unified_pool.is_unified_active() and not _is_clone():
+                old_provider = _provider.current_provider()
+                preference = [
+                    prv for prv in unified_pool.SUPPORTED_PROVIDERS_FOR_POOL
+                    if prv != old_provider
+                ] + [old_provider]
+                holder = _rotate_unified_root_after_rate_limit(preference)
+                if holder:
+                    print(
+                        f"[long-exposure] Unified pool: {old_provider} "
+                        f"rate-limited; promoted to "
+                        f"{holder.provider}/{Path(holder.account_dir).name}. "
+                        f"Clearing sessions and restarting cycle from top.",
+                        flush=True,
+                    )
+                    print(f"[long-exposure] {unified_pool.format_unified_summary()}", flush=True)
+                else:
+                    print(
+                        "[long-exposure] Unified pool: all accounts cooling; "
+                        f"falling back to adaptive cooldown ({rate_limit_reason})",
+                        flush=True,
+                    )
+                    cycle_ok = False
+                    break
+            elif pool.is_active():
                 if _is_clone():
                     # §6.2: a pinned clone whose account rate-limits cannot
                     # rotate. Mark cooling, release slot, exit cleanly so
@@ -4121,11 +4354,25 @@ def run_exploration(
             # Root path — final auditor + final synthesis + curator. The
             # _should_run_final_synthesis predicate is shared so the auditor
             # and reporter never desynchronize (docs/end-of-run-pipeline.md).
+            operator_stop_requested = _stop_requested
+            operator_clear_requested = _clear_requested
             should_run_final = _should_run_final_synthesis(
                 topic_exhausted=topic_exhausted,
-                stop_requested=_stop_requested,
-                clear_requested=_clear_requested,
+                max_cycles_reached=max_cycles_reached,
+                stop_requested=operator_stop_requested,
+                clear_requested=operator_clear_requested,
             )
+            stop_suppressed_for_final = _clear_stop_flag_for_final_synthesis(
+                should_run_final=should_run_final,
+                stop_requested=operator_stop_requested,
+                clear_requested=operator_clear_requested,
+            )
+            if stop_suppressed_for_final:
+                print(
+                    "[long-exposure] Stop acknowledged; running final "
+                    "auditor/reporter/curator before exit.",
+                    flush=True,
+                )
 
             # 1. Final auditor (if defined) — runs BEFORE the reporter so the
             #    reporter can ingest final_audit_summary.json structurally.
@@ -4143,6 +4390,9 @@ def run_exploration(
                         agent_summaries=agent_summaries,
                     )
                 except Exception as _aud_err:
+                    consecutive_failures["final_auditor"] = (
+                        consecutive_failures.get("final_auditor", 0) + 1
+                    )
                     # Final auditor failure must not block the reporter or
                     # curator — the run still ships a final report. Surface
                     # the error and continue.
@@ -4154,23 +4404,43 @@ def run_exploration(
 
             final_reporter_def = agents.get("final_reporter")
             if should_run_final and final_reporter_def:
-                last_session_id = _run_final_reporter(
-                    final_reporter_def, task, config, results, score_inputs,
-                    conn, cycle, last_session_id,
-                    context_window, compact_at,
-                    data_dir=data_dir,
-                    agent_sessions=agent_sessions,
-                    agent_summaries=agent_summaries,
-                )
+                try:
+                    last_session_id = _run_final_reporter(
+                        final_reporter_def, task, config, results, score_inputs,
+                        conn, cycle, last_session_id,
+                        context_window, compact_at,
+                        data_dir=data_dir,
+                        agent_sessions=agent_sessions,
+                        agent_summaries=agent_summaries,
+                    )
+                except Exception as _rep_err:
+                    consecutive_failures["final_reporter"] = (
+                        consecutive_failures.get("final_reporter", 0) + 1
+                    )
+                    print(
+                        f"[long-exposure] Final reporter crashed: {_rep_err!r} — "
+                        f"continuing to curator with available artifacts.",
+                        flush=True,
+                    )
 
             curator_def = agents.get("curator")
             if should_run_final and curator_def:
-                last_session_id = _run_curator(
-                    curator_def, task, config, results, score_inputs,
-                    conn, cycle, last_session_id,
-                    agent_sessions=agent_sessions,
-                    agent_summaries=agent_summaries,
-                )
+                try:
+                    last_session_id = _run_curator(
+                        curator_def, task, config, results, score_inputs,
+                        conn, cycle, last_session_id,
+                        agent_sessions=agent_sessions,
+                        agent_summaries=agent_summaries,
+                    )
+                except Exception as _cur_err:
+                    consecutive_failures["curator"] = (
+                        consecutive_failures.get("curator", 0) + 1
+                    )
+                    print(
+                        f"[long-exposure] Curator crashed: {_cur_err!r} — "
+                        f"saving state and final-stage failure counters.",
+                        flush=True,
+                    )
 
         # Stop: save current state for resume
         save_state(state_path, cycle, results, consecutive_failures,
@@ -4179,23 +4449,49 @@ def run_exploration(
                    run_id=run_id,
                    last_daily_sync_at=last_daily_sync_at,
                    daily_sync_count=daily_sync_count)
-        update_status_file(output_dir, cycle, "stopped", consecutive_failures)
+        final_status = (
+            "cleared" if _clear_requested
+            else "completed" if (
+                "should_run_final" in locals() and should_run_final
+            )
+            else "stopped"
+        )
+        update_status_file(output_dir, cycle, final_status, consecutive_failures)
         telemetry.emit(
             "run_end",
             phase="run",
             cycle=cycle,
             provider=config.get("llm_provider"),
             model=config.get("model"),
-            status="cleared" if _clear_requested else "stopped",
+            status=final_status,
             data={
                 "topic_exhausted": topic_exhausted,
-                "stop_requested": _stop_requested,
+                "max_cycles_reached": (
+                    max_cycles_reached
+                    if "max_cycles_reached" in locals()
+                    else False
+                ),
+                "stop_requested": (
+                    operator_stop_requested
+                    if "operator_stop_requested" in locals()
+                    else _stop_requested
+                ),
                 "clear_requested": _clear_requested,
+                "final_synthesis_requested": (
+                    should_run_final if "should_run_final" in locals() else False
+                ),
                 "failures": consecutive_failures,
             },
         )
-        print(f"\n[long-exposure] Stopped after {cycle} cycles.", flush=True)
-        print("[long-exposure] State preserved. Run again to resume.", flush=True)
+        if final_status == "completed":
+            print(
+                f"\n[long-exposure] Completed after {cycle} cycles.",
+                flush=True,
+            )
+            print("[long-exposure] Final artifacts written.", flush=True)
+        else:
+            print(f"\n[long-exposure] Stopped after {cycle} cycles.", flush=True)
+            print("[long-exposure] State preserved. Run again to resume.", flush=True)
 
     conn.close()
     print(f"[long-exposure] State: {state_path}", flush=True)

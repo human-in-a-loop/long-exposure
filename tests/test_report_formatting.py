@@ -6,6 +6,7 @@ from long_exposure.report_formatting import (
     REPORT_FONT_SIZE,
     build_pandoc_report_command,
     normalize_report_markdown,
+    sanitize_markdown_for_pdf,
 )
 
 
@@ -49,12 +50,57 @@ class ReportFormattingTests(unittest.TestCase):
 
         joined = " ".join(cmd)
         self.assertIn("--pdf-engine=tectonic", cmd)
+        self.assertIn(
+            "--from markdown+tex_math_single_backslash+tex_math_dollars"
+            "+raw_tex+autolink_bare_uris",
+            joined,
+        )
         self.assertIn(f"fontsize={REPORT_FONT_SIZE}", cmd)
         self.assertIn("mainfont=DejaVu Serif", cmd)
         self.assertIn("monofont=DejaVu Sans Mono", cmd)
         self.assertIn("monofontoptions=Scale=0.82", cmd)
         self.assertIn("--toc-depth=2", joined)
         self.assertNotIn("--number-sections", cmd)
+
+    def test_pdf_sanitizer_rewrites_svg_to_png_when_available(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "figures").mkdir()
+            (root / "figures" / "matrix.svg").write_text("<svg></svg>")
+            (root / "figures" / "matrix.png").write_bytes(b"png")
+            md_path = root / "reports" / "report.md"
+            md_path.parent.mkdir()
+            source = "![Matrix](figures/matrix.svg)\n"
+
+            out = sanitize_markdown_for_pdf(source, md_path=md_path, resource_root=root)
+
+        self.assertIn("![Matrix](figures/matrix.png)", out)
+        self.assertNotIn(".svg)", out)
+
+    def test_pdf_sanitizer_degrades_svg_without_png_to_artifact_link(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "figures").mkdir()
+            (root / "figures" / "matrix.svg").write_text("<svg></svg>")
+            md_path = root / "reports" / "report.md"
+            md_path.parent.mkdir()
+            source = "![Matrix](figures/matrix.svg)\n"
+
+            out = sanitize_markdown_for_pdf(source, md_path=md_path, resource_root=root)
+
+        self.assertIn("Figure artifact", out)
+        self.assertIn("figures/matrix.svg", out)
+        self.assertNotIn("![Matrix]", out)
+
+    def test_pdf_sanitizer_preserves_svg_inside_fenced_code(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            md_path = root / "report.md"
+            source = "```md\n![Matrix](figures/matrix.svg)\n```\n"
+
+            out = sanitize_markdown_for_pdf(source, md_path=md_path, resource_root=root)
+
+        self.assertEqual(source, out)
 
 
 if __name__ == "__main__":

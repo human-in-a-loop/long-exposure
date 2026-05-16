@@ -180,6 +180,7 @@ def build_manager_snapshot(
     workspace: Path,
     state_path: Path,
     data_dir: Path,
+    compact_db_path: str | Path | None = None,
     strict: bool = False,
 ) -> dict[str, Any]:
     state = load_state(state_path) or {}
@@ -204,6 +205,15 @@ def build_manager_snapshot(
             for ev in recent_required
         }
         repeated_manager = len(classes) == 1
+
+    try:
+        from long_exposure import branchial
+        branchial_sig = (
+            branchial.compute_branchial_signal(compact_db_path)
+            if compact_db_path else None
+        )
+    except Exception:
+        branchial_sig = None
 
     return {
         "poll_ts": _utc_iso(),
@@ -231,6 +241,7 @@ def build_manager_snapshot(
         "latest_research_brief_contract": _extract_brief_contract(
             state.get("results") or {}
         ),
+        "branchial": branchial_sig,
         "recent_health_events": health_events[-10:],
         "latest_reports": _latest_reports(workspace),
         "promise_ledger_summary": summarize_ledger(workspace, max_chars=16_000),
@@ -307,6 +318,27 @@ def decide_from_snapshot(snapshot: dict[str, Any]) -> ManagerDecision:
                 "</manager_intervention>"
             ),
             evidence=["promise_ledger.jsonl"],
+        )
+
+    branchial_sig = snapshot.get("branchial") or {}
+    if branchial_sig.get("classification") == "collapsed":
+        return ManagerDecision(
+            verdict=VERDICT_WATCH,
+            event_class="branchial-collapse",
+            pattern=(
+                "Recent cycle catalog has collapsed: "
+                f"H_recent={float(branchial_sig.get('recent_h', 0.0)):.2f} vs "
+                f"H_overall={float(branchial_sig.get('overall_h', 0.0)):.2f} "
+                f"over the last {branchial_sig.get('window_size', '?')} "
+                "compactions."
+            ),
+            rationale=(
+                "Recent compactions are concentrating on a small set of "
+                "(topic, subtopic) tuples. The campaign may be looping. "
+                "Watch-level only; no automatic guidance is written."
+            ),
+            guidance="",
+            evidence=["sessions.db"],
         )
 
     if int(snapshot.get("cycle") or 0) >= 2 and brief.get("present") and not all(
@@ -565,6 +597,7 @@ def run_manager_poll(
             workspace=workspace,
             state_path=state_path,
             data_dir=data_dir,
+            compact_db_path=config.get("compact_db"),
         )
         decision = decide_from_snapshot(snapshot)
         intervention_text = decision.guidance or None

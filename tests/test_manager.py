@@ -9,6 +9,7 @@ from long_exposure.exploration import DEFAULT_SCORE_PATH, load_exploration_score
 from long_exposure.manager import (
     VERDICT_ACT,
     VERDICT_HEALTHY,
+    VERDICT_WATCH,
     build_manager_snapshot,
     decide_from_snapshot,
     run_manager_poll,
@@ -257,6 +258,23 @@ class ManagerTests(unittest.TestCase):
             "latest_research_brief_contract": {"present": False},
         })
         self.assertEqual(decision.verdict, VERDICT_HEALTHY)
+
+    def test_branchial_collapse_is_watch_only(self):
+        decision = decide_from_snapshot({
+            "cycle": 20,
+            "promise_check": {"errors": [], "warnings": [], "notes": []},
+            "ledger": {"stale_milestones": {}, "repeated_recent_manager_action": False},
+            "latest_research_brief_contract": {"present": False},
+            "branchial": {
+                "classification": "collapsed",
+                "recent_h": 0.2,
+                "overall_h": 2.0,
+                "window_size": 20,
+            },
+        })
+        self.assertEqual(decision.verdict, VERDICT_WATCH)
+        self.assertEqual(decision.event_class, "branchial-collapse")
+        self.assertEqual(decision.guidance, "")
 
     def test_manager_process_artifacts_are_hard_excluded_from_package(self):
         self.assertTrue(_is_package_hard_excluded("manager.lock"))

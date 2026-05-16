@@ -5,7 +5,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from long_exposure import telemetry
-from long_exposure.exploration import run_exploration
+import long_exposure.exploration as exploration
+from long_exposure.exploration import (
+    _clear_stop_flag_for_final_synthesis,
+    _should_run_final_synthesis,
+    run_exploration,
+)
 
 
 def write_minimal_files(root: Path):
@@ -99,13 +104,131 @@ class CycleLoopIntegrationTests(unittest.TestCase):
         self.assertIn("research_brief", state["results"])
         self.assertIn("work_output", state["results"])
         self.assertIn("audit_report", state["results"])
-        self.assertIn("Status:** stopped", status)
+        self.assertIn("Status:** completed", status)
         event_types = {event["event_type"] for event in telemetry_events}
         self.assertIn("run_start", event_types)
         self.assertIn("cycle_start", event_types)
         self.assertIn("agent_call_end", event_types)
         self.assertIn("cycle_end", event_types)
         self.assertIn("run_end", event_types)
+
+    def test_final_synthesis_runs_on_stop_or_topic_exhaustion_but_not_clear(self):
+        self.assertTrue(_should_run_final_synthesis(
+            topic_exhausted=False,
+            stop_requested=True,
+            clear_requested=False,
+        ))
+        self.assertTrue(_should_run_final_synthesis(
+            topic_exhausted=True,
+            stop_requested=False,
+            clear_requested=False,
+        ))
+        self.assertTrue(_should_run_final_synthesis(
+            topic_exhausted=False,
+            max_cycles_reached=True,
+            stop_requested=False,
+            clear_requested=False,
+        ))
+        self.assertFalse(_should_run_final_synthesis(
+            topic_exhausted=True,
+            max_cycles_reached=True,
+            stop_requested=True,
+            clear_requested=True,
+        ))
+
+    def test_stop_flag_is_cleared_only_for_final_synthesis(self):
+        original = exploration._stop_requested
+        try:
+            exploration._stop_requested = True
+            changed = _clear_stop_flag_for_final_synthesis(
+                should_run_final=True,
+                stop_requested=True,
+                clear_requested=False,
+            )
+            self.assertTrue(changed)
+            self.assertFalse(exploration._stop_requested)
+
+            exploration._stop_requested = True
+            changed = _clear_stop_flag_for_final_synthesis(
+                should_run_final=True,
+                stop_requested=True,
+                clear_requested=True,
+            )
+            self.assertFalse(changed)
+            self.assertTrue(exploration._stop_requested)
+        finally:
+            exploration._stop_requested = original
+
+    def test_final_stage_exceptions_are_isolated_and_recorded(self):
+        calls = []
+
+        def fake_agent(agent_name, agent_def, **kwargs):
+            calls.append(agent_name)
+            output_name = agent_def["outputs"][0]
+            return {
+                "agent": agent_name,
+                "outputs": {output_name: f"{agent_name} output " + ("x" * 2100)},
+                "usage": {"output_tokens": 2100},
+                "duration_ms": 1,
+                "status": "ok",
+                "error": None,
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            score, config, inst = write_minimal_files(root)
+            score_text = score.read_text()
+            score.write_text(
+                score_text.replace(
+                    "flow: [researcher, worker, auditor]\n",
+                    "  final_auditor:\n"
+                    "    inputs: [directive]\n"
+                    "    outputs: [final_audit_report]\n"
+                    "    role: final auditor\n"
+                    "  final_reporter:\n"
+                    "    inputs: [directive]\n"
+                    "    outputs: [final_report]\n"
+                    "    role: final reporter\n"
+                    "  curator:\n"
+                    "    inputs: [directive]\n"
+                    "    outputs: [curation]\n"
+                    "    role: curator\n"
+                    "flow: [researcher, worker, auditor]\n",
+                )
+            )
+
+            with (
+                patch("long_exposure.exploration._call_exploration_agent", fake_agent),
+                patch(
+                    "long_exposure.auditing._run_final_auditor",
+                    side_effect=RuntimeError("audit boom"),
+                ),
+                patch(
+                    "long_exposure.exploration._run_final_reporter",
+                    side_effect=RuntimeError("report boom"),
+                ),
+                patch(
+                    "long_exposure.exploration._run_curator",
+                    return_value="curator-session",
+                ) as curator,
+            ):
+                run_exploration(
+                    score_path=str(score),
+                    config_path=str(config),
+                    output_dir=inst / "output",
+                    state_path=inst / "exploration_state.json",
+                    task_override=None,
+                    instance_dir=inst,
+                )
+
+            state = json.loads((inst / "exploration_state.json").read_text())
+            status = (inst / "output" / "exploration_status.md").read_text()
+
+        self.assertEqual(calls, ["researcher", "worker", "auditor"])
+        curator.assert_called_once()
+        self.assertEqual(state["failures"]["final_auditor"], 1)
+        self.assertEqual(state["failures"]["final_reporter"], 1)
+        self.assertIn("Status:** completed", status)
 
 
 if __name__ == "__main__":

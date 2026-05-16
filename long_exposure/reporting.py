@@ -102,7 +102,7 @@ def _final_report_expected_file(
 
     Stage 1 (Outline)  → reports/final/outline.md
     Body stages        → reports/final/draft.md
-    Final stage        → final_report.md at workspace root
+    Final stage        → reports/final/final_report.md
     """
     if stage == 1:
         return paths.final_report_outline_path(working_dir)
@@ -357,8 +357,15 @@ def render_pdf(working_dir: str, stem: str = "final_report") -> bool:
     so the two synthesis artifacts render identically.
     """
     wd = Path(working_dir)
-    md_path = wd / f"{stem}.md"
-    pdf_path = wd / f"{stem}.pdf"
+    if stem == "final_report":
+        md_path = paths.final_report_path(wd)
+        pdf_path = paths.final_report_pdf_path(wd)
+    elif stem == "final_audit_report":
+        md_path = paths.final_audit_report_path(wd)
+        pdf_path = paths.final_audit_pdf_path(wd)
+    else:
+        md_path = wd / f"{stem}.md"
+        pdf_path = wd / f"{stem}.pdf"
     if not md_path.exists():
         print(
             f"[long-exposure]   Cannot render PDF — {md_path.name} missing.",
@@ -443,8 +450,8 @@ def _run_final_reporter(
     in its [OUTPUT] block but failed to write the file, the orchestrator
     writes it deterministically as a rescue fallback, then re-prompts
     the agent to continue from the rescued state. This guarantees that
-    final_report.md and final_report.pdf are always produced when the
-    agent generates valid content.
+    reports/final/final_report.md and reports/final/final_report.pdf are
+    always produced when the agent generates valid content.
     """
     working_dir = str(paths.workspace_root(config.get("working_directory") or "/tmp"))
     config["working_directory"] = working_dir
@@ -487,6 +494,17 @@ def _run_final_reporter(
     # surfaces "(parse failed)" and the reporter narrates conservatively.
     _audit_summary_path = paths.final_audit_summary_path(config)
     _audit_summary_text, _audit_headline = _load_audit_summary(_audit_summary_path)
+    try:
+        if config.get("ledger_graph", {}).get("enabled", True):
+            from long_exposure.tools import ledger_graph as _ledger_graph
+            results["ledger_causal_summary"] = _ledger_graph.render_summary(
+                _ledger_graph.build(Path(working_dir))
+            )
+        else:
+            results["ledger_causal_summary"] = ""
+    except Exception as _ledger_err:
+        print(f"[final-reporter] ledger_causal_summary skipped: {_ledger_err!r}", flush=True)
+        results["ledger_causal_summary"] = ""
 
     # Wall-cap (Plan 2 §7.7) — shared with the final auditor. Document/finalize
     # stage always runs even when the cap is hit.

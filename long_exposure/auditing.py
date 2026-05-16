@@ -6,8 +6,9 @@ plan-of-record + promise ledger + periodic reports + closure documents,
 verifies the run's claims against its evidence, emits reconciliation events
 (if any), and writes:
 
-  * final_audit_report.md   — human-readable narrative
-  * final_audit_summary.json — machine-readable structured input for the reporter
+  * audits/final/final_audit_report.md   — human-readable narrative
+  * audits/final/final_audit_summary.json — machine-readable structured input
+    for the reporter
 
 See docs/end-of-run-pipeline.md for the design. Key invariants this module
 preserves:
@@ -463,6 +464,16 @@ def _commit_lessons(
 
     committed: list[dict] = []
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    def _metadata_text(value) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple, set)):
+            return ", ".join(str(v) for v in value)
+        if isinstance(value, dict):
+            return json.dumps(value, sort_keys=True)
+        return str(value)
+
     for lesson in chosen:
         slug = lesson["slug"]
         content = lesson["content"]
@@ -473,7 +484,7 @@ def _commit_lessons(
                 flush=True,
             )
             continue
-        keywords = lesson.get("keywords", "lesson")
+        keywords = _metadata_text(lesson.get("keywords", "lesson"))
         sid = str(uuid.uuid4())
         if store_session is not None and conn is not None:
             try:
@@ -486,8 +497,8 @@ def _commit_lessons(
                     summary_xml=content,
                     record_type="lesson",
                     topic=topic,
-                    subtopic=lesson.get("subtopic"),
-                    tools=lesson.get("tools"),
+                    subtopic=_metadata_text(lesson.get("subtopic")),
+                    tools=_metadata_text(lesson.get("tools")),
                     keywords=keywords,
                 )
                 existing_slugs.add(topic)
@@ -692,6 +703,17 @@ def _run_final_auditor(
             f"budget ~{budget_tokens:,} tokens; reports={paths.cycle_reports_glob(config)}",
             flush=True,
         )
+    try:
+        if config.get("ledger_graph", {}).get("enabled", True):
+            from long_exposure.tools import ledger_graph as _ledger_graph
+            results["ledger_causal_summary"] = _ledger_graph.render_summary(
+                _ledger_graph.build(workspace)
+            )
+        else:
+            results["ledger_causal_summary"] = ""
+    except Exception as _ledger_err:
+        print(f"[final-auditor] ledger_causal_summary skipped: {_ledger_err!r}", flush=True)
+        results["ledger_causal_summary"] = ""
 
     audit_sessions: dict = {}
     audit_summaries: dict = {}

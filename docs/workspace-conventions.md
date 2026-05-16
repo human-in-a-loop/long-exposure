@@ -359,10 +359,10 @@ Walks the workspace and surfaces:
 - Stale-looking files outside `stale/`.
 
 Allowlist for root: `MANIFEST.md`, `STRUCTURE.md`, `plan_of_record.md`,
-`promise_ledger.jsonl`, `final_report.{md,pdf}`,
-`final_audit_report.{md,pdf}`, `final_audit_summary.json`, and
-the final-output commit markers. Legacy root-stage artifacts are
-reported as notes during the layout transition.
+and `promise_ledger.jsonl`. Final report artifacts live under
+`reports/final/`; final audit artifacts live under `audits/final/`.
+Legacy root-stage artifacts are reported as notes during the layout
+transition.
 
 The validator scopes orphan detection to managed paths only:
 standard folders + domain folders declared in STRUCTURE.md +
@@ -399,19 +399,19 @@ Each agent's role text in `exploration-score.yaml` carries a
 | Worker | Scripts → `scripts/`; data → `data/`; tests → `tests/`; figures co-located with source data, NOT a separate `figures/` folder. List artifacts in ledger. |
 | Auditor | Test artifacts → `tests/`; run `promise_check` and `org_check`; cite milestone IDs. |
 | Reporter | Periodic reports → `reports/cycles/`. CRITICAL: write content to disk, not just `[OUTPUT]` block. |
-| Final reporter | `final_report.md` at workspace root (curator contract); intermediate drafts under `reports/final/`. |
-| Final auditor | `final_audit_report.md` and `final_audit_summary.json` at root; scratch and sidecars under `audits/final/`. |
+| Final reporter | Final report artifacts under `reports/final/`, including `final_report.{md,pdf}` and commit marker. |
+| Final auditor | Final audit artifacts under `audits/final/`, including `final_audit_report.{md,pdf}`, summary JSON, and commit marker. |
 | Curator | Reads MANIFEST.md "## Key Files"; writes CURATION.yaml; outputs ZIP package. |
 
 ---
 
 ## Periodic reports → `reports/cycles/` folder
 
-Per Stage 3 §0.5, the periodic reporter writes
-`report_cycles_<N>-<M>.{md,pdf}` to `<workspace>/reports/cycles/`.
-Final reports stay at workspace root because the curator contract
-expects them there. `org_check` notes legacy root-stage artifacts but
-new runs route scratch under `reports/final/` and `audits/final/`.
+The periodic reporter writes `report_cycles_<N>-<M>.{md,pdf}` to
+`<workspace>/reports/cycles/`.
+Final report artifacts live under `reports/final/`; final audit artifacts
+live under `audits/final/`. `org_check` notes legacy root-stage artifacts
+without failing so old workspaces remain inspectable.
 
 Fan-out clones append a clone suffix to periodic report basenames:
 `report_cycles_<N>-<M>_clone_<K>.{md,pdf}`. This prevents sibling
@@ -452,7 +452,7 @@ the reporter agent to produce its own bookkeeping event.
 
 ---
 
-## Code citations
+## Code references
 
 - `workspace_bootstrap.is_fresh_start`,
   `workspace_bootstrap.ensure_skeleton`,

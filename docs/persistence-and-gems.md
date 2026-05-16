@@ -2,21 +2,23 @@
 
 How long-exposure preserves context across cycles, compactions, stops,
 and resumes. This doc covers the `sessions.db` schema, the auto-compact
-mechanism, the depth-aware XML summaries, gem ranking, fork-scoped gems
-(Stage 4), and the MCP search server agents use to query the past.
+mechanism, the depth-aware XML summaries, gem ranking, ancestor-aware
+proximity, shared infrastructure lemmas, fork-scoped gems, and the MCP search
+server agents use to query the past.
 
 **Sources of truth:** `auto_compact/db.py`, `auto_compact/compact.py`,
 `auto_compact/proximity.py`, `long_exposure/orchestrator.py` (compaction
 integration), `long_exposure/exploration.py` (cycle write path),
-`long_exposure/mcp_search_server.py`.
+`long_exposure/mcp_search_server.py`, `long_exposure/lemmas.py`.
 
 ---
 
 ## sessions.db — single source of truth
 
-Every agent output, every compaction summary, and every cross-run
-lesson lands here. The DB is shared across cycles, across instances
-(when run with `--instance-dir` separation), and across fan-out clones.
+Every agent output, every compaction summary, every cross-run lesson, and every
+accepted infrastructure lemma lands here. The DB is shared across cycles,
+across instances (when run with `--instance-dir` separation), and across
+fan-out clones.
 
 **Path:** `long_exposure/data/sessions.db` by default
 (`config.compact_db`). Configurable.
@@ -59,6 +61,7 @@ Plus catalog indexes on `(topic)` and `(topic, subtopic)`.
 | `compaction` | auto-compact fires (90% context threshold) | Bootstrap on next session resume; gem ranking |
 | `checkpoint` | mid-context snapshot without context reset | Observability; not load-bearing |
 | `lesson` | final auditor's document stage emits a cross-run finding | Cross-run wisdom; +0.3 gem boost; immune from recency decay for ~30 days |
+| `lemma` | agent output includes an accepted `<lemma_proposal>` block | Shared infrastructure facts; excluded from gem ranking |
 
 ### Concurrency model
 
@@ -184,9 +187,16 @@ score = 0
 + topic_weights[session.topic]      (named topic boost / penalty)
 + tool_weights["_shared_tools"] × |session_tools ∩ current_tools|
 + keyword_weights[kw]               for each kw in session.keywords found
++ topic_weights["_ancestor"]        if session is in the current parent chain
 + 0.3                               if record_type == "lesson"
 * recency_decay
 ```
+
+The `_ancestor` weight defaults to `0.0` in all built-in profiles, making
+ancestor proximity opt-in. When enabled, `rank_sessions` walks `parent_id`
+pointers backward from the current session and boosts those direct ancestors
+before recency decay. This helps long compaction chains recover causal context
+without increasing global gem count.
 
 ### Recency decay
 
@@ -205,7 +215,7 @@ The relevance profile defaults are baked into the orchestrator's
 config defaults. Score-level overrides are possible via
 `config.proximity_profile`.
 
-### Fork-scoped gems (Stage 4)
+### Fork-scoped gems
 
 `rank_sessions(fork_scope=...)` filters by `fork_id`:
 
@@ -216,7 +226,7 @@ config defaults. Score-level overrides are possible via
   `current_fork_id`. The right default for clones: they see root
   context + their own history, but never sibling clones' work.
 
-`_compute_gems` in `orchestrator.py:2629–2645` reads
+`_compute_gems` in `orchestrator.py` reads
 `AGENT_FORK_ID` from the env to choose:
 
 ```python
@@ -232,6 +242,33 @@ else:
 Fork-scoped gems is the only sessions.db change required to make
 gems clean across fan-out clones. No schema migration; the `fork_id`
 column was added preemptively when the fan-out feature shipped.
+
+### Shared infrastructure lemmas
+
+Agents can record reusable infrastructure facts by emitting:
+
+```xml
+<lemma_proposal category="tool_invocation" label="gap-batch-mode">
+  <claim>Use gap -q for non-interactive batch mode.</claim>
+  <evidence>scripts/check_group.g</evidence>
+  <confidence>high</confidence>
+</lemma_proposal>
+```
+
+Accepted categories are intentionally narrow:
+
+| Category | Use |
+|---|---|
+| `tool_invocation` | How to call a local tool reliably. |
+| `env_quirk` | Environment behavior worth remembering. |
+| `data_format` | Durable facts about local file formats. |
+| `failed_attempt` | Infrastructure attempts that should not be repeated blindly. |
+
+The parser caps each agent output at 10 lemma blocks, drops invalid categories
+or missing labels/claims, XML-escapes stored content, and writes accepted
+lemmas as `record_type="lemma"` with `topic="lemma_<category>"`. Lemmas are
+excluded from proximity ranking so they do not crowd out research context.
+They remain searchable through MCP/FTS like other records.
 
 ---
 
@@ -279,7 +316,7 @@ decides.
 | Auto-compact | summary added | new UUID | recomputed |
 | `stop` / `resume` | preserved | preserved (in `exploration_state.json`) | recomputed |
 | `clear` | preserved (DB is *not* cleared) | reset | recomputed |
-| Account rotation (rate-limit OR planned 24h, Plan B) | preserved (single shared DB) | reset (per-account UUIDs cleared by both rotation paths) | recomputed |
+| Account rotation (rate-limit OR planned 24h) | preserved (single shared DB) | reset (per-account UUIDs cleared by both rotation paths) | recomputed |
 | Fan-out clone spawn | preserved | inherited from parent at spawn (then preserved until clone's own compaction or rate-limit; clones never migrate accounts) | scoped via `same_fork` |
 | `--from-archive` resume | preserved | restored from archive | recomputed |
 
@@ -304,23 +341,30 @@ memory of every campaign on this machine. To start truly fresh, move
    boundaries when they explicitly query.
 7. Schema migrations are silent `ALTER TABLE` calls; do not require a
    version row at current scale.
+8. Lemmas are a narrow infrastructure channel, not a research-result channel.
+   Research findings should remain in normal outputs, reports, and ledger
+   events.
 
 ---
 
-## Code citations
+## Code references
 
-- Schema + WAL setup: `auto_compact/db.py:10–69`.
-- `store_session`: `auto_compact/db.py:129–170`.
-- FTS5 triggers: `db.py:102–125`.
-- `compact_with_conditioning`: `orchestrator.py:2731–2790` (empty
+- Schema + WAL setup: `auto_compact/db.py`.
+- `store_session`: `auto_compact/db.py`.
+- FTS5 triggers: `auto_compact/db.py`.
+- `compact_with_conditioning`: `orchestrator.py` (empty
   guard, retry loop, store).
 - Strip + parse helpers: `orchestrator.py:_strip_xml_fences`,
   `_is_well_formed_xml`.
-- `_compute_gems` + fork-scope wire-up: `orchestrator.py:2620–2646`.
-- `rank_sessions` + fork-scope filter: `auto_compact/proximity.py:142–208`.
-- `score_session` (the recency-decay formula): `proximity.py:30–105`.
+- `_compute_gems` + fork-scope / ancestor wire-up:
+  `orchestrator.py` (`_compute_gems`).
+- `rank_sessions` + fork-scope / ancestor filter:
+  `auto_compact/proximity.py`.
+- Lemma parser/store path: `long_exposure/lemmas.py` and
+  `exploration.py` (`_store_agent_output`).
+- `score_session` (the recency-decay formula): `proximity.py`.
 - MCP server: `long_exposure/mcp_search_server.py`.
-- Cycle write path (per-agent output stored): `exploration.py:1005–1034`
-  (`_store_agent_output`).
-- Compaction within cycle: `exploration.py:834–938`
-  (`_compact_agent_session`).
+- Cycle write path (per-agent output stored):
+  `exploration.py` (`_store_agent_output`).
+- Compaction within cycle:
+  `exploration.py` (`_compact_agent_session`).

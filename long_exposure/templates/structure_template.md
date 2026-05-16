@@ -32,8 +32,8 @@ lives in named subfolders (e.g., `benchmark-XX-...`).
 - Plots co-located with their source data, NOT in a separate `figures/`.
 - Stale artifacts MOVED to nearest `stale/` (root or domain-internal); never deleted.
 - Periodic reporter writes ONLY to `reports/cycles/` (not to root, not to `docs/`).
-- Final reporter scratch lives in `reports/final/`; canonical `final_report.*` stays at root.
-- Final auditor scratch lives in `audits/final/`; canonical `final_audit_*` stays at root.
+- Final reporter artifacts live in `reports/final/`, including `final_report.*`.
+- Final auditor artifacts live in `audits/final/`, including `final_audit_*`.
 - Worker default: scripts to `scripts/`, data outputs to `data/`, plots beside data.
 - Auditor default: verification scripts to `tests/`.
 - Cross-cutting tools (validators, helpers) to `tools/`.

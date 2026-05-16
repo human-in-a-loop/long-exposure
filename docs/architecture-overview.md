@@ -45,12 +45,13 @@ report and traceable record out.**
                 │        within turn; rate-limit detect)   │
                 │                  │                       │
         ┌───────┴────────┐         ▼                       ▼
-        │ pool.py        │  auto_compact (db.py,    fanout.py
-        │ (slot acquire/ │  compact.py, proximity)  (parallel-cycle
-        │  release;      │   sessions.db (WAL,      fork; barrier;
-        │  freshness     │   FTS5, gems ranking,    merge synthesis;
-        │  promotion;    │   depth-aware XML        depth-1 gate)
-        │  per-acct      │   summaries)
+        │ pool.py +      │  auto_compact (db.py,    fanout.py
+        │ unified_pool.py│  compact.py, proximity)  (parallel-cycle
+        │ (slot acquire/ │  sessions.db WAL/FTS5,   fork; barrier;
+        │  release;      │  gems ranking, lemmas,   merge synthesis;
+        │  freshness     │  depth-aware XML         branchial diff)
+        │  promotion;    │  summaries)
+        │  per-acct      │
         │  cooldown)     │
         └────────────────┘
                                    │
@@ -133,7 +134,10 @@ crashes or wedges, the main cycle continues unaffected.
 Every manager poll also appends a compact structured notice to
 `data/manager_notifications.jsonl`. Launchers and `long-exposure status`
 read that file to surface manager awareness without coupling the cron sidecar
-to a specific Claude/Codex/Gemini interface.
+to a specific Claude/Codex/Gemini interface. The manager snapshot also includes
+a watch-only branchial entropy signal over recent `sessions.db` catalog tuples;
+when recent work collapses onto the same `(topic, subtopic)` region it records
+`event_class="branchial-collapse"` but does not write guidance by itself.
 
 Typical cron form:
 
@@ -178,8 +182,9 @@ compaction.
 
 The agent role block (`<agent-role>...</agent-role>`) and any
 runtime-injected blocks (gems, agent-teams guidance, parallel-cycle
-guidance, live operator guidance) are appended after layer 3 before
-layer 4. See `configuration-reference.md` for the full assembly order.
+guidance, ledger-derived anti-patterns, live operator guidance) are
+appended after layer 3 before layer 4. See `configuration-reference.md`
+for the full assembly order.
 
 ---
 
@@ -199,7 +204,8 @@ Two key invariants:
 - `sessions.db` is the **single source of truth**. Every agent output
   lands there as `record_type="exploration"`; every compaction summary
   as `record_type="compaction"`; every cross-run lesson as
-  `record_type="lesson"`. Workspace files are produced from agent
+  `record_type="lesson"`; accepted shared infrastructure lemmas as
+  `record_type="lemma"`. Workspace files are produced from agent
   output but the canonical record is the DB.
 - `exploration_state.json` is **ephemeral**. It holds the current
   cycle, last results dict, agent session UUIDs, and daily-sync
@@ -217,14 +223,14 @@ Two key invariants:
 | Cycle loop, signal handling, lifecycle | `long_exposure/exploration.py` | this doc + `usage-guide.md` |
 | Provider CLI subprocess, env handling, rate-limit detection | `long_exposure/orchestrator.py` | `multi-account-pool.md` |
 | Score loading, agent prompt assembly | `long_exposure/conductor.py`, `orchestrator.py` | `configuration-reference.md` |
-| Multi-account pool, slot lifecycle, freshness promotion | `long_exposure/pool.py` | `multi-account-pool.md` |
-| Parallel-cycle fan-out, barrier, merge synthesis, graceful preemption | `long_exposure/fanout.py` | `parallelism.md` |
-| Auto-compact, sessions.db schema, FTS5 search, depth-aware XML summaries | `auto_compact/{db,compact,proximity}.py` | `persistence-and-gems.md` |
+| Multi-account pool, unified provider pool, slot lifecycle, freshness promotion | `long_exposure/pool.py`, `unified_pool.py` | `multi-account-pool.md` |
+| Parallel-cycle fan-out, branchial budget/diff, barrier, merge synthesis, graceful preemption | `long_exposure/fanout.py`, `branchial_budget.py` | `parallelism.md` |
+| Auto-compact, sessions.db schema, FTS5 search, depth-aware XML summaries, lemmas | `auto_compact/{db,compact,proximity}.py`, `long_exposure/lemmas.py` | `persistence-and-gems.md` |
 | Workspace artifact routing | `long_exposure/paths.py` | `workspace-conventions.md` |
-| Reporter, final reporter, file-gate rescue, PDF render | `long_exposure/reporting.py`, `report_formatting.py` | `end-of-run-pipeline.md` |
-| Final auditor, reconciliation events | `long_exposure/auditing.py` | `end-of-run-pipeline.md` |
+| Reporter, final reporter, file-gate rescue, PDF render, ledger causal summary | `long_exposure/reporting.py`, `report_formatting.py`, `tools/ledger_graph.py` | `end-of-run-pipeline.md` |
+| Final auditor, reconciliation events, lessons | `long_exposure/auditing.py` | `end-of-run-pipeline.md` |
 | Curator, ZIP package | `long_exposure/curator.py` | `end-of-run-pipeline.md` |
-| Cron-polled manager sidecar | `long_exposure/manager.py` | this doc + `usage-guide.md` |
+| Cron-polled manager sidecar, branchial entropy watch signal | `long_exposure/manager.py`, `branchial.py` | this doc + `usage-guide.md` |
 | Opt-in passive telemetry | `long_exposure/telemetry.py` | `telemetry.md` |
 | Workspace bootstrap, plan-of-record, ledger | `long_exposure/workspace_bootstrap.py`, `tools/` | `workspace-conventions.md` |
 | MCP search server (exposes session search to agents) | `long_exposure/mcp_search_server.py` | `persistence-and-gems.md` |

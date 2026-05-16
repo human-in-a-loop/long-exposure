@@ -25,7 +25,7 @@ import yaml
 
 
 REQUIRED_BINARIES = ("pandoc", "tectonic")
-OPTIONAL_BINARIES = ("dot", "d2")
+OPTIONAL_BINARIES = ("rsvg-convert", "dot", "d2")
 PYTHON_IMPORTS = ("yaml", "prompt_toolkit", "matplotlib")
 OPTIONAL_PYTHON_IMPORTS = ("diagrams",)
 PROVIDER_BINARIES = {
@@ -289,6 +289,16 @@ def _sudo_prefix() -> list[str]:
     return ["sudo"]
 
 
+def _manual_install_note() -> str:
+    return (
+        "Install manually: pandoc from https://pandoc.org/installing.html, "
+        "tectonic from https://tectonic-typesetting.github.io/. "
+        "Optional SVG conversion: install rsvg-convert "
+        "(Debian/Ubuntu: librsvg2-bin; "
+        "Fedora/RHEL: librsvg2-tools; Arch/macOS Homebrew: librsvg)."
+    )
+
+
 def _pkg_manager_install_cmds(missing: list[str]) -> tuple[list[list[str]], str | None]:
     """Return install commands for the current platform, plus a note if any."""
     if not missing:
@@ -298,26 +308,72 @@ def _pkg_manager_install_cmds(missing: list[str]) -> tuple[list[list[str]], str 
     sudo = _sudo_prefix()
 
     if system == "darwin" and _which("brew"):
-        return [["brew", "install", name] for name in missing], None
+        brew_package = {
+            "rsvg-convert": "librsvg",
+        }
+        return [
+            ["brew", "install", brew_package.get(name, name)]
+            for name in missing
+        ], None
 
     if system == "linux":
+        apt_package = {
+            "rsvg-convert": "librsvg2-bin",
+        }
+        rpm_package = {
+            "rsvg-convert": "librsvg2-tools",
+        }
+        pacman_package = {
+            "rsvg-convert": "librsvg",
+        }
+        zypper_package = {
+            "rsvg-convert": "rsvg-convert",
+        }
         if _which("apt-get"):
             return [
                 [*sudo, "apt-get", "update"],
-                *[[*sudo, "apt-get", "install", "-y", name] for name in missing],
+                *[
+                    [
+                        *sudo,
+                        "apt-get",
+                        "install",
+                        "-y",
+                        apt_package.get(name, name),
+                    ]
+                    for name in missing
+                ],
             ], None
         if _which("dnf"):
-            return [[*sudo, "dnf", "install", "-y", name] for name in missing], None
+            return [
+                [*sudo, "dnf", "install", "-y", rpm_package.get(name, name)]
+                for name in missing
+            ], None
         if _which("yum"):
-            return [[*sudo, "yum", "install", "-y", name] for name in missing], None
+            return [
+                [*sudo, "yum", "install", "-y", rpm_package.get(name, name)]
+                for name in missing
+            ], None
         if _which("pacman"):
             return [
-                [*sudo, "pacman", "-S", "--needed", "--noconfirm", name]
+                [
+                    *sudo,
+                    "pacman",
+                    "-S",
+                    "--needed",
+                    "--noconfirm",
+                    pacman_package.get(name, name),
+                ]
                 for name in missing
             ], None
         if _which("zypper"):
             return [
-                [*sudo, "zypper", "--non-interactive", "install", name]
+                [
+                    *sudo,
+                    "zypper",
+                    "--non-interactive",
+                    "install",
+                    zypper_package.get(name, name),
+                ]
                 for name in missing
             ], None
 
@@ -326,17 +382,15 @@ def _pkg_manager_install_cmds(missing: list[str]) -> tuple[list[list[str]], str 
             "pandoc": "JohnMacFarlane.Pandoc",
             "tectonic": "Tectonic.Tectonic",
         }
+        unsupported = [name for name in missing if name not in package_ids]
+        if unsupported:
+            return [], _manual_install_note()
         return [
             ["winget", "install", "--id", package_ids[name], "-e"]
             for name in missing
-            if name in package_ids
         ], None
 
-    return [], (
-        "No supported package manager was detected. Install manually: "
-        "pandoc from https://pandoc.org/installing.html and tectonic from "
-        "https://tectonic-typesetting.github.io/."
-    )
+    return [], "No supported package manager was detected. " + _manual_install_note()
 
 
 def _confirm(prompt: str, *, yes: bool) -> bool:

@@ -1,14 +1,16 @@
 # Multi-Account Pool
 
-Long-exposure can run a single research campaign across multiple Claude
-Code config directories ("accounts") so a rate-limit on one account
-rotates work to another without interrupting the cycle. This doc covers
-the pool's state machine, slot lifecycle, rate-limit detection, and
-operational rules.
+Long-exposure can run a single research campaign across multiple provider
+config directories ("accounts") so a rate-limit on one account rotates work
+to another without interrupting the cycle. Claude and Codex use the same
+per-provider pool state machine; an optional unified selector can route a root
+run and fan-out clones across both configured pools. This doc covers the pool
+state machine, slot lifecycle, rate-limit detection, unified provider mode,
+and operational rules.
 
-**Sources of truth:** `long_exposure/pool.py`, `long_exposure/orchestrator.py`,
-`long_exposure/exploration.py` (cycle-level rotation), `long_exposure/fanout.py`
-(per-clone slot acquisition).
+**Sources of truth:** `long_exposure/pool.py`, `long_exposure/unified_pool.py`,
+`long_exposure/orchestrator.py`, `long_exposure/exploration.py`
+(cycle-level rotation), `long_exposure/fanout.py` (per-clone slot acquisition).
 
 ---
 
@@ -35,7 +37,7 @@ that fails, the credentials are bad — re-run the login.
 
 ---
 
-## Configuring the pool
+## Configuring a Claude pool
 
 The pool reads two environment variables:
 
@@ -72,11 +74,24 @@ Setting `CLAUDE_FORCE_ACCOUNT` does **not** disable pool semantics.
 `pool.is_active()` returns True whenever ≥2 accounts are configured;
 the force-pin only restricts which account each call uses, not whether
 the pool state machine runs. (This is deliberate — see the docstring
-at `pool.py:93–101` for why short-circuiting on the force pin caused
+in `pool.py` for why short-circuiting on the force pin caused
 the recent silent no-rotation failure.)
 
 To debug-pin without engaging pool semantics, leave
 `CLAUDE_ACCOUNT_POOL` unset and only set `CLAUDE_FORCE_ACCOUNT`.
+
+Codex uses the same semantics with Codex-specific names:
+
+| Purpose | Claude | Codex |
+|---|---|---|
+| Pool env | `CLAUDE_ACCOUNT_POOL` / `CLAUDE_ACCOUNTS` | `CODEX_ACCOUNT_POOL` / `CODEX_HOMES` |
+| Force pin | `CLAUDE_FORCE_ACCOUNT` | `CODEX_FORCE_ACCOUNT` |
+| Child config/auth dir | `CLAUDE_CONFIG_DIR` | `CODEX_HOME` |
+| Pool state file | `~/.claude-pool-state.json` | `~/.codex-pool-state.json` |
+
+Each `CODEX_HOME` directory must be authenticated for the Codex CLI and
+verified with `codex exec` in a trusted workspace before adding it to
+`CODEX_ACCOUNT_POOL`.
 
 ---
 
@@ -105,7 +120,7 @@ Transitions:
 ```
 
 `PER_ACCOUNT_SLOT_CAP = 3` (empirical ceiling on simultaneous in-flight
-`claude -p` calls per account). `available_slots()` sums free capacity
+provider CLI calls per account). `available_slots()` sums free capacity
 across primary + overflow + cold accounts; cooling accounts contribute
 zero. `fanout_cap()` returns `available_slots() - 1` (reserve 1 for
 sequential root calls).
@@ -237,8 +252,8 @@ otherwise spins forever against a stale `active_index`.
 | `~/.claude-accounts-state.json` | `{active_index: int}` | `orchestrator._save_account_state` | `orchestrator._parse_accounts`, `pool.init_pool` (first-run seed) |
 
 The pool-state schema grew with two additions:
-**top-level `last_rotation_at`** (Plan B) and **per-account
-`tokens_*` + `tokens_since`** (Plan A). Both are migrated lazily —
+**top-level `last_rotation_at`** and **per-account
+`tokens_*` + `tokens_since`**. Both are migrated lazily —
 `record_usage` and `record_rotation` use defensive `.get(field, 0)`
 on read, so old-schema state files continue to work and upgrade in
 place on the first call that touches an account.
@@ -259,7 +274,69 @@ restart, archive the files manually.
 
 ---
 
-## Per-account usage tracking (Plan A)
+## Unified Claude+Codex pool
+
+If both Claude and Codex pools are configured, unified mode is active by
+default:
+
+```bash
+export CLAUDE_ACCOUNT_POOL="$HOME/.claude-a,$HOME/.claude-b"
+export CODEX_ACCOUNT_POOL="$HOME/.codex-a,$HOME/.codex-b"
+```
+
+`long_exposure/unified_pool.py` does not replace `pool.py`. It is a thin
+selector over the existing per-provider pools:
+
+- initializes every configured provider pool,
+- picks a provider with free capacity,
+- acquires a normal provider-local slot,
+- pins the process via `LONG_EXPOSURE_LLM_PROVIDER` plus the provider's
+  force-account env,
+- routes release, PID updates, heartbeat sweeps, thawing, and usage writes
+  back to the provider that owns the slot.
+
+Set `LONG_EXPOSURE_UNIFIED_POOL=disabled` to force normal single-provider
+behavior even when both pools exist. Clone processes are launched with unified
+mode disabled so they cannot recursively select providers after the parent has
+assigned a slot.
+
+### Unified root rotation
+
+Rate-limit rotation in unified mode is provider-agnostic. The root process:
+
+1. Marks the current unified root holder's account cooling in its provider's
+   pool.
+2. Releases the old root slot.
+3. Acquires a fresh root slot from the other provider first, falling back to
+   the current provider if needed.
+4. Pins `LONG_EXPOSURE_LLM_PROVIDER` and the matching force-account env to the
+   new holder.
+5. Clears native provider session IDs before retrying the cycle or
+   out-of-cycle agent.
+
+This prevents passing a Claude session UUID to Codex or vice versa. The
+tradeoff is that unified rotation does not preserve provider-native session
+continuity; durable continuity remains in `sessions.db`, workspace files, and
+agent summaries.
+
+### Unified fan-out capacity
+
+`unified_pool.fanout_cap()` sums free slots across configured Claude and Codex
+pools, then applies the same root-slot reserve as normal fan-out. Clones are
+pinned to the provider/account selected by the parent and release through the
+origin provider. Gemini is intentionally excluded from unified pooling until
+multi-account Gemini OAuth homes are validated.
+
+### Known limitation
+
+Planned daily rotation remains provider-local. Rate-limit rotation is
+provider-agnostic; pre-emptive daily rotation may rotate within the active
+provider. This is documented in `docs/gaps.md` because it is an efficiency
+limitation, not a correctness bug.
+
+---
+
+## Per-account usage tracking
 
 Cumulative four-field token counters per account, hooked at the
 single API chokepoint (`orchestrator._invoke_claude` after envelope
@@ -316,13 +393,13 @@ Per account in pool state:
 
 ---
 
-## Planned 24h rotation (Plan B)
+## Planned 24h rotation
 
 Pre-emptively rotates the primary after each daily sync IF no
 rotation has happened in the previous 24 hours. Spreads usage across
 the pool when a primary doesn't naturally rate-limit within the
-window. Important for $200 / mo Max plans where a primary may not
-hit its cap day-over-day.
+window. Important for paid-plan accounts where a primary may not
+naturally hit its cap day-over-day.
 
 ### How it works
 
@@ -347,15 +424,14 @@ state save). Gates:
 When the gates pass, the block calls `pool.promote_fresh()`. On a
 non-None return it does THREE things — all load-bearing:
 
-1. **`os.environ["CLAUDE_FORCE_ACCOUNT"] = new_primary`** — without
-   this, the parent's `_active_account_dir()` reads the old pinned
-   value and continues sending API calls to the old primary, leaving
-   the rotation observable in pool state but invisible to the running
-   agents. (This was the M1 bug found in the recent review pass.)
-2. **`agent_sessions.clear()`** — Claude session UUIDs are
-   per-account; resuming an old account's UUID on the new account
-   fails with "session not found." Clearing forces fresh sessions on
-   the next cycle.
+1. **Set the provider-specific force-account env to `new_primary`** —
+   without this, the parent's active-account helper reads the old pinned
+   value and continues sending calls to the old primary, leaving the
+   rotation observable in pool state but invisible to running agents.
+2. **`agent_sessions.clear()`** — provider-native session IDs are
+   per-account; resuming an old account's session on the new account can
+   fail with "session not found." Clearing forces fresh sessions on the
+   next cycle.
 3. **`health_events.append_event("planned_rotation", ...)`** —
    informational event for operator observability.
 
@@ -454,24 +530,6 @@ print(pool.format_pool_summary())
 
 Drop the directory from `CLAUDE_ACCOUNT_POOL` and restart.
 
-## Codex Provider Pool
-
-When `llm_provider: codex` or `LONG_EXPOSURE_LLM_PROVIDER=codex` is
-active, the same state machine uses Codex-specific names:
-
-| Purpose | Claude | Codex |
-|---|---|---|
-| Pool env | `CLAUDE_ACCOUNT_POOL` / `CLAUDE_ACCOUNTS` | `CODEX_ACCOUNT_POOL` / `CODEX_HOMES` |
-| Force pin | `CLAUDE_FORCE_ACCOUNT` | `CODEX_FORCE_ACCOUNT` |
-| Child config/auth dir | `CLAUDE_CONFIG_DIR` | `CODEX_HOME` |
-| Pool state file | `~/.claude-pool-state.json` | `~/.codex-pool-state.json` |
-
-Each `CODEX_HOME` directory must be authenticated for the Codex CLI and
-verified with `codex exec` in a trusted workspace before adding it to
-`CODEX_ACCOUNT_POOL`.
-`_ensure_account_entries` removes any account entry not present in the
-new env-var list at the next init.
-
 ## Gemini Provider Pool
 
 Gemini multi-account pooling is disabled for now. Gemini CLI supports
@@ -486,32 +544,29 @@ separate account pins.
 
 ---
 
-## Code citations
+## Code references
 
-- Pool state machine: `long_exposure/pool.py:62–67` (states), `162–613`
-  (transitions and operations).
+- Pool state machine: `long_exposure/pool.py` (states, transitions,
+  acquire/release/sweep, promotion, usage counters).
+- Unified selector: `long_exposure/unified_pool.py`.
 - Freshness promotion + rotation recording: `long_exposure/pool.py:promote_fresh`
   (records `last_rotation_at` on success).
-- Slot lifecycle: `pool.py:347–508` (acquire/release/sweep);
-  `fanout.py:686–802` (parent-side acquire + post-Popen re-tag);
+- Slot lifecycle: `pool.py` (acquire/release/sweep);
+  `fanout.py` (parent-side acquire + post-Popen re-tag);
   `exploration.py` clone bootstrap block (clone-side re-tag + atexit).
-- Rate-limit detection: `orchestrator.py:2233–2261` (`_is_rate_limit`);
-  `orchestrator.py:2090–2098` (signatures).
-- Pool-aware compaction/checkpoint: `orchestrator.py:2695–2785` and
-  `2810–2850` (`call_claude_pool_aware`).
-- Rotation safety net: `exploration.py:2331–2334` (`rotation_attempts`
-  break).
-- Cycle-level rotation: `exploration.py` (cycle loop, look for
-  `tried_accounts_this_cycle`).
-- **Per-account usage tracking (Plan A):** `pool.record_usage`,
+- Rate-limit detection: `orchestrator.py` (`_is_rate_limit`,
+  `_RATE_LIMIT_SIGNATURES`, `_format_cli_failure_context`).
+- Pool-aware compaction/checkpoint: `orchestrator.py`
+  (`call_claude_pool_aware`).
+- Rotation safety net and root rotation: `exploration.py` (cycle loop,
+  `_rotate_unified_root_after_rate_limit`).
+- **Per-account usage tracking:** `pool.record_usage`,
   `pool.get_usage_snapshot`, `pool.reset_usage_counters`,
   `pool._human_tokens`, `pool.format_pool_summary` (extended).
   Hook site: `orchestrator._invoke_claude` (post-envelope, success
   path). Daily-sync print: `exploration._snapshot_account_usage`,
   `exploration._print_account_usage_delta`.
-- **Planned 24h rotation (Plan B):** `pool.record_rotation`,
+- **Planned 24h rotation:** `pool.record_rotation`,
   `pool.last_rotation_age_hours`. Hook site: cycle loop's daily-sync
-  `finally` clause in `exploration.py`. The hot-swap of
-  `os.environ["CLAUDE_FORCE_ACCOUNT"]` and `agent_sessions.clear()`
-  in that block are load-bearing — see the comment block at the hook
-  for why both are required.
+  `finally` clause in `exploration.py`. The force-account env hot-swap
+  and `agent_sessions.clear()` in that block are load-bearing.

@@ -16,6 +16,7 @@ as they do for `python -m long_exposure.exploration`.
 import argparse
 from pathlib import Path
 
+from long_exposure import paths
 from long_exposure.exploration import (
     _render_final_pdf,
     _resolve_output_dir,
@@ -131,8 +132,8 @@ def main():
         # Ensure PDF was rendered (the exploration loop handles this, but
         # run_final_reporter.py bypasses the loop so we check here too)
         working_dir = config.get("working_directory", "/tmp")
-        final_pdf = Path(working_dir) / "final_report.pdf"
-        final_md = Path(working_dir) / "final_report.md"
+        final_pdf = paths.final_report_pdf_path(working_dir)
+        final_md = paths.final_report_path(working_dir)
         if final_md.exists() and not final_pdf.exists():
             print("[run_final] PDF missing — rendering now.")
             _render_final_pdf(working_dir)

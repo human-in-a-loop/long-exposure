@@ -92,12 +92,24 @@ compact_xml_retries: 5    # bounded retry on malformed compaction summary XML
 
 ```yaml
 merge_synthesis_min_branches: 4
+ledger_graph:
+  enabled: true
+anti_patterns:
+  enabled: true
+  max_entries: 5
+  max_rationale_chars: 200
 ```
 
 When a fan-out collapses with ≥ this many branches, the reporter
 agent is invoked to compress N raw merge_reports into one bounded
 synthesis. Below the threshold, raw concatenation goes through
 unchanged. See `parallelism.md`.
+
+`ledger_graph.enabled` controls the read-only ledger causal summary injected
+into final auditor and final reporter stages. `anti_patterns` controls the
+ledger-derived `<campaign_anti_patterns>` block injected into live guidance
+when the latest event for a milestone is still high/medium-confidence
+`invalidated`. Both default to enabled and fail closed to empty strings.
 
 ### Agent-teams
 
@@ -267,6 +279,7 @@ relevance_profiles:
     topic_weights:
       _same_topic: 1.0
       _same_subtopic: 0.5
+      _ancestor: 0.0       # opt-in parent-chain boost
       testing: -0.3        # named topic; can boost or penalise
     tool_weights:
       _shared_tools: 0.3
@@ -282,9 +295,10 @@ relevance_profiles:
 ```
 
 Each profile is keyed by philosophy name. Special keys
-(`_same_topic`, `_same_subtopic`, `_any_topic`, `_shared_tools`) are
-detected by `proximity.score_session`. Named topics and keywords add
-direct boosts (or penalties — negative values are valid).
+(`_same_topic`, `_same_subtopic`, `_any_topic`, `_ancestor`,
+`_shared_tools`) are detected by `proximity.score_session`. `_ancestor`
+defaults to `0.0`, so parent-chain scoring is opt-in. Named topics and
+keywords add direct boosts (or penalties — negative values are valid).
 
 See `persistence-and-gems.md` for the full scoring model.
 
@@ -322,7 +336,7 @@ loop:
   daily_sync_interval_hours: 24
   min_clone_cycles_before_preempt: 1
   barrier_preempt_timeout_seconds: 3600
-  # Planned 24h rotation (Plan B). Defaults to daily_sync_interval_hours
+  # Planned 24h rotation. Defaults to daily_sync_interval_hours
   # when unset. Pre-emptively rotates the primary after each daily sync
   # iff no rate-limit-driven rotation has happened in the prior window.
   # planned_rotation_min_age_hours: 24
@@ -355,9 +369,9 @@ flow:                            # cycle order
 | `cycle_cooldown_seconds` | `400` | Pause between cycles. `2 ×` this on failure cycles (adaptive cooldown). |
 | `report_interval` | `3` | Periodic reporter runs every N cycles. |
 | `daily_sync_interval_hours` | `24` | Wall-clock interval for end-of-run pipeline in revise mode. See `end-of-run-pipeline.md`. |
-| `min_clone_cycles_before_preempt` | `1` | Stage 9: clones must complete this many cycles before being eligible for graceful preemption. See `parallelism.md`. |
+| `min_clone_cycles_before_preempt` | `1` | Clones must complete this many cycles before being eligible for graceful preemption. See `parallelism.md`. |
 | `barrier_preempt_timeout_seconds` | `3600` | Backup timer for preemption when no organic exit has happened. |
-| `planned_rotation_min_age_hours` | (defaults to `daily_sync_interval_hours`) | Plan B: the minimum age of the last rotation before a planned rotation will fire after the next daily sync. Set to a value larger than `daily_sync_interval_hours` to space planned rotations farther apart than syncs. |
+| `planned_rotation_min_age_hours` | (defaults to `daily_sync_interval_hours`) | Minimum age of the last rotation before a planned rotation will fire after the next daily sync. Set to a value larger than `daily_sync_interval_hours` to space planned rotations farther apart than syncs. |
 
 ### Agent definitions
 
@@ -412,9 +426,11 @@ time. Each declared input must come from one of three sources:
      `report_basename`, `working_dir`.
    - Stage inputs (final reporter / final auditor):
      `stage`, `total_stages`, `stage_index`, `expected_file`,
-     `rescue_warning`, `outline_path`, `prior_reports`,
-     `final_audit_summary`, `final_audit_headline`, `wall_cap_hit`,
-     `findings_file`, `lesson_candidates_file`.
+     `rescue_warning`, `outline_path`, `draft_path`,
+     `final_report_path`, `report_glob`, `final_report_dir`,
+     `prior_reports`, `final_audit_summary`, `final_audit_headline`,
+     `ledger_causal_summary`, `wall_cap_hit`, `findings_file`,
+     `lesson_candidates_file`, `audit_dir`.
    - Curator inputs: `clone_artifacts`.
    - Manager inputs: `manager_snapshot`.
 2. Score-level top-level `inputs:` mapping (rare; usually empty).
@@ -564,7 +580,7 @@ moderate depth with full output freedom.
 
 ---
 
-## Code citations
+## Code references
 
 - `PHILOSOPHY_PRESETS`, `FRAMEWORK_PRESETS`,
   `PHILOSOPHY_EFFORT_MAP`: `long_exposure/orchestrator.py`.

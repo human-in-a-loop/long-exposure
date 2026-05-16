@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from long_exposure import paths
 from long_exposure.auditing import _run_final_auditor
+from long_exposure.curator import _create_package_zip
 from long_exposure.exploration import _run_reporter
 from long_exposure.reporting import _run_final_reporter
 from long_exposure.tools import org_check, promise_check
@@ -21,16 +22,17 @@ def _ok_result(output_name: str, text: str = "# Stage\n\ncontent") -> dict:
 
 
 class WorkspaceRoutingTests(unittest.TestCase):
-    def test_workspace_root_invariants_stay_at_root(self):
+    def test_final_stage_artifacts_use_managed_dirs(self):
         with tempfile.TemporaryDirectory() as td:
             config = {"working_directory": td}
             root = Path(td).resolve()
 
-            self.assertEqual(paths.final_report_path(config).parent, root)
-            self.assertEqual(paths.final_report_pdf_path(config).parent, root)
-            self.assertEqual(paths.final_audit_report_path(config).parent, root)
-            self.assertEqual(paths.final_audit_pdf_path(config).parent, root)
-            self.assertEqual(paths.final_audit_summary_path(config).parent, root)
+            self.assertEqual(paths.final_report_path(config).parent, root / "reports" / "final")
+            self.assertEqual(paths.final_report_pdf_path(config).parent, root / "reports" / "final")
+            self.assertEqual(paths.final_report_commit_marker_path(config).parent, root / "reports" / "final")
+            self.assertEqual(paths.final_audit_report_path(config).parent, root / "audits" / "final")
+            self.assertEqual(paths.final_audit_pdf_path(config).parent, root / "audits" / "final")
+            self.assertEqual(paths.final_audit_summary_path(config).parent, root / "audits" / "final")
 
     def test_ensure_layout_creates_all_managed_dirs(self):
         with tempfile.TemporaryDirectory() as td:
@@ -189,8 +191,8 @@ class WorkspaceRoutingTests(unittest.TestCase):
 
             self.assertTrue((root / "reports" / "final" / "outline.md").exists())
             self.assertTrue((root / "reports" / "final" / "draft.md").exists())
-            self.assertTrue((root / "final_report.md").exists())
-            self.assertTrue((root / "final_report.committed").exists())
+            self.assertTrue((root / "reports" / "final" / "final_report.md").exists())
+            self.assertTrue((root / "reports" / "final" / "final_report.committed").exists())
             self.assertFalse((root / "final_report_outline.md").exists())
             self.assertFalse((root / "final_report_draft.md").exists())
 
@@ -200,8 +202,8 @@ class WorkspaceRoutingTests(unittest.TestCase):
             config = {"working_directory": str(root)}
             paths.ensure_layout(config)
             (root / "reports" / "cycles" / "report_cycles_1-1.md").write_text("# Cycle\n\nbody")
-            (root / "final_report.md").write_text("# Prior Final\n\nbaseline\n")
-            (root / "final_report.committed").write_text(json.dumps({
+            paths.final_report_path(config).write_text("# Prior Final\n\nbaseline\n")
+            paths.final_report_commit_marker_path(config).write_text(json.dumps({
                 "committed_at": "2000-01-01T00:00:00+00:00",
                 "run_id": "run-test",
             }))
@@ -235,12 +237,12 @@ class WorkspaceRoutingTests(unittest.TestCase):
             config = {"working_directory": str(root)}
             paths.ensure_layout(config)
             (root / "reports" / "cycles" / "report_cycles_1-1.md").write_text("# Cycle\n\nbody")
-            (root / "final_report.md").write_text("# Prior Final\n\nbaseline\n")
+            paths.final_report_path(config).write_text("# Prior Final\n\nbaseline\n")
             original_marker = {
                 "committed_at": "2000-01-01T00:00:00+00:00",
                 "run_id": "run-test",
             }
-            (root / "final_report.committed").write_text(json.dumps(original_marker))
+            paths.final_report_commit_marker_path(config).write_text(json.dumps(original_marker))
             agent_def = {"outputs": ["final_report_stage"]}
 
             def fake_call(**kwargs):
@@ -262,8 +264,8 @@ class WorkspaceRoutingTests(unittest.TestCase):
                     None, 1, None, 1000, 900,
                 )
 
-            self.assertEqual((root / "final_report.md").read_text(), "# Prior Final\n\nbaseline\n")
-            self.assertEqual(json.loads((root / "final_report.committed").read_text()), original_marker)
+            self.assertEqual(paths.final_report_path(config).read_text(), "# Prior Final\n\nbaseline\n")
+            self.assertEqual(json.loads(paths.final_report_commit_marker_path(config).read_text()), original_marker)
 
     def test_final_auditor_uses_audit_scratch_dir_and_commit_marker(self):
         with tempfile.TemporaryDirectory() as td:
@@ -278,7 +280,7 @@ class WorkspaceRoutingTests(unittest.TestCase):
                 expected.parent.mkdir(parents=True, exist_ok=True)
                 expected.write_text("# Audit Stage\n\nbody\n")
                 if expected.name == "final_audit_report.md":
-                    (root / "final_audit_summary.json").write_text(json.dumps({
+                    paths.final_audit_summary_path(config).write_text(json.dumps({
                         "run_id": "run-test",
                         "findings": {"CRITICAL": 0, "MODERATE": 0, "MINOR": 0},
                     }))
@@ -297,8 +299,8 @@ class WorkspaceRoutingTests(unittest.TestCase):
 
             self.assertTrue((root / "audits" / "final" / "explore.md").exists())
             self.assertTrue(list((root / "audits" / "final" / "stages").glob("*.md")))
-            self.assertTrue((root / "final_audit_report.md").exists())
-            self.assertTrue((root / "final_audit_report.committed").exists())
+            self.assertTrue((root / "audits" / "final" / "final_audit_report.md").exists())
+            self.assertTrue((root / "audits" / "final" / "final_audit_report.committed").exists())
             self.assertFalse((root / "final_audit_explore.md").exists())
 
     def test_final_auditor_detects_committed_delta_mode(self):
@@ -307,8 +309,8 @@ class WorkspaceRoutingTests(unittest.TestCase):
             config = {"working_directory": str(root)}
             paths.ensure_layout(config)
             (root / "reports" / "cycles" / "report_cycles_1-1.md").write_text("# Cycle\n\nbody")
-            (root / "final_audit_report.md").write_text("# Prior Audit\n\nbaseline\n")
-            (root / "final_audit_report.committed").write_text(json.dumps({
+            paths.final_audit_report_path(config).write_text("# Prior Audit\n\nbaseline\n")
+            paths.final_audit_commit_marker_path(config).write_text(json.dumps({
                 "committed_at": "2000-01-01T00:00:00+00:00",
                 "run_id": "run-test",
             }))
@@ -321,7 +323,7 @@ class WorkspaceRoutingTests(unittest.TestCase):
                 expected.parent.mkdir(parents=True, exist_ok=True)
                 expected.write_text("# Audit Stage\n\nbody\n")
                 if expected.name == "final_audit_report.md":
-                    (root / "final_audit_summary.json").write_text("{}")
+                    paths.final_audit_summary_path(config).write_text("{}")
                 return _ok_result("final_audit_stage", "wrote file")
 
             with (
@@ -346,12 +348,12 @@ class WorkspaceRoutingTests(unittest.TestCase):
             config = {"working_directory": str(root)}
             paths.ensure_layout(config)
             (root / "reports" / "cycles" / "report_cycles_1-1.md").write_text("# Cycle\n\nbody")
-            (root / "final_audit_report.md").write_text("# Prior Audit\n\nbaseline\n")
+            paths.final_audit_report_path(config).write_text("# Prior Audit\n\nbaseline\n")
             original_marker = {
                 "committed_at": "2000-01-01T00:00:00+00:00",
                 "run_id": "run-test",
             }
-            (root / "final_audit_report.committed").write_text(json.dumps(original_marker))
+            paths.final_audit_commit_marker_path(config).write_text(json.dumps(original_marker))
             agent_def = {"outputs": ["final_audit_stage"]}
 
             def fake_call(**kwargs):
@@ -372,9 +374,9 @@ class WorkspaceRoutingTests(unittest.TestCase):
                     None, 1, None, 1000, 900,
                 )
 
-            self.assertEqual((root / "final_audit_report.md").read_text(), "# Prior Audit\n\nbaseline\n")
+            self.assertEqual(paths.final_audit_report_path(config).read_text(), "# Prior Audit\n\nbaseline\n")
             self.assertEqual(
-                json.loads((root / "final_audit_report.committed").read_text()),
+                json.loads(paths.final_audit_commit_marker_path(config).read_text()),
                 original_marker,
             )
 
@@ -391,6 +393,26 @@ class WorkspaceRoutingTests(unittest.TestCase):
             self.assertTrue(
                 any("legacy root stage artifact" in note for note in findings.notes)
             )
+
+    def test_curator_fallback_collects_canonical_final_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paths.ensure_layout({"working_directory": str(root)})
+            paths.final_report_path(root).write_text("# Final\n\nbody\n")
+            paths.final_report_pdf_path(root).write_bytes(b"%PDF-1.4\n")
+            paths.final_audit_summary_path(root).write_text("{}\n")
+            (root / "MANIFEST.md").write_text("# Manifest\n")
+            (root / "REFERENCES.md").write_text("# References\n")
+
+            zip_name = _create_package_zip(root, "task")
+
+            self.assertIsNotNone(zip_name)
+            import zipfile
+            with zipfile.ZipFile(root / zip_name) as zf:
+                names = set(zf.namelist())
+            self.assertTrue(any(name.endswith("/report/final_report.md") for name in names))
+            self.assertTrue(any(name.endswith("/report/final_report.pdf") for name in names))
+            self.assertTrue(any(name.endswith("/report/final_audit_summary.json") for name in names))
 
 
 if __name__ == "__main__":

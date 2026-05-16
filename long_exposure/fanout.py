@@ -33,6 +33,7 @@ from pathlib import Path
 
 from long_exposure import provider as _provider
 from long_exposure import telemetry
+from long_exposure import unified_pool
 
 
 # Lazy-import delegators for names defined in long_exposure.exploration.
@@ -106,6 +107,9 @@ def _fanout_branch_cap() -> int:
     """
     try:
         from long_exposure import pool as _pool
+        if unified_pool.is_unified_active():
+            cap = unified_pool.fanout_cap()
+            return max(1, cap) if cap > 0 else FANOUT_MAX_BRANCHES
         if _pool.is_active():
             cap = _pool.fanout_cap()
             return max(1, cap) if cap > 0 else FANOUT_MAX_BRANCHES
@@ -155,6 +159,9 @@ def _build_fanout_guidance() -> str:
         "  </parallel_cycle_fanout>\n"
         "\n"
         "Clones inherit your gems, context, and workspace.\n"
+        "Lemmas (record_type=\"lemma\") cross branch boundaries. Search them\n"
+        "before tool/env work; emit <lemma_proposal> blocks only for\n"
+        "infrastructure facts every sibling clone would need.\n"
         "</parallel_cycle_fanout_guidance>"
     )
 
@@ -221,6 +228,12 @@ MERGE_SYNTHESIS_PROMPT = (
     "Input format: per-branch sections, each tagged with branch ID,\n"
     "objective, deliverable status (exists / missing / unchecked), and\n"
     "the branch's merge_report content.\n\n"
+    "Output structure:\n"
+    "  1. FIRST: emit a <branchial_diff>...</branchial_diff> block containing\n"
+    "     a JSON object with keys convergences, divergences, asymmetric_finds,\n"
+    "     and failed_branches. Each key maps to an array; arrays may be empty.\n"
+    "     Reference branches by zero-based clone index. Keep claims one line.\n"
+    "  2. THEN: write the prose synthesis as usual.\n\n"
     "Produce a single coherent synthesis that:\n"
     "  - Integrates findings across branches.\n"
     "  - Surfaces convergences (agreements across branches).\n"
@@ -248,17 +261,129 @@ POST_MERGE_BRIEF_TEMPLATE = (
     "that now need integration into the main workspace. This cycle runs\n"
     "worker-only -- researcher and auditor are skipped.\n\n"
     "## Your task\n"
-    "1. Read the merge content below.\n"
-    "2. Integrate the sub-cycle outputs into the main workspace. Reconcile\n"
+    "1. Read the divergence table first; disagreements are the priority.\n"
+    "2. Read the merge content below for full context.\n"
+    "3. Integrate the sub-cycle outputs into the main workspace. Reconcile\n"
     "   any overlap or conflict between branches.\n"
-    "3. Run integration tests / consistency checks that span branch outputs.\n\n"
+    "4. Run integration tests / consistency checks that span branch outputs.\n\n"
     "## Do not\n"
     "- Start new research directions. The researcher resumes next cycle.\n"
     "- Perform audit-level validation of the sub-cycles. They audited\n"
     "  themselves via their own R/W/A loops.\n\n"
+    "{divergence_table}\n"
     "## Fan-out merge content (fork {fork_id})\n\n"
     "{merge}\n"
 )
+
+_BRANCHIAL_DIFF_RE = _re.compile(
+    r"<branchial_diff>(.*?)</branchial_diff>",
+    _re.DOTALL | _re.IGNORECASE,
+)
+
+
+def _strip_code_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def _extract_branchial_diff(synthesis_text: str | None) -> dict | None:
+    """Parse the reporter's <branchial_diff> JSON block.
+
+    Returns normalized known-list keys or None. Any malformed model output
+    degrades to prose-only merge behavior.
+    """
+    if not synthesis_text:
+        return None
+    match = _BRANCHIAL_DIFF_RE.search(synthesis_text)
+    if not match:
+        return None
+    try:
+        payload = json.loads(_strip_code_fences(match.group(1)))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    out: dict[str, list[dict]] = {}
+    for key in ("convergences", "divergences", "asymmetric_finds", "failed_branches"):
+        value = payload.get(key, [])
+        if isinstance(value, list):
+            out[key] = [item for item in value if isinstance(item, dict)]
+        else:
+            out[key] = []
+    return out
+
+
+def _branch_label(value) -> str:
+    if not isinstance(value, list):
+        return ""
+    return ", ".join(f"c{v}" for v in value)
+
+
+def _render_divergence_table(diff: dict | None, outcomes: list[dict]) -> str:
+    """Render structured branch diff, or a state-only fallback table."""
+    if diff is None:
+        lines = ["## Branch outcomes (state-level diff)", ""]
+        for outcome in outcomes:
+            lines.append(
+                f"- clone-{outcome.get('clone_k', '?')}: "
+                f"{outcome.get('state', 'unknown')} | "
+                f"deliverable={outcome.get('deliverable_status', 'unchecked')}"
+            )
+        return "\n".join(lines) + "\n"
+
+    lines = ["## Branchial diff (structured)", ""]
+    if diff.get("convergences"):
+        lines.append("### Convergences")
+        for item in diff["convergences"]:
+            lines.append(
+                f"- [{_branch_label(item.get('branches'))}] "
+                f"{item.get('claim', '(no claim)')}"
+            )
+        lines.append("")
+    if diff.get("divergences"):
+        lines.append("### Divergences")
+        for item in diff["divergences"]:
+            lines.append(f"- **{item.get('subject', '(no subject)')}**")
+            positions = item.get("positions") or []
+            if not isinstance(positions, list):
+                continue
+            for pos in positions:
+                if not isinstance(pos, dict):
+                    continue
+                lines.append(
+                    f"  - [{_branch_label(pos.get('branches'))}] "
+                    f"{pos.get('claim', '(no claim)')}"
+                )
+        lines.append("")
+    if diff.get("asymmetric_finds"):
+        lines.append("### Asymmetric finds")
+        for item in diff["asymmetric_finds"]:
+            notable = item.get("notable_because") or ""
+            suffix = f" -- {notable}" if notable else ""
+            lines.append(
+                f"- [{_branch_label(item.get('branches'))}] "
+                f"{item.get('claim', '(no claim)')}{suffix}"
+            )
+        lines.append("")
+    if diff.get("failed_branches"):
+        lines.append("### Failed branches")
+        for item in diff["failed_branches"]:
+            lines.append(
+                f"- [{_branch_label(item.get('branches'))}] "
+                f"exit={item.get('exit_state', '?')} -- "
+                f"{item.get('what_was_lost', '')}"
+            )
+        lines.append("")
+    if len(lines) == 2:
+        return _render_divergence_table(None, outcomes)
+    return "\n".join(lines) + "\n"
 
 
 def _extract_fork_metadata(audit_report: str) -> tuple[str, int]:
@@ -524,11 +649,53 @@ def _write_fork_manifest(
             f"- pid: {pid}",
             f"- started: {starts_iso[k]}",
             f"- objective: {first_sentence}",
-            "",
         ]
+        ann = br.get("branchial_budget") or {}
+        if ann:
+            suffix = (
+                f" ({ann.get('novelty_score')})"
+                if ann.get("novelty_score") is not None else ""
+            )
+            lines.append(
+                f"- branchial_budget: {ann.get('novelty_class', 'unknown')}{suffix}"
+            )
+            matched = ann.get("matched_session_ids") or []
+            if matched:
+                lines.append(f"- matched_session_ids: {', '.join(matched[:3])}")
+        lines.append("")
     try:
         _atomic_write_text(fork_dir / "fork_manifest.md", "\n".join(lines))
     except OSError:
+        pass
+
+
+def _append_branchial_budget_log(
+    data_dir: Path,
+    run_id: str | None,
+    cycle: int | None,
+    fork_id: str,
+    branches: list[dict],
+) -> None:
+    """Append one report-only fan-out novelty record. Best-effort."""
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": run_id,
+            "cycle": cycle,
+            "fork_id": fork_id,
+            "branches": [
+                {
+                    "k": i,
+                    "objective_snippet": (branch.get("objective") or "")[:120],
+                    **(branch.get("branchial_budget") or {}),
+                }
+                for i, branch in enumerate(branches)
+            ],
+        }
+        with (data_dir / "branchial_budget.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+    except Exception:
         pass
 
 
@@ -799,7 +966,7 @@ def _resolve_python_exe() -> str:
     )
 
 
-def _acquire_clone_pool_slot(fork_id: str, clone_k: int) -> str | None:
+def _acquire_clone_pool_slot(fork_id: str, clone_k: int):
     """Acquire a pool slot for a clone. Returns the pinned account dir,
     or None when the pool is inactive or PoolExhausted is raised.
 
@@ -809,6 +976,20 @@ def _acquire_clone_pool_slot(fork_id: str, clone_k: int) -> str | None:
     """
     try:
         from long_exposure import pool as _pool
+        if unified_pool.is_unified_active():
+            try:
+                return unified_pool.acquire_slot(
+                    role="clone",
+                    fork_id=fork_id,
+                    clone_k=clone_k,
+                )
+            except _pool.PoolExhausted as _ex:
+                print(
+                    f"[long-exposure]   clone-{clone_k}: unified pool exhausted "
+                    f"({_ex}); falling back to inherited account",
+                    flush=True,
+                )
+                return None
         if not _pool.is_active():
             return None
         try:
@@ -837,6 +1018,7 @@ def _spawn_clone(
     score_path: str,
     config_path: str | None,
     pinned_account_dir: str | None = None,
+    unified_holder=None,
 ) -> subprocess.Popen:
     """Spawn one clone subprocess. Returns the Popen handle.
 
@@ -886,14 +1068,23 @@ def _spawn_clone(
                 f"post-acquire ({_err}); update_slot_pid will be skipped",
                 flush=True,
             )
-        env[_provider.force_account_env()] = pinned_account_dir
-        # Drop provider pool envs so the clone doesn't see the multi-account
-        # retry loop in call_claude — pinned accounts must single-attempt.
-        for env_name in _provider.account_pool_envs():
-            env.pop(env_name, None)
+        if unified_holder is not None:
+            env["LONG_EXPOSURE_LLM_PROVIDER"] = unified_holder.provider
+            env[_provider.force_account_env(unified_holder.provider)] = pinned_account_dir
+            for prv in _provider.PROVIDERS:
+                for env_name in _provider.account_pool_envs(prv):
+                    env.pop(env_name, None)
+            env["LONG_EXPOSURE_UNIFIED_POOL"] = "disabled"
+        else:
+            env[_provider.force_account_env()] = pinned_account_dir
+            # Drop provider pool envs so the clone doesn't see the multi-account
+            # retry loop in call_claude — pinned accounts must single-attempt.
+            for env_name in _provider.account_pool_envs():
+                env.pop(env_name, None)
         print(
             f"[long-exposure]   clone-{clone_k}: pinned to "
-            f"{Path(pinned_account_dir).name}",
+            f"{Path(pinned_account_dir).name}"
+            + (f" ({unified_holder.provider})" if unified_holder is not None else ""),
             flush=True,
         )
     python_exe = _resolve_python_exe()
@@ -924,7 +1115,10 @@ def _spawn_clone(
         # records this branch as spawn_failed.
         if pool_slot_acquired and pool_module is not None:
             try:
-                pool_module.release_slot_by_branch(fork_id, clone_k)
+                if unified_holder is not None:
+                    unified_pool.release_slot_by_holder(unified_holder)
+                else:
+                    pool_module.release_slot_by_branch(fork_id, clone_k)
             except Exception as _re:
                 print(
                     f"[long-exposure]   clone-{clone_k}: slot release after "
@@ -945,7 +1139,10 @@ def _spawn_clone(
     # path that survives parent crashes.
     if pool_slot_acquired and pool_module is not None:
         try:
-            pool_module.update_slot_pid(fork_id, clone_k, p.pid)
+            if unified_holder is not None:
+                unified_pool.update_slot_pid_for_holder(unified_holder, p.pid)
+            else:
+                pool_module.update_slot_pid(fork_id, clone_k, p.pid)
         except Exception as _ue:
             # Best-effort — clone-side re-tag will close any remaining gap.
             print(
@@ -1260,6 +1457,13 @@ def _run_fanout_conductor(
             f"-> {br['output_artifact']}",
             flush=True,
         )
+    _append_branchial_budget_log(
+        data_dir=data_dir,
+        run_id=parent_run_id,
+        cycle=None,
+        fork_id=fork_id,
+        branches=branches,
+    )
 
     # --- Seed each clone's workspace, assignment, state ---
     # Resolve parent's active account dir ONCE; it does not change across the
@@ -1280,7 +1484,9 @@ def _run_fanout_conductor(
         # can compare parent's account dir vs. clone's pinned account dir
         # (Plan D). Falls back to None on inactive pool / exhaustion;
         # _seed_clone_state then preserves sessions verbatim.
-        pinned_dir = _acquire_clone_pool_slot(fork_id, k)
+        pinned_slot = _acquire_clone_pool_slot(fork_id, k)
+        unified_holder = pinned_slot if isinstance(pinned_slot, unified_pool.UnifiedHolder) else None
+        pinned_dir = unified_holder.account_dir if unified_holder is not None else pinned_slot
         # Defensive release: if assignment/seed raises before spawn, the
         # slot we just acquired must not leak. _spawn_clone's own OSError
         # handler covers the Popen-failure case (release_slot_by_branch).
@@ -1301,6 +1507,7 @@ def _run_fanout_conductor(
                 p = _spawn_clone(
                     cdir, fork_id, k, score_path, config_path,
                     pinned_account_dir=pinned_dir,
+                    unified_holder=unified_holder,
                 )
                 spawn_succeeded = True
                 procs.append(p)
@@ -1328,8 +1535,11 @@ def _run_fanout_conductor(
                 # reached _spawn_clone; release the slot we acquired so
                 # it doesn't leak. Best-effort.
                 try:
-                    from long_exposure import pool as _pool
-                    _pool.release_slot_by_branch(fork_id, k)
+                    if unified_holder is not None:
+                        unified_pool.release_slot_by_holder(unified_holder)
+                    else:
+                        from long_exposure import pool as _pool
+                        _pool.release_slot_by_branch(fork_id, k)
                 except Exception as _re:
                     print(
                         f"[long-exposure]   clone-{k} pre-spawn release "
@@ -1628,6 +1838,7 @@ def _run_fanout_conductor(
     threshold = MERGE_SYNTHESIS_MIN_BRANCHES
     if config:
         threshold = int(config.get("merge_synthesis_min_branches", threshold))
+    divergence_table = ""
     if reporter_def is not None and len(branches) >= threshold:
         synthesis_text = _run_merge_synthesis(
             reporter_def=reporter_def,
@@ -1639,6 +1850,10 @@ def _run_fanout_conductor(
             outcomes=outcomes,
         )
         if synthesis_text:
+            divergence_table = _render_divergence_table(
+                _extract_branchial_diff(synthesis_text),
+                outcomes,
+            )
             # Build a small index for traceability so the post-merge worker
             # can find raw branch reports if the synthesis is unclear, then
             # replace the aggregated text with synthesis + index.
@@ -1675,6 +1890,12 @@ def _run_fanout_conductor(
                 "raw concatenation for post-merge worker.",
                 flush=True,
             )
+    if not divergence_table:
+        divergence_table = _render_divergence_table(None, outcomes)
+    try:
+        _atomic_write_text(fork_dir / "fanout_divergence.md", divergence_table)
+    except OSError:
+        pass
 
     # Finalize the fork manifest with concluded-outcomes block + per-clone
     # file provenance + cross-clone collisions (reads files_touched.txt).
@@ -1733,7 +1954,24 @@ def _run_fanout_conductor(
     # own slot via the rate-limit path, this is a no-op for that branch.
     try:
         from long_exposure import pool as _pool
-        if _pool.is_active():
+        if unified_pool.is_unified_active():
+            for _k in range(len(branches)):
+                try:
+                    _holder = None
+                    # No persisted holder list is needed for correctness here:
+                    # release-by-branch is provider-routed best effort; heartbeat
+                    # sweeps reclaim any missed clone slot on the next root tick.
+                    for _prv in unified_pool.configured_providers():
+                        with unified_pool.swap_active_provider(_prv):
+                            if _pool.release_slot_by_branch(fork_id, _k):
+                                break
+                except Exception as _re:
+                    print(
+                        f"[long-exposure]   clone-{_k}: unified slot release failed "
+                        f"({_re}); heartbeat_sweep will reclaim",
+                        flush=True,
+                    )
+        elif _pool.is_active():
             for _k in range(len(branches)):
                 try:
                     _pool.release_slot_by_branch(fork_id, _k)
@@ -1779,6 +2017,7 @@ def _run_fanout_conductor(
 
     return {
         "aggregated_report": aggregated,
+        "divergence_table": divergence_table,
         "fork_id": fork_id,
         "fork_dir": str(fork_dir),
         "clone_dirs": [str(p) for p in clone_dirs],

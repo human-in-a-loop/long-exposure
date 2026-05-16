@@ -19,6 +19,8 @@ from pathlib import Path
 
 import yaml
 
+from long_exposure import paths
+
 
 # Lazy-import delegators for names defined in long_exposure.exploration.
 #
@@ -196,11 +198,19 @@ def _minimal_safety_curation(working_dir: Path, task: str) -> dict:
     workspace — a tight minimal package beats a junk drawer.
     """
     include: list[dict] = []
-    for name in ("final_report.md", "final_report.pdf",
-                 "MANIFEST.md", "REFERENCES.md"):
-        if (working_dir / name).is_file():
+    canonical = {
+        "final_report.md": paths.final_report_path(working_dir),
+        "final_report.pdf": paths.final_report_pdf_path(working_dir),
+        "final_audit_report.md": paths.final_audit_report_path(working_dir),
+        "final_audit_report.pdf": paths.final_audit_pdf_path(working_dir),
+        "final_audit_summary.json": paths.final_audit_summary_path(working_dir),
+        "MANIFEST.md": working_dir / "MANIFEST.md",
+        "REFERENCES.md": working_dir / "REFERENCES.md",
+    }
+    for name, path in canonical.items():
+        if path.is_file():
             include.append({
-                "src": name,
+                "src": path.relative_to(working_dir).as_posix(),
                 "dest": f"report/{name}",
                 "role": "report",
             })
@@ -280,6 +290,20 @@ def _render_package_readme(curation: dict, task: str) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def _canonical_final_src(working_dir: Path, src: str) -> Path | None:
+    """Resolve legacy final-artifact manifest paths to canonical locations."""
+    by_name = {
+        "final_report.md": paths.final_report_path(working_dir),
+        "final_report.pdf": paths.final_report_pdf_path(working_dir),
+        "final_report.committed": paths.final_report_commit_marker_path(working_dir),
+        "final_audit_report.md": paths.final_audit_report_path(working_dir),
+        "final_audit_report.pdf": paths.final_audit_pdf_path(working_dir),
+        "final_audit_report.committed": paths.final_audit_commit_marker_path(working_dir),
+        "final_audit_summary.json": paths.final_audit_summary_path(working_dir),
+    }
+    return by_name.get(Path(src).name)
 
 
 def _create_package_zip(
@@ -370,8 +394,12 @@ def _create_package_zip(
         for entry in curation["include"]:
             src_abs = working_dir / entry["src"]
             if not src_abs.is_file():
-                missing.append(entry["src"])
-                continue
+                canonical = _canonical_final_src(working_dir, entry["src"])
+                if canonical and canonical.is_file():
+                    src_abs = canonical
+                else:
+                    missing.append(entry["src"])
+                    continue
             dest_abs = staging_root / entry["dest"]
             dest_abs.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_abs, dest_abs)
@@ -582,7 +610,7 @@ def _run_curator(
     """Run the curator agent, then assemble a curated handoff zip.
 
     1. Agent writes CURATION.yaml based on MANIFEST.md's "## Key Files"
-       section + final_report.md.
+       section + reports/final/final_report.md.
     2. Deterministic code validates the manifest, enforces hard
        exclusions, organizes files into <pkg>/{report,code,...}/, writes
        an auto-generated README and an audit-trail CURATION.yaml, and

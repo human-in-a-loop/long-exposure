@@ -54,7 +54,8 @@ The run goes until you stop it (Ctrl+C on the tail, stop signal, or topic
 exhaustion).
 Each cycle pauses for the configured cooldown (default 400s) before the next
 cycle starts. A reporter agent runs every 3 cycles to consolidate results;
-a final reporter + curator run once at the end to package the output.
+a final auditor, final reporter, and curator run once at the end to audit,
+synthesize, and package the output.
 
 **Equivalent from a terminal:**
 
@@ -96,8 +97,10 @@ intent explicit.
 
 ### Stop
 
-Any of these gracefully stop the exploration (the current agent finishes its
-turn, then state is saved):
+Any of these gracefully stop the exploration. The current in-flight agent turn
+is allowed to finish; the run then exits through the final auditor, final
+reporter, and curator before writing a completed status. Use `clear` only when
+you explicitly want to archive state and skip end-of-run synthesis.
 
 | Interface | Command |
 |---|---|
@@ -248,7 +251,7 @@ directory; Bash is restricted to a pattern allowlist.
 | `python`, `python3` | Run Python scripts |
 | `pip`, `pip3` | Install Python packages |
 | `pandoc` | Render reports to PDF (reporter agents) |
-| `figure` | Unified figure CLI (Plan C). Subcommands: `plot` (matplotlib), `flow` (D2 structural diagrams), `arch` (mingrammer/diagrams architecture diagrams), `check`, `list`. See [`figures.md`](figures.md). |
+| `figure` | Unified figure CLI. Subcommands: `plot` (matplotlib), `flow` (D2 structural diagrams), `arch` (mingrammer/diagrams architecture diagrams), `check`, `list`. See [`figures.md`](figures.md). |
 | `WebSearch` | Search the web |
 
 Agents cannot run arbitrary shell commands.
@@ -442,10 +445,11 @@ Agent output prints to the terminal as the exploration runs. Key log lines:
 State is saved to `exploration_state.json` after every cycle. If the
 process crashes, `resume` picks up from the last saved state.
 
-### Multi-account observability (Plan A + B)
+### Multi-account observability
 
-When the pool is active (≥2 accounts in `CLAUDE_ACCOUNT_POOL`), two
-additional log surfaces appear:
+When a provider pool is active (for example ≥2 accounts in
+`CLAUDE_ACCOUNT_POOL`, or a unified Claude+Codex pool), additional log
+surfaces appear:
 
 ```
 # format_pool_summary — printed alongside pool state changes:

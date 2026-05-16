@@ -1,7 +1,9 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from long_exposure.exploration import run_exploration
 
@@ -54,13 +56,15 @@ class ResumeStateTests(unittest.TestCase):
                 "anti_patterns_enabled: true\n"
             )
 
-            run_exploration(
-                score_path=str(score),
-                config_path=str(config),
-                output_dir=instance / "output",
-                state_path=state_path,
-                instance_dir=instance,
-            )
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("LONG_EXPOSURE_LLM_PROVIDER", None)
+                run_exploration(
+                    score_path=str(score),
+                    config_path=str(config),
+                    output_dir=instance / "output",
+                    state_path=state_path,
+                    instance_dir=instance,
+                )
 
             state = json.loads(state_path.read_text())
 

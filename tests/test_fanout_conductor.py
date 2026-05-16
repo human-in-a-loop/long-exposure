@@ -20,8 +20,20 @@ class FakeProc:
 class FanoutConductorTests(unittest.TestCase):
     def test_conductor_collects_fake_clone_merge_reports(self):
         branches = [
-            {"objective": "left branch", "output_artifact": "left.md"},
-            {"objective": "right branch", "output_artifact": "right.md"},
+            {
+                "objective": "left branch",
+                "output_artifact": "left.md",
+                "branchial_budget": {"novelty_class": "novel", "novelty_score": 0.9},
+            },
+            {
+                "objective": "right branch",
+                "output_artifact": "right.md",
+                "branchial_budget": {
+                    "novelty_class": "likely-retread",
+                    "novelty_score": 0.2,
+                    "matched_session_ids": ["s1"],
+                },
+            },
         ]
 
         def fake_spawn(cdir, fork_id, clone_k, *args, **kwargs):
@@ -55,8 +67,13 @@ class FanoutConductorTests(unittest.TestCase):
             self.assertIn("Fan-out Merge", result["aggregated_report"])
             self.assertIn("clone-0=done", result["aggregated_report"])
             self.assertIn("clone 1 complete", result["aggregated_report"])
+            self.assertIn("Branch outcomes", result["divergence_table"])
             self.assertTrue((fork_dir / "fork_manifest.md").exists())
             self.assertTrue((fork_dir / "fanout_merge.md").exists())
+            self.assertTrue((fork_dir / "fanout_divergence.md").exists())
+            manifest = (fork_dir / "fork_manifest.md").read_text()
+            self.assertIn("branchial_budget: likely-retread", manifest)
+            self.assertTrue((data / "branchial_budget.jsonl").exists())
 
 
 if __name__ == "__main__":

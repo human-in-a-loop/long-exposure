@@ -71,10 +71,10 @@ The bulk of the work is soft-guidance text in
 
 ### The unified `figure` CLI (shipped)
 
-Plan C added a single Bash entry point — `figure` — that the worker
-calls for any visual output. One discoverable name, one allowlist
-entry (`Bash(figure *)`), and a per-backend renderer module so future
-DSLs are plug-in additions.
+Long-exposure exposes a single Bash entry point — `figure` — that the worker
+calls for visual output. One discoverable name, one allowlist entry
+(`Bash(figure *)`), and a per-backend renderer module keep future DSLs as
+plug-in additions.
 
 | Subcommand | Backend | Figure category |
 |---|---|---|

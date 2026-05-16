@@ -10,16 +10,17 @@ from pathlib import Path
 from typing import Iterable
 
 
-# Workspace-root invariant set (DO NOT MOVE):
-#   final_report.md
-#   final_report.pdf
-#   final_report.committed
-#   final_audit_report.md
-#   final_audit_report.pdf
-#   final_audit_report.committed
-#   final_audit_summary.json
-# These are read by delta-mode detection, curator package collection, and
-# org_check's root allowlist. Moving any of these requires coordinated updates.
+# Final-stage invariant set (DO NOT MOVE without coordinated updates):
+#   reports/final/final_report.md
+#   reports/final/final_report.pdf
+#   reports/final/final_report.committed
+#   audits/final/final_audit_report.md
+#   audits/final/final_audit_report.pdf
+#   audits/final/final_audit_report.committed
+#   audits/final/final_audit_summary.json
+# Delta-mode detection, final-stage file gates, PDF rendering, and curator
+# package collection should derive paths from this module rather than
+# hardcoding workspace-root filenames.
 
 
 def workspace_root(config_or_workspace) -> Path:
@@ -98,15 +99,15 @@ def final_report_run_mode_path(config_or_workspace) -> Path:
 
 
 def final_report_path(config_or_workspace) -> Path:
-    return workspace_root(config_or_workspace) / "final_report.md"
+    return final_report_scratch_dir(config_or_workspace) / "final_report.md"
 
 
 def final_report_pdf_path(config_or_workspace) -> Path:
-    return workspace_root(config_or_workspace) / "final_report.pdf"
+    return final_report_scratch_dir(config_or_workspace) / "final_report.pdf"
 
 
 def final_report_commit_marker_path(config_or_workspace) -> Path:
-    return workspace_root(config_or_workspace) / "final_report.committed"
+    return final_report_scratch_dir(config_or_workspace) / "final_report.committed"
 
 
 def audits_dir(config_or_workspace) -> Path:
@@ -143,19 +144,19 @@ def final_audit_run_mode_path(config_or_workspace) -> Path:
 
 
 def final_audit_report_path(config_or_workspace) -> Path:
-    return workspace_root(config_or_workspace) / "final_audit_report.md"
+    return final_audit_dir(config_or_workspace) / "final_audit_report.md"
 
 
 def final_audit_pdf_path(config_or_workspace) -> Path:
-    return workspace_root(config_or_workspace) / "final_audit_report.pdf"
+    return final_audit_dir(config_or_workspace) / "final_audit_report.pdf"
 
 
 def final_audit_commit_marker_path(config_or_workspace) -> Path:
-    return workspace_root(config_or_workspace) / "final_audit_report.committed"
+    return final_audit_dir(config_or_workspace) / "final_audit_report.committed"
 
 
 def final_audit_summary_path(config_or_workspace) -> Path:
-    return workspace_root(config_or_workspace) / "final_audit_summary.json"
+    return final_audit_dir(config_or_workspace) / "final_audit_summary.json"
 
 
 def ensure_layout(config_or_workspace) -> None:

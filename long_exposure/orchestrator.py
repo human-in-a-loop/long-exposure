@@ -48,6 +48,7 @@ from auto_compact.proximity import (
 
 from long_exposure import pool as _pool
 from long_exposure import provider as _provider
+from long_exposure import unified_pool
 
 # ---------------------------------------------------------------------------
 # Directory setup
@@ -85,7 +86,7 @@ PHILOSOPHY_PRESETS = {
             "the client's budget. You don't gold-plate. You don't over-explore. You\n"
             "find the simplest thing that works and you ship it.\n"
             "\n"
-            "Null results and invalidated hypotheses are foundational research\n"
+            "[INVARIANT] Null results and invalidated hypotheses are foundational research\n"
             "findings — document them with the same rigor as positive results;\n"
             "they constrain the design space and prevent rediscovery in future\n"
             "cycles."
@@ -99,15 +100,15 @@ PHILOSOPHY_PRESETS = {
             "than 10 steps, you're overcomplicating it — re-scope."
         ),
         "execute_style": (
-            "Write it once, correctly. Minimal abstraction. No premature optimization.\n"
-            "Inline is better than indirect. Clear is better than clever."
+            "[PREFER] Write it once, correctly. Minimal abstraction. No premature optimization.\n"
+            "[PREFER] Inline is better than indirect. Clear is better than clever."
         ),
         "test_rigor": (
             "Verify the critical path works. One happy-path test, one obvious failure\n"
             "case. Move on. Edge cases are a luxury at this budget level."
         ),
         "doc_scope": (
-            "A brief summary of what changed and why. Three to five sentences. If\n"
+            "[PREFER] A brief summary of what changed and why. Three to five sentences. If\n"
             "someone needs more context, the code should speak for itself."
         ),
         "discomfort_signal": (
@@ -1473,22 +1474,22 @@ FRAMEWORK_PRESETS = {
 
 DEFAULT_RELEVANCE_PROFILES = {
     "efficient": {
-        "topic_weights": {"_same_topic": 1.0, "_same_subtopic": 0.5, "testing": -0.3},
+        "topic_weights": {"_same_topic": 1.0, "_same_subtopic": 0.5, "_ancestor": 0.0, "testing": -0.3},
         "tool_weights": {"_shared_tools": 0.3},
         "keyword_weights": {"breaking_change": 0.4, "constraint": 0.3, "silent_failure": 0.3},
     },
     "research": {
-        "topic_weights": {"_same_topic": 0.8, "_same_subtopic": 0.4, "_any_topic": 0.1},
+        "topic_weights": {"_same_topic": 0.8, "_same_subtopic": 0.4, "_any_topic": 0.1, "_ancestor": 0.0},
         "tool_weights": {"_shared_tools": 0.4},
         "keyword_weights": {"constraint": 0.5, "rejected_approach": 0.5, "dead_end": 0.4, "surprising": 0.3},
     },
     "audit": {
-        "topic_weights": {"_same_topic": 1.0, "_same_subtopic": 0.6},
+        "topic_weights": {"_same_topic": 1.0, "_same_subtopic": 0.6, "_ancestor": 0.0},
         "tool_weights": {"_shared_tools": 0.3},
         "keyword_weights": {"bug": 0.5, "silent_failure": 0.5, "regression": 0.4, "race_condition": 0.4, "breaking_change": 0.3},
     },
     "reporter": {
-        "topic_weights": {"_same_topic": 1.0, "_same_subtopic": 0.8, "_any_topic": 0.2},
+        "topic_weights": {"_same_topic": 1.0, "_same_subtopic": 0.8, "_any_topic": 0.2, "_ancestor": 0.0},
         "tool_weights": {"_shared_tools": 0.2},
         "keyword_weights": {"design_decision": 0.5, "constraint": 0.4, "rejected_approach": 0.4, "dead_end": 0.3, "breaking_change": 0.3, "surprising": 0.3},
     },
@@ -2655,6 +2656,31 @@ def _is_rate_limit(
     return False
 
 
+def _format_cli_failure_context(
+    *,
+    stderr: str = "",
+    stdout: str = "",
+    envelope: dict | None = None,
+    limit: int = 500,
+) -> str:
+    """Return compact non-zero CLI diagnostics without changing control flow."""
+    parts: list[str] = []
+    err = (stderr or "").strip()
+    out = (stdout or "").strip()
+    result = ""
+    if envelope:
+        raw_result = envelope.get("result")
+        if raw_result is not None:
+            result = str(raw_result).strip()
+    if err:
+        parts.append(f"stderr={err[:limit]!r}")
+    if result:
+        parts.append(f"result={result[:limit]!r}")
+    if out:
+        parts.append(f"stdout={out[:limit]!r}")
+    return "; ".join(parts) or "no stderr/stdout captured"
+
+
 def _codex_yolo_enabled(config: dict | None = None) -> bool:
     if config is None:
         return True
@@ -2993,7 +3019,7 @@ def _invoke_claude(
         if result.returncode != 0:
             raise ClaudeCliError(
                 f"codex CLI exited with code {result.returncode}: "
-                f"{(result.stderr or result.stdout)[:500]}"
+                f"{_format_cli_failure_context(stderr=result.stderr, stdout=result.stdout, envelope=envelope)}"
             )
         if envelope is None:
             raise ClaudeCliError(
@@ -3003,7 +3029,7 @@ def _invoke_claude(
         if envelope.get("is_error") is True:
             msg = (envelope.get("result") or "").strip()[:500] or "api error"
             raise ClaudeCliError(f"codex CLI API error: {msg}")
-        if acct_dir and _pool.is_active():
+        if acct_dir and unified_pool.pool_engaged():
             usage = envelope.get("usage") or {}
             if usage:
                 _pool.record_usage(acct_dir, usage)
@@ -3019,7 +3045,7 @@ def _invoke_claude(
         if result.returncode != 0:
             raise ClaudeCliError(
                 f"gemini CLI exited with code {result.returncode}: "
-                f"{(result.stderr or result.stdout)[:500]}"
+                f"{_format_cli_failure_context(stderr=result.stderr, stdout=result.stdout, envelope=envelope)}"
             )
         if envelope is None:
             raise ClaudeCliError(
@@ -3029,7 +3055,7 @@ def _invoke_claude(
         if envelope.get("is_error") is True:
             msg = (envelope.get("result") or "").strip()[:500] or "api error"
             raise ClaudeCliError(f"gemini CLI API error: {msg}")
-        if acct_dir and _pool.is_active():
+        if acct_dir and unified_pool.pool_engaged():
             usage = envelope.get("usage") or {}
             if usage:
                 _pool.record_usage(acct_dir, usage)
@@ -3053,7 +3079,8 @@ def _invoke_claude(
 
     if result.returncode != 0:
         raise ClaudeCliError(
-            f"Claude CLI exited with code {result.returncode}: {result.stderr[:500]}"
+            f"Claude CLI exited with code {result.returncode}: "
+            f"{_format_cli_failure_context(stderr=result.stderr, stdout=result.stdout, envelope=envelope)}"
         )
 
     if envelope is None:
@@ -3073,7 +3100,7 @@ def _invoke_claude(
     # point and don't count. `acct_dir` was resolved at the top of this
     # function and represents which account this call landed on.
     # Best-effort; record_usage never raises.
-    if acct_dir and _pool.is_active():
+    if acct_dir and unified_pool.pool_engaged():
         usage = envelope.get("usage") or {}
         if usage:
             _pool.record_usage(acct_dir, usage)
@@ -3542,6 +3569,7 @@ def _compute_gems(
         exclude_id=exclude_id,
         fork_scope=fork_scope,
         current_fork_id=current_fork_id,
+        ancestor_anchor_id=exclude_id,
     )
 
     if not ranked:

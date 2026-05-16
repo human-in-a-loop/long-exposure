@@ -19,12 +19,21 @@ The same pipeline of agents runs under two conditions:
 | Mode | Trigger | Consumer of artifacts |
 |---|---|---|
 | **End-of-run** | topic exhausted (low-output streak), `max_cycles` hit, operator stop / Ctrl-C | The operator; the curator's ZIP is the final handoff |
-| **Daily sync** (Stage 3) | wall-clock 24h since last sync (`loop.daily_sync_interval_hours`) at cycle boundary | The operator mid-campaign; provides continuously-updated artifacts so a multi-week run is inspectable without stopping |
+| **Daily sync** | wall-clock 24h since last sync (`loop.daily_sync_interval_hours`) at cycle boundary | The operator mid-campaign; provides continuously-updated artifacts so a multi-week run is inspectable without stopping |
 
 Both modes run the same sequence: `final_auditor → final_reporter →
 curator`. The agents detect mode implicitly via the presence of prior
 artifacts (revise mode kicks in when the artifact already exists);
 there is no explicit `--revise-mode` flag passed in.
+
+For an operator stop, the loop records that a stop was requested, exits the
+normal researcher/worker/auditor cycle, and then clears the internal stop flag
+only for the finalization pipeline. This is intentional: the final auditor and
+final reporter also poll the stop flag between stages, so leaving it set would
+make a graceful stop enter final synthesis and immediately short-circuit it.
+Clear/archive signals are the carve-out and do not run end-of-run synthesis.
+`max_cycles` is tracked as its own end-of-run condition, separate from topic
+exhaustion, and enters the same finalization gate.
 
 The periodic reporter (every `loop.report_interval` cycles, default 3)
 runs in addition. It is **not** part of the end-of-run sequence — it
@@ -94,6 +103,7 @@ The four canonical stage purposes:
 | `expected_file` | What this stage is supposed to write |
 | `rescue_warning` | Set if the previous stage's file-gate rescue fired |
 | `findings_file`, `lesson_candidates_file` | On-disk JSONL files the auditor appends to during verify/test |
+| `ledger_causal_summary` | Read-only causal summary from `tools/ledger_graph.py` |
 | `wall_cap_hit` | Boolean — true when the wall-cap timer has expired |
 
 POR + ledger are primary; without them the audit degrades to
@@ -103,9 +113,29 @@ counts, promise_check status, wall-cap flag) and injects it as
 `final_audit_headline` so the reporter has a reliable summary line
 even if JSON parsing fails.
 
+The ledger causal summary is best-effort. If the ledger is missing or malformed,
+the injected value is an empty string and the final auditor proceeds normally.
+
+### Ledger causal summary
+
+`long_exposure/tools/ledger_graph.py` builds a read-only graph view of
+`promise_ledger.jsonl` for final stages. It summarizes:
+
+- event/milestone counts,
+- supersedes, citation, and dependency edge counts,
+- causal chains to recently validated milestones,
+- contradiction clusters where a milestone is validated then invalidated
+  without an intervening `reopened`,
+- top cited evidence files/events.
+
+Reserved namespaces such as `_manager/` are ignored for contradiction
+clusters. The graph does not infer speculative bridge events across independent
+milestone chains; it only reports edges explicitly present in the ledger. This
+keeps final-stage summaries useful without inventing causal claims.
+
 ### Outputs
 
-`<workspace>/final_audit_report.md` — the narrative. Sections (per
+`<workspace>/audits/final/final_audit_report.md` — the narrative. Sections (per
 the role text):
 
 - Findings by severity (CRITICAL / MODERATE / MINOR)
@@ -116,7 +146,7 @@ the role text):
 - Reconciliation log (silent supersessions made explicit; silent
   edits surfaced)
 
-`<workspace>/final_audit_summary.json` — structured machine-readable
+`<workspace>/audits/final/final_audit_summary.json` — structured machine-readable
 record of the same content. Schema:
 
 ```json
@@ -207,7 +237,7 @@ total_stages = 1 + num_body_stages + 1
             = outline → body×N → finalize
 ```
 
-The hard cap on N (was 10) was removed in Stage 3 for multi-day runs
+The hard cap on N was removed for multi-day runs
 that accumulate ~1M tokens of prior reports. Wall-cap (10h) is the
 real ceiling.
 
@@ -217,7 +247,7 @@ real ceiling.
 |---|---|
 | **outline** (1) | `<workspace>/reports/final/outline.md` — narrative skeleton |
 | **body** (×N) | Appends sections to `<workspace>/reports/final/draft.md` |
-| **finalize** (1) | Consolidates draft into `<workspace>/final_report.md` |
+| **finalize** (1) | Consolidates draft into `<workspace>/reports/final/final_report.md` |
 
 The reporter's session persists across stages (each stage is one
 `claude -p` call with `--resume` on the previous session UUID).
@@ -235,15 +265,17 @@ Auto-compact within the reporter's session triggers at 90% as usual.
 | `working_dir` | workspace root |
 | `final_audit_summary` | the JSON from the final auditor |
 | `final_audit_headline` | the one-line headline computed by the harness |
+| `ledger_causal_summary` | same read-only ledger graph summary available to the auditor |
 | `wall_cap_hit` | boolean |
 
 ### Outputs
 
-- `<workspace>/final_report.md` — canonical synthesis.
-- `<workspace>/final_report.pdf` — rendered via `render_pdf`.
+- `<workspace>/reports/final/final_report.md` — canonical synthesis.
+- `<workspace>/reports/final/final_report.pdf` — rendered via `render_pdf`.
 
-`final_report.md` is contractual at workspace root (curator + curator
-contract expects it there; org_check tolerates this).
+The curator accepts legacy root-relative manifest entries for backward
+compatibility, but new canonical final report artifacts are routed through
+`reports/final/`.
 
 ---
 
@@ -289,8 +321,7 @@ hard exclude list:
 - Intermediate drafts under `reports/final/`.
 - Previous packages: `<slug>_package*.zip`.
 
-Entries with `role: figure` are staged under `figures/` in the bundle
-(per Plan 06).
+Entries with `role: figure` are staged under `figures/` in the bundle.
 
 ### Fallback to safety package
 
@@ -299,12 +330,14 @@ harness falls back to a minimal "safety package" containing
 report-only artifacts: `final_report.{md,pdf}`,
 `final_audit_report.{md,pdf}`, `final_audit_summary.json`,
 `MANIFEST.md`, `REFERENCES.md`, `CURATION.yaml` (the failed attempt
-preserved as audit trail). The bundle always ships; coverage degrades
+preserved as audit trail). Source files are read from `reports/final/`
+and `audits/final/` before being staged under `report/` in the bundle.
+The bundle always ships; coverage degrades
 gracefully.
 
 ---
 
-## Daily sync (Stage 3)
+## Daily sync
 
 End-of-run vs daily-sync are the same agent pipeline running under
 different triggering. The daily-sync trigger:
@@ -330,7 +363,7 @@ in clock units; the model makes its work-based decisions in cycles.
 Each agent detects revise mode by the existence of its prior
 artifact:
 
-- **Final auditor**: if `final_audit_report.md` exists, agent reads
+- **Final auditor**: if `audits/final/final_audit_report.md` exists, agent reads
   prior + delta inputs (ledger events since last sync, mtime-filtered)
   and produces a revised version.
 - **Final reporter**: same pattern; mtime-filters
@@ -344,8 +377,8 @@ selects `p.stat().st_mtime > last_sync_epoch`.
 
 | Agent | If it fails |
 |---|---|
-| Final auditor | Skip; keep prior `final_audit_summary.json`; reporter still runs with last good summary |
-| Final reporter | File-gate rescue; if rescue also fails, keep prior `final_report.md` and log warning |
+| Final auditor | Skip; keep prior `audits/final/final_audit_summary.json`; reporter still runs with last good summary |
+| Final reporter | File-gate rescue; if rescue also fails, keep prior `reports/final/final_report.md` and log warning |
 | Curator | Keep prior bundle and symlink; log warning |
 
 In all cases: log failure, clear the in-progress flag, advance
@@ -353,7 +386,7 @@ In all cases: log failure, clear the in-progress flag, advance
 design — the operator still has the last good artifacts and the run
 keeps cycling.
 
-### Per-account usage delta print (Plan A)
+### Per-account usage delta print
 
 `_run_daily_sync` snapshots per-account token totals at sync entry
 (`_snapshot_account_usage()`) and prints a delta + share % at sync
@@ -374,7 +407,7 @@ Example:
 Pool inactive (single-account or pinned-without-pool): the snapshot
 helper returns `{}` and the print is a silent no-op.
 
-### Planned 24h rotation hook (Plan B)
+### Planned 24h rotation hook
 
 Immediately after the daily-sync `finally` clause completes (state
 saved with `daily_sync_in_progress=False`), the cycle loop runs a
@@ -392,13 +425,13 @@ Gates: `pool.is_active()` AND `not _is_clone()` AND
 The block calls `pool.promote_fresh()`. On a non-None return it does
 THREE things, all load-bearing:
 
-1. **`os.environ["CLAUDE_FORCE_ACCOUNT"] = new_primary`** — without
-   this, the parent's `_active_account_dir()` reads the old pinned
-   value and continues sending API calls to the old primary.
-2. **`agent_sessions.clear()`** — Claude session UUIDs are
-   per-account; resuming an old account's UUID on the new account
-   fails. Forcing fresh sessions on the next cycle is the only way
-   to make the rotation effective.
+1. **Set the provider-specific force-account env to `new_primary`** —
+   without this, the parent's active-account helper reads the old pinned
+   value and continues sending calls to the old primary.
+2. **`agent_sessions.clear()`** — provider-native session IDs are
+   per-account; resuming an old account's session on the new account can
+   fail. Forcing fresh sessions on the next cycle is the only way to make
+   the rotation effective.
 3. **`health_events.append_event("planned_rotation", ...)`** —
    informational event for operator observability.
 
@@ -419,7 +452,7 @@ mechanics + gates analysis.
 
 ---
 
-## Cross-cutting lessons (Plan 5)
+## Cross-cutting lessons
 
 The final auditor's document stage emits durable cross-run findings
 as `record_type='lesson'` rows in `sessions.db`. Lessons are surfaced
@@ -480,20 +513,21 @@ idempotent commit) are unit-tested.
 
 ---
 
-## PDF rendering (Stage 8 — unified)
+## PDF rendering
 
 `report_formatting.normalize_report_markdown` and
 `reporting.render_pdf(working_dir, stem)` are the canonical report
 formatting path, used for:
 
-- `final_report.{md,pdf}`
-- `final_audit_report.{md,pdf}`
+- `reports/final/final_report.{md,pdf}`
+- `audits/final/final_audit_report.{md,pdf}`
 - `report_cycles_NNN-MMM.{md,pdf}` (periodic reporter)
 
 ### Pandoc command
 
 ```
 pandoc <stem>.md
+  --from markdown+autolink_bare_uris
   -o <stem>.pdf
   --pdf-engine=tectonic
   --resource-path <workspace>:<report-dir>:.
@@ -517,6 +551,12 @@ Before rendering, Markdown is normalized deterministically:
   `toc-depth: 2`, `numbersections: false`, and `fontsize: 10pt`.
 - Blank lines are inserted before ATX headings outside fenced code blocks,
   preventing Pandoc from swallowing headings into preceding lists.
+- Bare `http://` and `https://` references are parsed as autolinks, so
+  Pandoc emits URL-aware LaTeX instead of unbreakable plain text.
+- Local SVG image embeds are sanitized on the temporary PDF input only:
+  if a same-stem PNG exists it is used for PDF rendering; otherwise the
+  SVG image embed becomes a normal artifact link. The canonical Markdown
+  report is not rewritten.
 
 `header.tex` is written as a temporary include and removed after render.
 Its LaTeX preamble includes:
@@ -530,10 +570,12 @@ Its LaTeX preamble includes:
 
 `render_pdf` returns `False` on subprocess failure or missing input.
 Markdown is always intact. The harness logs and surfaces an
-off-nominal event (`pdf_render_failed`). If pandoc / tectonic is
-missing from PATH, the event records `rc=127` explicitly. The PDF is
-a convenience artifact, not the source of truth — the markdown report
-is canonical.
+off-nominal event (`pdf_render_failed`). If pandoc, tectonic, or the
+runtime renderer is missing from PATH, the event records the failed render.
+SVG conversion is not a required baseline dependency: local SVG embeds are
+converted to same-stem PNG references when available, or downgraded to artifact
+links in the temporary PDF input. The PDF is a convenience artifact, not the
+source of truth — the markdown report is canonical.
 
 ---
 
@@ -563,7 +605,7 @@ would silently lose downstream consumers.
    trigger differs.
 2. The agent sequence is fixed: `final_auditor → final_reporter →
    curator`. Each is best-effort; failure of one doesn't block the
-   next.
+   next, and final-stage exceptions are caught before state/status are saved.
 3. Reconciliation events commit transactionally at the auditor's
    document stage; never incrementally. UUIDv5-based dedup makes the
    commit idempotent on resume.
@@ -580,22 +622,25 @@ would silently lose downstream consumers.
    per-run cap of `max(1, ceil(cycles / 3))`.
 10. Curator falls back to a report-only safety package on
     `CURATION.yaml` failure — the bundle always ships.
+11. A normal operator stop and a `max_cycles` exit are graceful end-of-run
+    requests. After final synthesis completes, the status file is written as
+    `completed`. A clear/archive request remains `cleared` and skips
+    synthesis.
 
 ---
 
-## Code citations
+## Code references
 
-- Periodic reporter: `reporting.py:325–370` (entry point), `reporting._run_reporter`.
-- Final reporter: `reporting._run_final_reporter`, `reporting.py:341–474`.
-- Final auditor: `auditing._run_final_auditor`, `auditing.py:560–818`.
-- Curator: `curator.py:279–456` (build), `curator.py:308–334` (safety package fallback).
-- File-gate rescue: `reporting.py:187–214`, `auditing.py:700–718`.
+- Periodic reporter: `reporting.py` (`_run_reporter`).
+- Final reporter: `reporting.py` (`_run_final_reporter`).
+- Final auditor: `auditing.py` (`_run_final_auditor`).
+- Curator: `curator.py` (build path and safety package fallback).
+- File-gate rescue: `reporting.py` and `auditing.py`.
 - Daily-sync trigger: `exploration.py:_run_daily_sync`,
-  `exploration.py:2808–2853`. Crash-recovery clear:
-  `exploration.py:1947–1959`.
+  `exploration.py`. Crash-recovery clear: `exploration.py`.
 - `WALL_CAP_SECONDS`: `long_exposure/limits.py`.
-- `render_pdf`: `reporting.py:258–322`.
-- Reconciliation event commit: `auditing.py:743–755`.
-- Lesson emission: `auditing._commit_lessons`, `auditing.py:757–765`.
+- `render_pdf`: `reporting.py`.
+- Reconciliation event commit: `auditing.py`.
+- Lesson emission: `auditing._commit_lessons`.
 - Audit summary headline: `reporting._load_audit_summary` (returns
-  parsed text and one-line headline; `reporting.py:107–151`).
+  parsed text and one-line headline).

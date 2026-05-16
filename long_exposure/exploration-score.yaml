@@ -87,6 +87,12 @@ allowed_tools:
   - "Bash(wolfram-batch *)"
   - "Bash(wolfram *)"
   - "Bash(wolframscript *)"
+  - "Bash(gap *)"
+  - "Bash(lean *)"
+  - "Bash(lake *)"
+  - "Bash(pdflatex *)"
+  - "Bash(pandoc *)"
+  - "Bash(tectonic *)"
   # Python — path-independent. Bare forms match PATH-resolved invocations;
   # */ forms match absolute or nested paths (venv interpreters, wrappers).
   # Verified greedy across `/` — a single `*` covers arbitrary-depth prefixes.
@@ -143,7 +149,7 @@ agents:
       cycle (if any).
 
       <authority-and-commitment>
-      You have full research authority within the directive. Your cycle's
+      You have full research authority within the directive. [INVARIANT] Your cycle's
       deliverable is advancement. Mechanism analysis counts as advancement;
       empirical retries without an associated mechanism statement do not.
       An analytical mechanism statement, a falsifiability criterion derived
@@ -222,7 +228,7 @@ agents:
       add it to STRUCTURE.md's "Domain folders" section and emit a
       `_plan/<change>` ledger event.
 
-      You may use mkdir/ls/mv/cp via Bash. Never delete files — only add,
+      [INVARIANT] You may use mkdir/ls/mv/cp via Bash. Never delete files — only add,
       move, or copy. Move stale artifacts to the nearest stale/ folder
       (root or domain-internal). On scope changes, update plan_of_record.md
       AND emit a `_plan/<descriptive-change-name>` ledger event so the
@@ -426,7 +432,7 @@ agents:
 
       Do not write to workspace root. If unsure, prefer a domain folder
       over the root. You may use mkdir/ls/mv/cp via Bash. Never delete.
-      Move stale artifacts to the nearest stale/ folder.
+      [INVARIANT] Move stale artifacts to the nearest stale/ folder.
       </file-organization>
 
       <artifact-tracking>
@@ -703,7 +709,7 @@ agents:
         write separate files for in-cycle audit output
       - closure letters at campaign level → docs/
 
-      You may invoke tools/promise_check and tools/org_check via Bash.
+      [INVARIANT] You may invoke tools/promise_check and tools/org_check via Bash.
       Surface findings in audit_report. You may use mkdir/ls/mv/cp;
       never delete; move stale artifacts to stale/.
       </file-organization>
@@ -843,11 +849,16 @@ agents:
       - "Bash(/usr/local/bin/wolfram *)"
       - "Bash(wolfram *)"
       - "Bash(wolframscript *)"
+      - "Bash(gap *)"
+      - "Bash(lean *)"
+      - "Bash(lake *)"
       - "Bash(python3 *)"
       - "Bash(python *)"
       - "Bash(pip3 *)"
       - "Bash(pip *)"
       - "Bash(pandoc *)"
+      - "Bash(pdflatex *)"
+      - "Bash(tectonic *)"
       - "Bash(figure *)"
       - WebSearch
     inputs: [directive, cycle_range, audit_report, cycle_sessions, report_basename, working_dir]
@@ -1078,14 +1089,19 @@ agents:
       - "Bash(/usr/local/bin/wolfram *)"
       - "Bash(wolfram *)"
       - "Bash(wolframscript *)"
+      - "Bash(gap *)"
+      - "Bash(lean *)"
+      - "Bash(lake *)"
       - "Bash(python3 *)"
       - "Bash(python *)"
       - "Bash(pip3 *)"
       - "Bash(pip *)"
       - "Bash(pandoc *)"
+      - "Bash(pdflatex *)"
+      - "Bash(tectonic *)"
       - "Bash(figure *)"
       - WebSearch
-    inputs: [directive, stage, total_stages, expected_file, rescue_warning, outline_path, draft_path, final_report_path, report_glob, final_report_dir, prior_reports, working_dir, final_audit_summary, final_audit_headline, wall_cap_hit]
+    inputs: [directive, stage, total_stages, expected_file, rescue_warning, outline_path, draft_path, final_report_path, report_glob, final_report_dir, prior_reports, working_dir, final_audit_summary, final_audit_headline, ledger_causal_summary, wall_cap_hit]
     outputs: [final_report_stage]
     role: |
       You are the final reporter. You produce a comprehensive synthesis
@@ -1105,14 +1121,14 @@ agents:
       </content-scope>
 
       <file-organization>
-      final_report.md and final_report.pdf are written to the workspace by
-      the orchestrator — your task is composition, not file placement.
-      Intermediate outline and draft files live under the path named in
-      [INPUT: final_report_dir].
-      MANIFEST.md is updated in place at workspace root. final_audit_report.md
-      and final_audit_summary.json (from the final auditor) are produced by
-      that agent and read into your prompt as the `final_audit_summary` input;
-      do not re-author them.
+      final_report.md and final_report.pdf are written under
+      [INPUT: final_report_dir] by the orchestrator — your task is
+      composition, not file placement. Intermediate outline and draft
+      files also live under the path named in [INPUT: final_report_dir].
+      MANIFEST.md is updated in place at workspace root.
+      final_audit_report.md and final_audit_summary.json (from the final
+      auditor) are produced under audits/final/ and read into your prompt
+      as the `final_audit_summary` input; do not re-author them.
       </file-organization>
 
       <audit-summary>
@@ -1148,6 +1164,13 @@ agents:
       body content. Note this near the top of the report's frontmatter or
       conclusions section.
       </audit-summary>
+
+      <ledger-causal-summary>
+      The [INPUT: ledger_causal_summary] block contains structured causal
+      chains and contradiction clusters derived from promise_ledger.jsonl.
+      Use it as the narrative spine for validated milestones when present.
+      Empty means the ledger had no qualifying graph content.
+      </ledger-causal-summary>
 
       <file-writing-requirement>
       CRITICAL REQUIREMENT — READ THIS BEFORE EVERY STAGE:
@@ -1324,14 +1347,19 @@ agents:
       - "Bash(/usr/local/bin/wolfram *)"
       - "Bash(wolfram *)"
       - "Bash(wolframscript *)"
+      - "Bash(gap *)"
+      - "Bash(lean *)"
+      - "Bash(lake *)"
       - "Bash(python3 *)"
       - "Bash(python *)"
       - "Bash(pip3 *)"
       - "Bash(pip *)"
       - "Bash(pandoc *)"
+      - "Bash(pdflatex *)"
+      - "Bash(tectonic *)"
       - "Bash(figure *)"
       - WebSearch
-    inputs: [directive, plan_of_record, promise_ledger_summary, working_dir, stage, total_stages, stage_index, expected_file, rescue_warning, findings_file, lesson_candidates_file, report_glob, audit_dir, wall_cap_hit]
+    inputs: [directive, plan_of_record, promise_ledger_summary, ledger_causal_summary, working_dir, stage, total_stages, stage_index, expected_file, rescue_warning, findings_file, lesson_candidates_file, report_glob, audit_dir, wall_cap_hit]
     outputs: [final_audit_stage]
     staging:
       enabled: true
@@ -1366,7 +1394,8 @@ agents:
 
       <file-organization>
       final_audit_report.md, final_audit_report.pdf, and
-      final_audit_summary.json are the canonical outputs. The
+      final_audit_summary.json are the canonical outputs under
+      [INPUT: audit_dir]. The
       orchestrator renders the PDF after your document stage; do NOT
       attempt PDF rendering yourself. Stage-intermediate files
       live under [INPUT: audit_dir]; findings are appended to
@@ -1391,6 +1420,23 @@ agents:
       The [OUTPUT] block is a status receipt ONLY (2-3 lines). Audit
       content goes into files.
       </file-writing-requirement>
+
+      <ledger-causal-summary>
+      The [INPUT: ledger_causal_summary] block contains structured causal
+      chains and contradiction clusters derived from promise_ledger.jsonl.
+      Investigate every Contradictions entry; use validated chains to check
+      whether closure claims are causally supported. Empty means no qualifying
+      graph content was available.
+      </ledger-causal-summary>
+
+      <codex-tool-dispatch-guard>
+      When running under Codex, do not emit multiple shell/tool calls in
+      one assistant turn. Bundle simple existence checks, validators, and
+      file reads into a single Bash command per phase, then wait for that
+      command's result before issuing another tool call. This avoids a
+      known Codex CLI dead state where several simultaneous tool calls
+      are emitted but no tool output is returned.
+      </codex-tool-dispatch-guard>
 
       <rescue-feedback>
       The [INPUT: rescue_warning] block reports whether the previous
@@ -1448,15 +1494,16 @@ agents:
         - Read [INPUT: findings_file]. Deduplicate; the harness
           batch-commits all `reconcile: true` entries as ledger events
           with `agent: "final_auditor"` after this stage.
-        - WRITE final_audit_report.md (sections below).
-        - WRITE final_audit_summary.json (schema below).
+        - WRITE [INPUT: expected_file] as final_audit_report.md.
+        - WRITE final_audit_summary.json under [INPUT: audit_dir] (schema below).
         - APPEND lesson candidates to [INPUT: lesson_candidates_file]. The
           harness enforces a deterministic cap of
           `max(1, ceil(total_cycles / 3))` and commits in your stated
           order — rank confidence first, then evidence_count, then
           signal density.
         - GATE: final_audit_report.md AND final_audit_summary.json must
-          both exist after this stage. PDF is rendered automatically.
+          both exist under [INPUT: audit_dir] after this stage. PDF is
+          rendered automatically.
       </stage-protocol>
 
       <report-sections>
@@ -1605,15 +1652,15 @@ agents:
       1. MANIFEST.md — especially the "## Key Files" section, which the
          final reporter has already curated for you. This is your
          primary input.
-      2. final_report.md — for the package description and to
+      2. reports/final/final_report.md — for the package description and to
          cross-check any ambiguous entries.
       3. REFERENCES.md — to confirm it exists.
 
       You may use Glob to list filenames to confirm a path exists.
       Do NOT Read individual .wls / .py / .ipynb / other code files —
       MANIFEST.md is authoritative for what each script does.
-      Do NOT read files under reports/final/ or any report_cycles_*.md
-      (these are process artifacts, not results).
+      Do NOT read intermediate drafts under reports/final/ or any
+      report_cycles_*.md (these are process artifacts, not results).
       </context-budget>
 
       <clone-artifacts>
@@ -1636,8 +1683,8 @@ agents:
 
       <include-policy>
       The package MUST include (always):
-      - final_report.md
-      - final_report.pdf (if it exists on disk)
+      - reports/final/final_report.md
+      - reports/final/final_report.pdf (if it exists on disk)
       - MANIFEST.md
       - REFERENCES.md (if it exists on disk)
 
@@ -1650,7 +1697,7 @@ agents:
 
       The package MUST NOT include:
       - Per-cycle reports: report_cycles_*.md, any report_cycles_*.pdf
-      - Intermediate drafts under reports/final/
+      - Intermediate drafts under reports/final/ (outline.md and draft.md)
       - Session/log files: sessions.db, exploration.log,
         exploration_state.json, exploration.stop, exploration.clear,
         exploration.guide, long-exposure.stop, long-exposure.clear,
@@ -1676,10 +1723,10 @@ agents:
              package contains, what the user can do with it.>
           curation_complete: <true|false>
           include:
-            - src: final_report.md
+            - src: reports/final/final_report.md
               dest: report/final_report.md
               role: report
-            - src: final_report.pdf
+            - src: reports/final/final_report.pdf
               dest: report/final_report.pdf
               role: report
             - src: MANIFEST.md
