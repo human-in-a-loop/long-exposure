@@ -149,6 +149,16 @@ class UnifiedPoolTests(unittest.TestCase):
         rotate.assert_called_once()
         self.assertEqual(sessions, {})
 
+    def test_unified_fanout_cap_sums_remaining_branch_slots(self):
+        available = {"claude": 3, "codex": 5}
+
+        def slots():
+            return available[os.environ["LONG_EXPOSURE_LLM_PROVIDER"]]
+
+        with patch.dict(os.environ, {"CLAUDE_ACCOUNT_POOL": "/a", "CODEX_ACCOUNT_POOL": "/b"}, clear=True):
+            with patch("long_exposure.unified_pool.pool.available_slots", side_effect=slots):
+                self.assertEqual(unified_pool.fanout_cap(), 8)
+
 
 if __name__ == "__main__":
     unittest.main()

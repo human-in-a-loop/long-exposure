@@ -17,9 +17,11 @@ import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import xml.etree.ElementTree as _ET
 from urllib.error import HTTPError, URLError
@@ -100,15 +102,15 @@ PHILOSOPHY_PRESETS = {
             "than 10 steps, you're overcomplicating it — re-scope."
         ),
         "execute_style": (
-            "[PREFER] Write it once, correctly. Minimal abstraction. No premature optimization.\n"
-            "[PREFER] Inline is better than indirect. Clear is better than clever."
+            "Write it once, correctly. Minimal abstraction. No premature optimization.\n"
+            "Inline is better than indirect. Clear is better than clever."
         ),
         "test_rigor": (
             "Verify the critical path works. One happy-path test, one obvious failure\n"
             "case. Move on. Edge cases are a luxury at this budget level."
         ),
         "doc_scope": (
-            "[PREFER] A brief summary of what changed and why. Three to five sentences. If\n"
+            "A brief summary of what changed and why. Three to five sentences. If\n"
             "someone needs more context, the code should speak for itself."
         ),
         "discomfort_signal": (
@@ -347,7 +349,17 @@ PHILOSOPHY_PRESETS = {
             "Every step is explained. Every decision is traced to its origin.\n"
             "Jargon is defined on first use. The report is self-contained: a\n"
             "reader should never need to consult the raw sessions to understand\n"
-            "what happened and why."
+            "what happened and why.\n\n"
+            "[INVARIANT] You write for a human reader who is a domain expert\n"
+            "in the field of the directive but has no knowledge of this\n"
+            "system's internal process, terminology, or artifacts. Keep all\n"
+            "domain jargon the field uses (mathematical notation,\n"
+            "field-standard acronyms, established results); translate every\n"
+            "process artifact term (validators, ledger statuses, milestone\n"
+            "IDs, cycle numbers, session IDs, wall-caps, compaction, audit\n"
+            "severity buckets) into plain English at the point of use. The\n"
+            "reader should be unable to tell from the prose that this report\n"
+            "was produced by a multi-cycle, multi-agent harness."
         ),
         "explore_depth": (
             "Be exhaustive in GATHERING, not in analyzing. Read every relevant\n"
@@ -378,7 +390,10 @@ PHILOSOPHY_PRESETS = {
             "state the decision first, then the rationale.\n\n"
             "Do not editorialize. Do not add qualifiers like 'interestingly'\n"
             "or 'surprisingly.' Report the facts and let the reader draw\n"
-            "conclusions. If something IS surprising, the facts will show it."
+            "conclusions. Inventories of more than ~5 items belong in a bullet\n"
+            "list or table, not in a sentence. If a sentence is enumerating six\n"
+            "or more distinct things, restructure. If something IS surprising,\n"
+            "the facts will show it."
         ),
         "test_rigor": (
             "Read the report as if you have never seen the project. Does it\n"
@@ -403,6 +418,10 @@ PHILOSOPHY_PRESETS = {
             "  source material. Go back and gather first.\n"
             "- A section requires the reader to have context that is not\n"
             "  provided earlier in the report. Add the context or restructure.\n"
+            "- You are using a term that depends on a concept this report has\n"
+            "  not yet introduced. Forward references force the reader to fill\n"
+            "  gaps. Define the prerequisite first, then build up — even when\n"
+            "  the term is field-standard.\n"
             "- You are spending tokens on analysis or judgment instead of\n"
             "  narration and organization. Stay in reporter mode."
         ),
@@ -1536,6 +1555,7 @@ def load_config(path: str | Path | None = None) -> dict:
         "codex_subagents": {"max_threads": 3, "max_depth": 1},
         "model_tier": "opus",
         "compact_threshold": 0.90,
+        "reanchor_enabled": True,
         "compact_db": "./data/sessions.db",
         "max_summary_pct": 0.15,
         "depth_compression": "gentle",
@@ -1548,6 +1568,8 @@ def load_config(path: str | Path | None = None) -> dict:
         "working_directory": "",
         "allowed_tools": ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "WebSearch"],
         "cli_timeout": 0,
+        "provider_idle_timeout_seconds": 1800,
+        "provider_idle_poll_seconds": 10,
         "context_proximity": dict(DEFAULT_CONTEXT_PROXIMITY),
         "relevance_profiles": dict(DEFAULT_RELEVANCE_PROFILES),
         "telemetry": {
@@ -2753,6 +2775,208 @@ def _is_gemini_command(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "gemini"
 
 
+def _proc_stat(pid: int) -> tuple[int, int] | None:
+    """Return (ppid, cpu_ticks) from /proc, or None if the process is gone."""
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    try:
+        rparen = text.rindex(")")
+        fields = text[rparen + 2:].split()
+        ppid = int(fields[1])
+        utime = int(fields[11])
+        stime = int(fields[12])
+        return ppid, utime + stime
+    except (ValueError, IndexError):
+        return None
+
+
+def _proc_comm(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _provider_process_activity(root_pid: int) -> tuple[int, int, bool]:
+    """Return (tree_size, cpu_ticks, has_external_child)."""
+    children: dict[int, list[int]] = {}
+    stats: dict[int, int] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        stat = _proc_stat(pid)
+        if stat is None:
+            continue
+        ppid, ticks = stat
+        children.setdefault(ppid, []).append(pid)
+        stats[pid] = ticks
+
+    stack = [root_pid]
+    seen: set[int] = set()
+    total_ticks = 0
+    external_child = False
+    provider_names = {"claude", "codex", "node", "gemini"}
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total_ticks += stats.get(pid, 0)
+        if pid != root_pid:
+            comm = _proc_comm(pid)
+            if comm and comm not in provider_names:
+                external_child = True
+        stack.extend(children.get(pid, []))
+    return len(seen), total_ticks, external_child
+
+
+def _file_progress_signature(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
+    sig: list[tuple[str, int, int]] = []
+    for path in paths:
+        try:
+            st = path.stat()
+        except OSError:
+            sig.append((str(path), -1, -1))
+            continue
+        sig.append((str(path), int(st.st_size), int(st.st_mtime_ns)))
+    return tuple(sig)
+
+
+def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float = 10.0) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    if proc.poll() is not None:
+        return
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace_seconds
+    while proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.2)
+    if proc.poll() is not None:
+        return
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+
+
+def _run_cli_subprocess(
+    cmd: list[str],
+    *,
+    stdin_text: str,
+    cwd: str | None,
+    env: dict,
+    timeout: int | None,
+    output_file: Path | None = None,
+    idle_timeout: int | None = None,
+    idle_poll: int | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a provider CLI with a hard timeout plus a no-progress watchdog."""
+    idle_timeout = int(idle_timeout or 0)
+    idle_poll = max(1, int(idle_poll or 10))
+    start = time.monotonic()
+    stdout_tmp = tempfile.NamedTemporaryFile(delete=False)
+    stderr_tmp = tempfile.NamedTemporaryFile(delete=False)
+    stdout_path = Path(stdout_tmp.name)
+    stderr_path = Path(stderr_tmp.name)
+    stdout_tmp.close()
+    stderr_tmp.close()
+
+    stdout_handle = open(stdout_path, "w", encoding="utf-8")
+    stderr_handle = open(stderr_path, "w", encoding="utf-8")
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=stdout_handle,
+        stderr=stderr_handle,
+        text=True,
+        cwd=cwd or "/tmp",
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        if proc.stdin is not None:
+            try:
+                proc.stdin.write(stdin_text)
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+
+        progress_paths = [stdout_path, stderr_path]
+        if output_file is not None:
+            progress_paths.append(output_file)
+        last_sig = _file_progress_signature(progress_paths)
+        last_tree = _provider_process_activity(proc.pid)
+        last_tree_shape = (last_tree[0], last_tree[2])
+        last_progress = time.monotonic()
+
+        while proc.poll() is None:
+            now = time.monotonic()
+            if timeout and (now - start) >= timeout:
+                _terminate_process_group(proc)
+                raise subprocess.TimeoutExpired(cmd, timeout)
+
+            sig = _file_progress_signature(progress_paths)
+            tree = _provider_process_activity(proc.pid)
+            has_external_child = tree[2]
+            tree_shape = (tree[0], tree[2])
+            if sig != last_sig or has_external_child or tree_shape != last_tree_shape:
+                last_progress = now
+                last_sig = sig
+                last_tree = tree
+                last_tree_shape = tree_shape
+            elif idle_timeout and (now - last_progress) >= idle_timeout:
+                _terminate_process_group(proc)
+                raise subprocess.TimeoutExpired(
+                    cmd,
+                    int(now - start),
+                    output=(
+                        f"provider CLI idle timeout after {idle_timeout}s "
+                        "with no stdout/stderr/output-file progress or external child tool"
+                    ),
+                )
+            else:
+                last_tree = tree
+            sleep_for = idle_poll
+            if timeout:
+                remaining = max(0.1, timeout - (time.monotonic() - start))
+                sleep_for = min(sleep_for, remaining)
+            time.sleep(sleep_for)
+
+        stdout_handle.close()
+        stderr_handle.close()
+        stdout = stdout_path.read_text(errors="replace")
+        stderr = stderr_path.read_text(errors="replace")
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    finally:
+        for stream in (stdout_handle, stderr_handle, proc.stdin):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+        if proc.poll() is None:
+            _terminate_process_group(proc)
+        for path in (stdout_path, stderr_path):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def _extract_codex_envelope(stdout: str, final_text: str, duration_ms: int) -> dict | None:
     thread_id = None
     usage = {}
@@ -2940,6 +3164,8 @@ def _invoke_claude(
     env_base: dict | None = None,
     cwd: str | None = None,
     timeout: int | None = None,
+    idle_timeout: int | None = None,
+    idle_poll: int | None = None,
 ) -> dict:
     """Run one `claude -p` subprocess against the currently active account.
 
@@ -2980,14 +3206,15 @@ def _invoke_claude(
     started = datetime.now(timezone.utc)
 
     try:
-        result = subprocess.run(
+        result = _run_cli_subprocess(
             cmd,
-            input=stdin_text,
-            capture_output=True,
-            text=True,
+            stdin_text=stdin_text,
+            output_file=output_file,
             timeout=timeout or None,
             cwd=cwd or "/tmp",
             env=env,
+            idle_timeout=idle_timeout,
+            idle_poll=idle_poll,
         )
     except subprocess.TimeoutExpired as e:
         if output_file:

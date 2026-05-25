@@ -26,6 +26,11 @@ long_exposure/output/*
 .long-exposure/
 sources/data/
 agent_workspace/
+instances/
+run-configs/
+*.db
+*.sqlite
+*.sqlite3
 
 # Logs (any pattern, anywhere in the repo)
 *.log

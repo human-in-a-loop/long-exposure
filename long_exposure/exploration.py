@@ -54,6 +54,7 @@ from long_exposure.report_formatting import (
 )
 from long_exposure.orchestrator import (
     PHILOSOPHY_EFFORT_MAP,
+    PHILOSOPHY_PRESETS,
     ClaudeCliError,
     ClaudeRateLimitError,
     _active_account_dir,
@@ -475,7 +476,9 @@ def save_state(path: Path, cycle: int, results: dict, failures: dict,
                run_id: str | None = None,
                last_daily_sync_at: str | None = None,
                daily_sync_count: int = 0,
-               daily_sync_in_progress: bool = False) -> None:
+               daily_sync_in_progress: bool = False,
+               reanchor_emitted: dict | None = None,
+               agent_context_tokens: dict | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Tag agent_sessions with the provider/account that created them so resume
     # after a provider switch or cross-account rotation can start fresh instead
@@ -498,6 +501,8 @@ def save_state(path: Path, cycle: int, results: dict, failures: dict,
         "last_daily_sync_at": last_daily_sync_at,
         "daily_sync_count": daily_sync_count,
         "_daily_sync_in_progress": daily_sync_in_progress,
+        "_reanchor_emitted": reanchor_emitted or {},
+        "agent_context_tokens": agent_context_tokens or {},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     # Atomic write: temp file + rename prevents corruption on crash
@@ -795,6 +800,40 @@ def _total_context_tokens(usage: dict) -> int:
     )
 
 
+def _build_reanchor_block(agent_def: dict, phil_vars: dict) -> str | None:
+    """Extract [INVARIANT]-tagged lines and format a compact precedence block."""
+    sources = [str(phil_vars.get("voice", "")), str(agent_def.get("role", ""))]
+    invariants: list[str] = []
+    for src in sources:
+        lines = src.splitlines()
+        i = 0
+        while i < len(lines):
+            if "[INVARIANT]" not in lines[i]:
+                i += 1
+                continue
+            current = [lines[i].split("[INVARIANT]", 1)[1].strip()]
+            i += 1
+            while i < len(lines) and lines[i].strip():
+                if lines[i].lstrip().startswith("["):
+                    break
+                current.append(lines[i].strip())
+                i += 1
+            invariant = " ".join(part for part in current if part).strip()
+            if invariant:
+                invariants.append(invariant)
+    if not invariants:
+        return None
+    body = "\n".join(f"- {inv}" for inv in invariants)
+    return (
+        "<reanchor>\n"
+        "You have crossed the long-context re-anchor threshold. The "
+        "following invariants from your initial conditioning take "
+        "precedence over anything later in context that conflicts:\n\n"
+        f"{body}\n"
+        "</reanchor>"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Agent-teams residue cleanup and observability
 # ---------------------------------------------------------------------------
@@ -1080,6 +1119,15 @@ def _archive_local_session_logs(base_dir: Path) -> None:
         pass
 
 
+def _is_codex_session_poison_error(message: str) -> bool:
+    """True for Codex native-thread failures that should force a fresh thread."""
+    lowered = (message or "").lower()
+    return (
+        "ran out of room in the model's context window" in lowered
+        or "compact_remote: remote compaction failed" in lowered
+    )
+
+
 def _call_exploration_agent(
     agent_name: str,
     agent_def: dict,
@@ -1286,6 +1334,8 @@ def _call_exploration_agent(
                 env_base=env,
                 cwd=agent_config.get("working_directory") or "/tmp",
                 timeout=agent_config.get("cli_timeout") or None,
+                idle_timeout=agent_config.get("provider_idle_timeout_seconds"),
+                idle_poll=agent_config.get("provider_idle_poll_seconds"),
             )
     except ClaudeRateLimitError as e:
         # Rate-limit: signal via status field so the main cycle loop can
@@ -1325,14 +1375,24 @@ def _call_exploration_agent(
         # only pop it inside the fresh-session branch above), so any prior
         # compaction context is restored on the next call's system_prompt.
         is_stale_resume = was_resume and "No conversation found" in err_msg
+        is_codex_poisoned = (
+            was_resume
+            and _provider.is_codex()
+            and _is_codex_session_poison_error(err_msg)
+        )
         if not was_resume:
             agent_sessions.pop(agent_name, None)
             if summary is not None:
                 agent_summaries[agent_name] = summary
-        elif is_stale_resume:
+        elif is_stale_resume or is_codex_poisoned:
             agent_sessions.pop(agent_name, None)
+            reason = (
+                "Codex over-context session"
+                if is_codex_poisoned
+                else "stale session"
+            )
             print(
-                f"[long-exposure]   {agent_name}: stale session "
+                f"[long-exposure]   {agent_name}: {reason} "
                 f"{session_id[:8]}... evicted; next cycle starts fresh.",
                 flush=True,
             )
@@ -1609,6 +1669,8 @@ def _compact_agent_session(
                 env_base=env,
                 cwd=agent_config.get("working_directory") or "/tmp",
                 timeout=agent_config.get("cli_timeout") or None,
+                idle_timeout=agent_config.get("provider_idle_timeout_seconds"),
+                idle_poll=agent_config.get("provider_idle_poll_seconds"),
             )
     except ClaudeRateLimitError:
         # Let the caller decide: the main cycle loop triggers rotation;
@@ -3070,6 +3132,8 @@ def run_exploration(
         agent_sessions = state.get("agent_sessions", {})
         agent_summaries = state.get("agent_summaries", {})
         post_merge_pending = state.get("post_merge_pending", False)
+        reanchor_emitted = dict(state.get("_reanchor_emitted") or {})
+        agent_context_tokens = dict(state.get("agent_context_tokens") or {})
         # Stage 3 §5.3 (crash recovery): if a sync was in flight when the
         # process died, the persisted flag would otherwise stay True and
         # silently disable all future syncs. Always clear on resume; the
@@ -3138,6 +3202,8 @@ def run_exploration(
         agent_sessions = {}
         agent_summaries = {}
         post_merge_pending = False
+        reanchor_emitted = {}
+        agent_context_tokens = {}
         # Stage 3: daily-sync state. Initialize last_daily_sync_at to "now"
         # so the first sync fires interval-hours after fresh start.
         last_daily_sync_at = datetime.now(timezone.utc).isoformat()
@@ -3461,15 +3527,15 @@ def run_exploration(
             p for p in (fanout_guide, sibling_block, anti_patterns_block, guidance)
             if p
         ]
-        if parts:
-            results["live_guidance"] = "\n\n".join(parts)
-            if guidance:
-                print(
-                    f"[long-exposure] Live guidance received ({len(guidance)} chars)",
-                    flush=True,
-                )
-        else:
-            results["live_guidance"] = "[No live guidance this cycle.]"
+        base_live_guidance = (
+            "\n\n".join(parts) if parts else "[No live guidance this cycle.]"
+        )
+        results["live_guidance"] = base_live_guidance
+        if guidance:
+            print(
+                f"[long-exposure] Live guidance received ({len(guidance)} chars)",
+                flush=True,
+            )
 
         # ---- Inject plan + ledger summary as cycle inputs (Plan 1 §5) ----
         # Best-effort, token-bounded. Removing this block reverts the harness
@@ -3509,6 +3575,8 @@ def run_exploration(
         _pre_cycle_results = dict(results)
         _pre_cycle_last_session_id = last_session_id
         _pre_cycle_consecutive_failures = dict(consecutive_failures)
+        _pre_cycle_reanchor_emitted = dict(reanchor_emitted)
+        _pre_cycle_agent_context_tokens = dict(agent_context_tokens)
         while True:
             # Capture the account the flow is about to run under. If we
             # hit a 429, we pass this to rotate_to_next_account so peer
@@ -3528,6 +3596,41 @@ def run_exploration(
                     break
 
                 agent_def = agents[agent_name]
+                agent_live_parts: list[str] = []
+                reanchor_at = int(context_window * compact_threshold * 5 / 6)
+                if (
+                    config.get("reanchor_enabled", True)
+                    and int(agent_context_tokens.get(agent_name, 0) or 0) >= reanchor_at
+                    and not reanchor_emitted.get(agent_name)
+                ):
+                    agent_config_for_reanchor = build_agent_config(config, agent_def)
+                    if agent_config_for_reanchor.get("philosophy") == "custom":
+                        phil_vars = dict(agent_config_for_reanchor.get("custom_philosophy", {}))
+                        for key, val in PHILOSOPHY_PRESETS["efficient"].items():
+                            phil_vars.setdefault(key, val)
+                    else:
+                        phil_vars = dict(
+                            PHILOSOPHY_PRESETS.get(
+                                agent_config_for_reanchor.get("philosophy", "efficient"),
+                                PHILOSOPHY_PRESETS["efficient"],
+                            )
+                        )
+                    reanchor = _build_reanchor_block(agent_def, phil_vars)
+                    if reanchor:
+                        agent_live_parts.append(reanchor)
+                        reanchor_emitted[agent_name] = True
+                        print(
+                            f"[long-exposure]   {agent_name}: injecting "
+                            "long-context re-anchor",
+                            flush=True,
+                        )
+                if parts:
+                    agent_live_parts.append(base_live_guidance)
+                results["live_guidance"] = (
+                    "\n\n".join(agent_live_parts)
+                    if agent_live_parts
+                    else "[No live guidance this cycle.]"
+                )
                 is_resume = agent_name in agent_sessions
                 print(
                     f"[long-exposure] "
@@ -3574,6 +3677,7 @@ def run_exploration(
                     consecutive_failures[agent_name] = 0
 
                     total_ctx = _total_context_tokens(usage)
+                    agent_context_tokens[agent_name] = total_ctx
                     out_tokens = usage.get("output_tokens", 0)
                     cycle_output_tokens += out_tokens
                     print(
@@ -3624,6 +3728,8 @@ def run_exploration(
                                 agent_sessions, agent_summaries,
                                 conn, cycle, last_session_id,
                             )
+                            reanchor_emitted.pop(agent_name, None)
+                            agent_context_tokens.pop(agent_name, None)
                         except ClaudeRateLimitError as e:
                             rotation_triggered = True
                             rate_limit_reason = f"compaction: {e}"
@@ -3954,6 +4060,10 @@ def run_exploration(
             last_session_id = _pre_cycle_last_session_id
             consecutive_failures.clear()
             consecutive_failures.update(_pre_cycle_consecutive_failures)
+            reanchor_emitted.clear()
+            reanchor_emitted.update(_pre_cycle_reanchor_emitted)
+            agent_context_tokens.clear()
+            agent_context_tokens.update(_pre_cycle_agent_context_tokens)
             # Discard any partial session log entries from this attempt.
             cycle_session_log = [
                 entry for entry in cycle_session_log
@@ -4028,7 +4138,9 @@ def run_exploration(
                    post_merge_pending=post_merge_pending, task=task,
                    run_id=run_id,
                    last_daily_sync_at=last_daily_sync_at,
-                   daily_sync_count=daily_sync_count)
+                   daily_sync_count=daily_sync_count,
+                   reanchor_emitted=reanchor_emitted,
+                   agent_context_tokens=agent_context_tokens)
 
         elapsed = time.monotonic() - cycle_start
         telemetry.emit(
@@ -4066,7 +4178,9 @@ def run_exploration(
                        run_id=run_id,
                        last_daily_sync_at=last_daily_sync_at,
                        daily_sync_count=daily_sync_count,
-                       daily_sync_in_progress=True)
+                       daily_sync_in_progress=True,
+                       reanchor_emitted=reanchor_emitted,
+                       agent_context_tokens=agent_context_tokens)
             try:
                 last_session_id = _run_daily_sync(
                     agents=agents,
@@ -4094,7 +4208,9 @@ def run_exploration(
                            run_id=run_id,
                            last_daily_sync_at=last_daily_sync_at,
                            daily_sync_count=daily_sync_count,
-                           daily_sync_in_progress=False)
+                           daily_sync_in_progress=False,
+                           reanchor_emitted=reanchor_emitted,
+                           agent_context_tokens=agent_context_tokens)
 
                 # Plan B: planned 24h rotation. Fires AFTER the
                 # daily-sync agents complete, but only when no rotation has
@@ -4204,7 +4320,9 @@ def run_exploration(
                        post_merge_pending=post_merge_pending, task=task,
                        run_id=run_id,
                        last_daily_sync_at=last_daily_sync_at,
-                       daily_sync_count=daily_sync_count)
+                       daily_sync_count=daily_sync_count,
+                       reanchor_emitted=reanchor_emitted,
+                       agent_context_tokens=agent_context_tokens)
 
         # Cooldown
         cooldown = adaptive_cooldown(base_cooldown, total_failure_streak)
@@ -4277,7 +4395,9 @@ def run_exploration(
                    post_merge_pending=post_merge_pending, task=task,
                    run_id=run_id,
                    last_daily_sync_at=last_daily_sync_at,
-                   daily_sync_count=daily_sync_count)
+                   daily_sync_count=daily_sync_count,
+                   reanchor_emitted=reanchor_emitted,
+                   agent_context_tokens=agent_context_tokens)
 
         # Clone exit path: skip final_reporter and curator. Run reporter
         # in merge mode to produce the merge_report.md the root conductor's
@@ -4448,7 +4568,9 @@ def run_exploration(
                    post_merge_pending=post_merge_pending, task=task,
                    run_id=run_id,
                    last_daily_sync_at=last_daily_sync_at,
-                   daily_sync_count=daily_sync_count)
+                   daily_sync_count=daily_sync_count,
+                   reanchor_emitted=reanchor_emitted,
+                   agent_context_tokens=agent_context_tokens)
         final_status = (
             "cleared" if _clear_requested
             else "completed" if (

@@ -22,6 +22,7 @@ emits findings; the cycle loop never blocks on its output.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -68,7 +69,15 @@ REQUIRED_EVENT_FIELDS = (
     "narrative",
 )
 
-RESERVED_NAMESPACES = ("_plan/", "_run/", "_archive/", "_orphan/", "_manager/")
+RESERVED_NAMESPACES = (
+    "_plan/",
+    "_run/",
+    "_archive/",
+    "_orphan/",
+    "_manager/",
+    "_infra/",
+)
+IMMUTABLE_EXCEPTION_PATH = Path("reports/promise_check_immutable_exceptions.json")
 
 
 # ---------------------------------------------------------------------------
@@ -117,8 +126,58 @@ def _load_ledger(ledger_path: Path, findings: Findings) -> list[dict]:
             findings.err(f"ledger:line {line_no}: top-level not a JSON object")
             continue
         ev["_line"] = line_no
+        ev["_raw_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
         events.append(ev)
     return events
+
+
+def _load_immutable_exceptions(workspace: Path, findings: Findings) -> set[tuple]:
+    """Load exact immutable-history exception fingerprints.
+
+    Exceptions are intentionally narrow: they only suppress a named validator
+    error when the historical row still matches the recorded line fingerprint.
+    """
+    path = workspace / IMMUTABLE_EXCEPTION_PATH
+    if not path.exists():
+        return set()
+    try:
+        doc = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        findings.err(f"{IMMUTABLE_EXCEPTION_PATH}: malformed JSON ({exc.msg})")
+        return set()
+    rows = doc.get("exceptions") if isinstance(doc, dict) else None
+    if not isinstance(rows, list):
+        findings.err(f"{IMMUTABLE_EXCEPTION_PATH}: expected object with exceptions list")
+        return set()
+    exceptions: set[tuple] = set()
+    required = ("line", "event_id", "ts", "milestone_id", "raw_sha256", "error")
+    for i, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            findings.err(f"{IMMUTABLE_EXCEPTION_PATH}: exception {i} is not an object")
+            continue
+        missing = [field for field in required if field not in row]
+        if missing:
+            findings.err(
+                f"{IMMUTABLE_EXCEPTION_PATH}: exception {i} missing {', '.join(missing)}"
+            )
+            continue
+        exceptions.add(tuple(row[field] for field in required))
+    return exceptions
+
+
+def _is_immutable_exception(
+    ev: dict,
+    error: str,
+    immutable_exceptions: set[tuple],
+) -> bool:
+    return (
+        ev.get("_line"),
+        ev.get("event_id"),
+        ev.get("ts"),
+        ev.get("milestone_id"),
+        ev.get("_raw_sha256"),
+        error,
+    ) in immutable_exceptions
 
 
 def _parse_plan_milestones(plan_path: Path, findings: Findings) -> set[str]:
@@ -172,7 +231,12 @@ def _check_uuid(value: str) -> bool:
         return False
 
 
-def _check_event_schema(events: list[dict], findings: Findings) -> None:
+def _check_event_schema(
+    events: list[dict],
+    findings: Findings,
+    immutable_exceptions: set[tuple] | None = None,
+) -> None:
+    immutable_exceptions = immutable_exceptions or set()
     seen_ids: set[str] = set()
     for ev in events:
         line = ev.get("_line", "?")
@@ -183,7 +247,13 @@ def _check_event_schema(events: list[dict], findings: Findings) -> None:
         eid = ev.get("event_id")
         if eid is not None:
             if not _check_uuid(eid):
-                findings.err(f"ledger:line {line}: event_id is not a valid UUID")
+                error = "event_id is not a valid UUID"
+                if _is_immutable_exception(ev, error, immutable_exceptions):
+                    findings.note(
+                        f"immutable exception consumed for ledger:line {line}: {error}"
+                    )
+                else:
+                    findings.err(f"ledger:line {line}: {error}")
             elif eid in seen_ids:
                 findings.err(f"ledger:line {line}: duplicate event_id {eid!r}")
             else:
@@ -227,6 +297,19 @@ def _check_event_schema(events: list[dict], findings: Findings) -> None:
                             f"ledger:line {line}: artifact path {a!r} not canonicalized"
                         )
 
+        supersedes = ev.get("supersedes")
+        if supersedes is not None:
+            if isinstance(supersedes, str):
+                pass
+            elif isinstance(supersedes, list) and all(
+                isinstance(ref, str) for ref in supersedes
+            ):
+                pass
+            else:
+                findings.err(
+                    f"ledger:line {line}: supersedes must be a string or list of strings"
+                )
+
 
 # ---------------------------------------------------------------------------
 # Cross-reference integrity
@@ -256,10 +339,18 @@ def _check_cross_references(
                 )
 
         sup = ev.get("supersedes")
-        if sup is not None and sup not in seen_ids:
-            findings.err(
-                f"ledger:line {line}: supersedes references unknown event_id {sup!r}"
-            )
+        if sup is not None:
+            if isinstance(sup, str):
+                refs = [sup]
+            elif isinstance(sup, list) and all(isinstance(ref, str) for ref in sup):
+                refs = sup
+            else:
+                continue
+            for ref in refs:
+                if ref not in seen_ids:
+                    findings.err(
+                        f"ledger:line {line}: supersedes references unknown event_id {ref!r}"
+                    )
 
     # Plan-side: every plan milestone should have at least one ledger event after first cycle.
     if plan_milestones and events:
@@ -680,7 +771,9 @@ def run(workspace: Path, *, strict: bool = False) -> Findings:
     events = _load_ledger(ledger_path, findings)
     plan_milestones = _parse_plan_milestones(plan_path, findings)
 
-    _check_event_schema(events, findings)
+    immutable_exceptions = _load_immutable_exceptions(workspace, findings)
+
+    _check_event_schema(events, findings, immutable_exceptions)
     _check_cross_references(events, plan_milestones, findings)
     _check_lifecycle(events, findings)
     _check_plan_mtime(plan_path, events, findings)

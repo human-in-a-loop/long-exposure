@@ -167,6 +167,7 @@ def build_agent_config(base_config: dict, agent_def: dict) -> dict:
     for key in (
         "philosophy", "framework", "model", "model_tier",
         "working_directory", "allowed_tools", "cli_timeout", "effort",
+        "provider_idle_timeout_seconds", "provider_idle_poll_seconds",
     ):
         if key in agent_def:
             config[key] = agent_def[key]

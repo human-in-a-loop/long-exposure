@@ -198,6 +198,44 @@ existing block, not add a new one.
    be a one-line edit that can be reverted to leave the system
    identical to today.
 
+Some guidance lines use lightweight tags: `[INVARIANT]`, `[PREFER]`,
+`[AVOID]`. They are not parsed by Python in the validator path.
+They have two effects: (1) semantic emphasis for the model —
+invariants are load-bearing, preferences are default posture,
+avoids are known bad moves; (2) at the `compact_threshold * 5/6`
+mark (75% at default settings), the orchestrator re-injects all
+`[INVARIANT]` lines from the active philosophy + role as a
+precedence reminder (see operating-protocol `INVARIANT RE-ANCHOR`).
+
+Keep tags sparse. Current visible system-wide count in this tree is
+3 `[INVARIANT]` lines and 0 `[AVOID]`. Soft budget: <=3
+`[INVARIANT]` per role, <=2 per philosophy preset. If every sentence
+is tagged, no sentence is emphasized AND the re-anchor block grows
+past the 150-300 token zone that makes it useful.
+
+## Distribution-shaping primitives
+
+Some behaviors are not rules but distribution shifts — they raise or
+lower the prior on a continuous behavior rather than gating discrete
+actions. These do not enter the P^N joint-compliance tax. Prefer them
+when the desired behavior is a tendency, not a check.
+
+Two primitives are used throughout:
+
+- **discomfort_signal** (philosophy presets) — names a felt sense the
+  agent should monitor for. "Mild discomfort at >2000 tokens of
+  reasoning without output" shapes pacing without adding a rule.
+- **voice prose** (philosophy presets) — the persona prose
+  ("pragmatic senior engineer who bills by the hour") shapes
+  register, choice of abstraction, and verbosity without enforcing
+  any single output.
+
+When considering a new soft-guidance addition, ask first: is this a
+rule (discrete, pass/fail per output) or a distribution shift
+(continuous, manifests across many outputs)? If the latter, write it
+as voice prose or a discomfort signal, NOT as an enumerated rule
+with a tag.
+
 ---
 
 ## Code references

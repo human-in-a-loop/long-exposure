@@ -875,9 +875,14 @@ def _seed_clone_state(
     pinned_account_dir: str | None = None,
     clone_k: int | None = None,
 ) -> None:
-    """Seed the clone's state file so it resumes with parent's sessions but
-    at cycle 0. Clones inherit Claude Code --resume IDs (gems + context),
-    but run their own cycle count.
+    """Seed the clone's state file so it starts at cycle 0.
+
+    Claude clones may inherit parent --resume IDs when account-local session
+    lookup is valid. Codex clones deliberately do not inherit native thread
+    IDs: `codex exec resume <thread>` appends to the same mutable thread, so
+    sibling clones can contaminate and overfill the root researcher context.
+    Codex continuity comes from summaries, workspace artifacts, and the clone
+    assignment instead.
 
     Propagates parent_run_id so clone-emitted ledger events share the same
     run_id as the parent (Plan 1 §6 + Plan 5 §2.2). Without this, clone
@@ -901,6 +906,22 @@ def _seed_clone_state(
         if k not in ("live_guidance",)
     }
     seeded_sessions = dict(parent_agent_sessions or {})
+    if seeded_sessions and _provider.current_provider() == _provider.CODEX:
+        print(
+            f"[long-exposure]   clone-{clone_k}: dropping Codex parent "
+            "sessions; fan-out clones start fresh to avoid shared-thread "
+            "contamination.",
+            flush=True,
+        )
+        try:
+            from long_exposure import health_events as _he
+            _he.append_event(
+                "codex_clone_session_drop",
+                detail=f"clone_k={clone_k}",
+            )
+        except Exception:
+            pass
+        seeded_sessions = {}
     if (
         seeded_sessions
         and parent_account_dir

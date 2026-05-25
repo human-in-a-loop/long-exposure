@@ -57,6 +57,11 @@ cycle starts. A reporter agent runs every 3 cycles to consolidate results;
 a final auditor, final reporter, and curator run once at the end to audit,
 synthesize, and package the output.
 
+Provider CLI calls are guarded by both `cli_timeout` and the no-progress
+watchdog `provider_idle_timeout_seconds`. The watchdog counts stdout/stderr,
+Codex final-output-file writes, and external child tool processes as progress;
+provider-only CPU wakeups do not reset it.
+
 **Equivalent from a terminal:**
 
 ```bash

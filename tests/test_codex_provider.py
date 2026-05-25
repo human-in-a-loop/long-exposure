@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from long_exposure import provider
+from long_exposure.orchestrator import ClaudeCliError
 from long_exposure.exploration import _call_exploration_agent
 from long_exposure.orchestrator import (
     _codex_permission_flags,
@@ -92,6 +93,43 @@ class CodexProviderTests(unittest.TestCase):
         self.assertIn("--json", captured["cmd"])
         self.assertIn("-o", captured["cmd"])
         self.assertIn("[SYSTEM PROMPT]", captured["stdin"])
+
+    def test_codex_over_context_resume_evicts_poisoned_session(self):
+        def fake_invoke(cmd, stdin_text, **kwargs):
+            raise ClaudeCliError(
+                "codex CLI exited with code 1: "
+                "Codex ran out of room in the model's context window. "
+                "Start a new thread or clear earlier history before retrying."
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            config = load_config()
+            config.update({
+                "llm_provider": "codex",
+                "model": "gpt-5.5",
+                "codex_model": "gpt-5.5",
+                "working_directory": td,
+            })
+            sessions = {"tester": "poison-thread"}
+            with patch.dict(os.environ, {"LONG_EXPOSURE_LLM_PROVIDER": "codex"}, clear=False):
+                with patch("long_exposure.exploration._invoke_claude", fake_invoke):
+                    result = _call_exploration_agent(
+                        agent_name="tester",
+                        agent_def={
+                            "role": "You are a tester.",
+                            "inputs": ["directive"],
+                            "outputs": ["out"],
+                        },
+                        task="test task",
+                        config=config,
+                        results={"directive": "test task"},
+                        score_inputs={"directive": "test task"},
+                        agent_sessions=sessions,
+                        agent_summaries={},
+                    )
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(sessions, {})
 
 
 if __name__ == "__main__":

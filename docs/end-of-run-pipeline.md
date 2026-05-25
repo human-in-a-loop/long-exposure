@@ -211,6 +211,13 @@ executes within its own `cli_timeout`, ensuring an audit pass always
 produces both report.md and summary.json (or synthetic minimal
 fallbacks if the agent fails entirely).
 
+Provider CLI calls also use the global no-progress watchdog configured by
+`provider_idle_timeout_seconds` and `provider_idle_poll_seconds`. The watchdog
+keeps a call alive when stdout/stderr, the Codex final-output file, or an
+external child tool process is making progress; provider-only CPU wakeups are
+not treated as progress. This catches silent provider hangs without killing
+long-running tool work.
+
 ### Wall-cap
 
 `WALL_CAP_SECONDS = 36000` (10h) total auditor pass time. The cap

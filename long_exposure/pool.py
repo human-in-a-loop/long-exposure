@@ -50,7 +50,7 @@ from long_exposure import provider as _provider
 # Constants
 # ---------------------------------------------------------------------------
 
-PER_ACCOUNT_SLOT_CAP = 3  # empirical; per-account in-flight `claude -p` ceiling
+PER_ACCOUNT_SLOT_CAP = 3  # default empirical per-account in-flight CLI ceiling
 
 # Default cooldown matches the score's `cycle_cooldown_seconds` (400s) doubled
 # — same value the existing adaptive_cooldown uses for failure cycles. A
@@ -68,6 +68,28 @@ def _pool_state_path() -> Path:
 
 def _pool_lock_path() -> Path:
     return _provider.pool_lock_path()
+
+
+def _slot_cap() -> int:
+    """Return the provider-local in-flight slot cap.
+
+    Defaults to the conservative historical cap. Operators can raise or lower
+    the cap per provider for a specific live run with
+    LONG_EXPOSURE_<PROVIDER>_SLOT_CAP, e.g. LONG_EXPOSURE_CODEX_SLOT_CAP=5.
+    Invalid values fall back to the default rather than blocking startup.
+    """
+    provider = _provider.current_provider().upper()
+    for name in (f"LONG_EXPOSURE_{provider}_SLOT_CAP", "LONG_EXPOSURE_POOL_SLOT_CAP"):
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return PER_ACCOUNT_SLOT_CAP
 
 # Account states.
 COLD = "cold"
@@ -327,7 +349,7 @@ def is_cooling(account_dir: str) -> bool:
 def _free_slots(account: dict) -> int:
     if account["state"] == COOLING:
         return 0
-    return max(0, PER_ACCOUNT_SLOT_CAP - account.get("slots_used", 0))
+    return max(0, _slot_cap() - account.get("slots_used", 0))
 
 
 def available_slots() -> int:
@@ -858,8 +880,9 @@ def format_pool_summary() -> str:
         tcr = _human_tokens(a.get("tokens_cache_read", 0))
         tcc = _human_tokens(a.get("tokens_cache_creation", 0))
         tout = _human_tokens(a.get("tokens_output", 0))
+        cap = _slot_cap()
         parts.append(
-            f"{label}={a['state'][:4]}({used}/{PER_ACCOUNT_SLOT_CAP}) "
+            f"{label}={a['state'][:4]}({used}/{cap}) "
             f"tokens(in={tin} cr={tcr} cc={tcc} out={tout})"
         )
     free = available_slots()

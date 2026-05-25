@@ -157,11 +157,17 @@ def promote_fresh_unified(cooling_provider: str | None = None) -> tuple[str, str
 
 
 def fanout_cap() -> int:
+    # Root unified runs reserve their root slot at startup before cycle-level
+    # fan-out guidance is rendered. At that point provider-local
+    # available_slots() already excludes the root holder, so the unified cap is
+    # the remaining free branch capacity summed across providers. This also
+    # lets heterogeneous caps compose directly, e.g. Claude root+3 plus Codex 5
+    # exposes 8 branch slots after the root holder is acquired.
     total = 0
     for prv in configured_providers():
         with swap_active_provider(prv):
             try:
-                total += max(0, pool.fanout_cap())
+                total += max(0, pool.available_slots())
             except Exception:
                 pass
     return total

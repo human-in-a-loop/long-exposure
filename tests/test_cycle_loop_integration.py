@@ -112,6 +112,49 @@ class CycleLoopIntegrationTests(unittest.TestCase):
         self.assertIn("cycle_end", event_types)
         self.assertIn("run_end", event_types)
 
+    def test_reanchor_is_injected_before_compaction_threshold(self):
+        live_guidance_by_call = []
+
+        def fake_agent(agent_name, agent_def, **kwargs):
+            live_guidance_by_call.append(
+                (agent_name, kwargs["results"].get("live_guidance", ""))
+            )
+            output_name = agent_def["outputs"][0]
+            return {
+                "agent": agent_name,
+                "outputs": {output_name: f"{agent_name} output " + ("x" * 2100)},
+                "usage": {"input_tokens": 310000, "output_tokens": 2100},
+                "duration_ms": 1,
+                "status": "ok",
+                "error": None,
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            score, config, inst = write_minimal_files(root)
+            score.write_text(score.read_text().replace("  max_cycles: 1\n", "  max_cycles: 2\n"))
+            with patch("long_exposure.exploration._call_exploration_agent", fake_agent):
+                run_exploration(
+                    score_path=str(score),
+                    config_path=str(config),
+                    output_dir=inst / "output",
+                    state_path=inst / "exploration_state.json",
+                    task_override=None,
+                    instance_dir=inst,
+                )
+
+            state = json.loads((inst / "exploration_state.json").read_text())
+
+        researcher_guidance = [
+            guidance for agent_name, guidance in live_guidance_by_call
+            if agent_name == "researcher"
+        ]
+        self.assertEqual(len(researcher_guidance), 2)
+        self.assertNotIn("<reanchor>", researcher_guidance[0])
+        self.assertIn("<reanchor>", researcher_guidance[1])
+        self.assertTrue(state["_reanchor_emitted"]["researcher"])
+        self.assertEqual(state["agent_context_tokens"]["researcher"], 312100)
+
     def test_final_synthesis_runs_on_stop_or_topic_exhaustion_but_not_clear(self):
         self.assertTrue(_should_run_final_synthesis(
             topic_exhausted=False,

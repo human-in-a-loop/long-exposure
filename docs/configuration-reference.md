@@ -44,6 +44,8 @@ codex_subagents:
   max_depth: 1
 model_tier: opus
 cli_timeout: 0            # seconds per claude -p call (0 = no timeout)
+provider_idle_timeout_seconds: 1800  # no-progress provider CLI watchdog (0 = disabled)
+provider_idle_poll_seconds: 10       # watchdog poll interval
 ```
 
 | Key | Meaning |
@@ -69,6 +71,8 @@ cli_timeout: 0            # seconds per claude -p call (0 = no timeout)
 | `codex_subagents` | Codex subagent runtime caps. `max_threads` limits concurrent child threads; `max_depth: 1` permits direct children but prevents recursive subagent trees. |
 | `model_tier` | Used by template substitution; selects philosophy-tier-specific phrasing |
 | `cli_timeout` | Per-provider CLI call timeout; `0` disables. Override per-agent in score |
+| `provider_idle_timeout_seconds` | No-progress watchdog for provider CLI calls. The call stays alive while stdout/stderr, the Codex final-output file, or an external child tool process is making progress. Provider-only CPU wakeups are not treated as progress. `0` disables. |
+| `provider_idle_poll_seconds` | Poll interval for the provider idle watchdog. |
 
 ### Compaction
 

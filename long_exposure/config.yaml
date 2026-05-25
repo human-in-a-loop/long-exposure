@@ -25,9 +25,12 @@ codex_subagents:
   max_depth: 1                        # direct children only; no recursive subagent trees
 model_tier: opus
 cli_timeout: 0                       # seconds per claude -p call (0 = no timeout)
+provider_idle_timeout_seconds: 1800  # no-progress hold before killing a silent provider CLI (0 = disabled)
+provider_idle_poll_seconds: 10       # provider watchdog poll interval
 
 # === Compact ===
 compact_threshold: 0.90
+reanchor_enabled: true
 compact_db: ./data/sessions.db
 max_summary_pct: 0.15
 depth_compression: gentle
