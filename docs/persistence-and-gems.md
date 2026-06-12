@@ -65,8 +65,9 @@ Plus catalog indexes on `(topic)` and `(topic, subtopic)`.
 
 ### Concurrency model
 
-- **WAL journal mode** + `busy_timeout=5000` + connection
-  `timeout=30s` (`db.init_db`).
+- **WAL journal mode** + `busy_timeout=30000` matching the connection
+  `timeout=30s` (`db.init_db`; the PRAGMA and connect timeout set the
+  same underlying busy handler, so they are kept equal).
 - One writer at a time, many concurrent readers. Writers serialise
   via the WAL lock; each compaction-write completes in ~10ms, so
   even at N=14 fan-out clones the worst case is ~140ms serialised.

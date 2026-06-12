@@ -119,6 +119,21 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("Latest Manager Notice", printed)
         self.assertIn("tighten mechanism", printed)
 
+    def test_status_degrades_gracefully_on_empty_status_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            inst = Path(td) / "inst"
+            out = inst / "output"
+            out.mkdir(parents=True)
+            # Simulate racing a non-atomic writer: file exists but is empty.
+            (out / "exploration_status.md").write_text("")
+
+            with patch("builtins.print") as mock_print:
+                rc = cli.main(["--instance-dir", str(inst), "status"])
+
+        self.assertEqual(rc, 0)
+        printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list)
+        self.assertIn("still being written", printed)
+
     def test_cli_install_writes_adapter_files(self):
         with tempfile.TemporaryDirectory() as td:
             rc = cli.main(["cli-install", "--target", "all", "--directory", td])

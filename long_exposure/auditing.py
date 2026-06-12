@@ -318,9 +318,40 @@ def _extract_audit_content(output_text: str) -> str:
     return text
 
 
-def _rescue_audit_stage_file(expected: Path, output_text: str) -> bool:
+# Minimum plausible size for rescued document-stage content — shared with
+# reporting: a sub-threshold rescue is a status receipt, not the audit
+# narrative, and must not become (or pollute) the canonical
+# final_audit_report.md — the commit marker would then poison every later
+# delta pass.
+from long_exposure.reporting import _RESCUE_MIN_CONTENT_CHARS
+
+
+def _rescue_audit_stage_file(
+    expected: Path, output_text: str, *, min_chars: int = 0,
+) -> bool:
     content = _extract_audit_content(output_text)
     if not content:
+        return False
+    if min_chars and len(content) < min_chars:
+        print(
+            f"[long-exposure]   WARNING: audit rescue REFUSED for "
+            f"{expected.name} — content too short ({len(content)} chars). "
+            f"Rescued text looks like a receipt, not the deliverable.",
+            flush=True,
+        )
+        # Parity with reporting._rescue_stage_file: surface the refusal as a
+        # health event. Best-effort — never let telemetry break the gate.
+        try:
+            from long_exposure import health_events as _he
+            _he.append_event(
+                "file_gate_rescue_refused",
+                detail=(
+                    f"audit target={expected.name} bytes={len(content)} "
+                    f"reason=content too short ({len(content)} chars)"
+                ),
+            )
+        except Exception:
+            pass
         return False
     try:
         if expected.exists():
@@ -432,15 +463,6 @@ def _commit_lessons(
     if not candidates:
         return []
 
-    cap = _max_lessons_for_run(total_cycles)
-    chosen = candidates[:cap]
-    if len(candidates) > cap:
-        print(
-            f"[long-exposure]   Lessons: {len(candidates)} candidates → committing "
-            f"top {cap} (cap = max(1, ceil({total_cycles}/3)))",
-            flush=True,
-        )
-
     # Commit to sessions.db. Idempotent: if a lesson with the same topic
     # slug already exists in the DB (e.g., this auditor was re-run after
     # a crash, or a prior run on this workspace already emitted the same
@@ -461,6 +483,29 @@ def _commit_lessons(
             existing_slugs = {r[0] for r in rows if r[0]}
         except Exception:
             pass
+
+    # Filter already-committed slugs BEFORE applying the cap. lessons.jsonl
+    # is append-only across passes, so capping from the head would let
+    # run-1's slugs permanently occupy the cap window and new lessons from
+    # later passes would never commit.
+    new_candidates: list[dict] = []
+    for c in candidates:
+        if f"lesson/{c['slug']}" in existing_slugs:
+            print(
+                f"[long-exposure]   Lesson skipped (slug already in DB): {c['slug']}",
+                flush=True,
+            )
+            continue
+        new_candidates.append(c)
+
+    cap = _max_lessons_for_run(total_cycles)
+    chosen = new_candidates[:cap]
+    if len(new_candidates) > cap:
+        print(
+            f"[long-exposure]   Lessons: {len(new_candidates)} new candidates → committing "
+            f"top {cap} (cap = max(1, ceil({total_cycles}/3)))",
+            flush=True,
+        )
 
     committed: list[dict] = []
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -658,13 +703,24 @@ def _run_final_auditor(
     data_dir: Path | None = None,
     agent_sessions: dict | None = None,
     agent_summaries: dict | None = None,
+    run_id: str | None = None,
 ) -> str | None:
-    """Execute the final auditor in 2+2N stages with shared wall-cap."""
+    """Execute the final auditor in 2+2N stages with shared wall-cap.
+
+    ``run_id`` (keyword-only by position, optional): the loop's real run
+    identifier. When omitted, falls back to results/score_inputs and then
+    to a synthesized ``run-<timestamp>`` — but a synthesized id changes on
+    every invocation, which breaks the lessons cap (cycle count filters to
+    zero matching ledger events → cap stuck at 1) and reconciliation
+    idempotency (UUIDv5 event ids are keyed on run_id). Callers that know
+    the run_id (exploration.py's cycle loop / daily sync) should pass it.
+    """
     workspace = paths.workspace_root(config.get("working_directory") or ".")
     config["working_directory"] = str(workspace)
     paths.ensure_layout(config)
     run_id = (
-        results.get("run_id")
+        run_id
+        or results.get("run_id")
         or score_inputs.get("run_id")
         or f"run-{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H%M%SZ')}"
     )
@@ -719,12 +775,20 @@ def _run_final_auditor(
     audit_summaries: dict = {}
     pending_rescue_warning: str | None = None
     document_stage_touched = False
+    # Mirrors reporting.py's finalize_completed: the commit marker may only
+    # be written when the document stage actually ran and left the report
+    # on disk — never after a stop-signal break mid-pass.
+    document_completed = False
     start_ts = time.monotonic()
 
-    # Reset per-run findings file at start so a re-run on resume cannot
-    # double-commit reconciliation events from a stale prior pass.
+    # Reset per-run findings file at start so a re-run cannot double-commit
+    # reconciliation events from a stale prior pass. Findings are re-derived
+    # from scratch on every auditor pass; there is no stage-level resume
+    # signal today (a previous `long-exposure.resume` check here was dead
+    # code — nothing ever created that file). Stage-level resume that would
+    # preserve a partially-completed pass's findings is gap row 44.
     fp = _findings_path(workspace)
-    if fp.exists() and not (data_dir and (data_dir / "long-exposure.resume").exists()):
+    if fp.exists():
         try:
             fp.unlink()
         except OSError:
@@ -843,7 +907,10 @@ def _run_final_auditor(
                     f"rescuing from output.",
                     flush=True,
                 )
-                if _rescue_audit_stage_file(expected, output_text):
+                if _rescue_audit_stage_file(
+                    expected, output_text,
+                    min_chars=_RESCUE_MIN_CONTENT_CHARS if label == "document" else 0,
+                ):
                     print(
                         f"[long-exposure]   FILE GATE: rescued "
                         f"{expected.name} ({expected.stat().st_size:,}b)",
@@ -861,7 +928,10 @@ def _run_final_auditor(
                     f"during stage {stage}.",
                     flush=True,
                 )
-                if not (delta_mode and label == "document") and _rescue_audit_stage_file(expected, output_text):
+                if not (delta_mode and label == "document") and _rescue_audit_stage_file(
+                    expected, output_text,
+                    min_chars=_RESCUE_MIN_CONTENT_CHARS if label == "document" else 0,
+                ):
                     print(
                         f"[long-exposure]   FILE GATE: rescued "
                         f"{expected.name} from output.",
@@ -874,6 +944,14 @@ def _run_final_auditor(
                 )
             if label == "document" and _file_signature(expected) != expected_before:
                 document_stage_touched = True
+            if label == "document" and expected.exists() and document_stage_touched:
+                # Same gating as reporting.finalize_completed: the marker may
+                # only be armed by a document stage that actually changed the
+                # file THIS pass. A final_audit_report.md left over from a
+                # prior pass (e.g. agent emitted a receipt and the rescue
+                # plausibility gate refused the write) must not arm the
+                # commit marker — that would poison later delta passes.
+                document_completed = True
 
             # Compaction
             if total_ctx >= compact_at:
@@ -929,10 +1007,13 @@ def _run_final_auditor(
     # is non-fatal — markdown is always usable.
     audit_md = paths.final_audit_report_path(config)
     audit_pdf = paths.final_audit_pdf_path(config)
-    if audit_md.exists() and not audit_pdf.exists():
+    if audit_md.exists():
         try:
-            from long_exposure.reporting import render_pdf
-            render_pdf(str(workspace), stem="final_audit_report")
+            from long_exposure.reporting import _pdf_needs_render, render_pdf
+            # Missing OR stale (md newer than pdf) — a delta pass that
+            # revised the markdown must not ship the previous sync's PDF.
+            if _pdf_needs_render(audit_md, audit_pdf):
+                render_pdf(str(workspace), stem="final_audit_report")
         except Exception as e:
             print(f"[long-exposure]   Audit PDF render error: {e}", flush=True)
 
@@ -967,8 +1048,15 @@ def _run_final_auditor(
         except OSError:
             pass
 
-    if audit_md.exists() and (not delta_mode or document_stage_touched):
+    if audit_md.exists() and document_completed and (not delta_mode or document_stage_touched):
         _write_commit_marker(marker_path, run_id=run_id, mode=mode, token_count=budget_tokens)
+    elif audit_md.exists() and not document_completed:
+        print(
+            "[long-exposure]   Audit commit marker withheld: document stage "
+            "did not complete (stop signal, stage failure, or document "
+            "unchanged this pass). Next pass will re-audit from full inputs.",
+            flush=True,
+        )
     elif audit_md.exists():
         print(
             "[long-exposure]   Audit commit marker not updated: delta audit "

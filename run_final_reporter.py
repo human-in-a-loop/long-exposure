@@ -29,6 +29,7 @@ from long_exposure.exploration import (
     update_status_file,
 )
 from long_exposure.orchestrator import load_config, resolve_instance_dir
+from long_exposure.reporting import _pdf_needs_render
 from auto_compact.db import init_db
 
 
@@ -134,8 +135,10 @@ def main():
         working_dir = config.get("working_directory", "/tmp")
         final_pdf = paths.final_report_pdf_path(working_dir)
         final_md = paths.final_report_path(working_dir)
-        if final_md.exists() and not final_pdf.exists():
-            print("[run_final] PDF missing — rendering now.")
+        # Missing OR stale (md newer than pdf) — a re-run that revised the
+        # markdown must not ship the previous pass's PDF.
+        if final_md.exists() and _pdf_needs_render(final_md, final_pdf):
+            print("[run_final] PDF missing or stale — rendering now.")
             _render_final_pdf(working_dir)
     else:
         print("[run_final] No final_reporter defined in score. Skipping.")

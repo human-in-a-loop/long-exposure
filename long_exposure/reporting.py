@@ -268,6 +268,14 @@ def _coerce_findings_counts(data: dict) -> dict:
     return {key: value for key, value in counts.items() if value}
 
 
+# Minimum plausible size for rescued boundary-stage content. A finalize- or
+# outline-stage rescue below this is almost certainly a status receipt
+# ("done, see file") rather than the deliverable; committing it would clobber
+# a real outline/report and — via the commit marker — poison every later
+# delta pass. Same threshold as the body-append fingerprint gate.
+_RESCUE_MIN_CONTENT_CHARS = 200
+
+
 def _extract_report_content(
     output_text: str,
     marker: str = "final_report_stage",
@@ -310,7 +318,10 @@ def _rescue_stage_file(
     """If the agent failed to write the expected file, write it from output.
 
     For body stages, appends to reports/final/draft.md.
-    For outline/finalize, writes/overwrites the target file.
+    For outline/finalize, writes/overwrites the target file — but only when
+    the extracted content passes a plausibility floor: a sub-200-char rescue
+    (a status receipt, never a report) or one dwarfed by an existing target
+    file must NOT clobber that file.
     Returns True if a rescue write was performed.
     """
     content = _extract_report_content(output_text)
@@ -318,6 +329,43 @@ def _rescue_stage_file(
         return False
 
     is_body = 1 < stage < total_stages
+    if not is_body:
+        # Boundary stages (outline / finalize) overwrite the target.
+        # Plausibility floor before destroying anything on disk.
+        existing_size = 0
+        try:
+            if expected_path.exists():
+                existing_size = expected_path.stat().st_size
+        except OSError:
+            existing_size = 0
+        implausible = len(content) < _RESCUE_MIN_CONTENT_CHARS
+        shadowed = existing_size > max(
+            _RESCUE_MIN_CONTENT_CHARS, 2 * len(content)
+        )
+        if implausible or shadowed:
+            reason = (
+                f"content too short ({len(content)} chars)" if implausible
+                else f"existing file substantially larger ({existing_size}b vs {len(content)} chars)"
+            )
+            print(
+                f"[long-exposure]   WARNING: rescue REFUSED for "
+                f"{expected_path.name} — {reason}. Leaving existing file "
+                f"untouched; rescued text looks like a receipt, not the "
+                f"deliverable.",
+                flush=True,
+            )
+            try:
+                from long_exposure import health_events as _he
+                _he.append_event(
+                    "file_gate_rescue_refused",
+                    detail=(
+                        f"stage={stage}/{total_stages} target={expected_path.name} "
+                        f"bytes={len(content)} existing={existing_size} reason={reason}"
+                    ),
+                )
+            except Exception:
+                pass
+            return False
     try:
         if is_body and expected_path.exists():
             # Append this stage's sections to the draft
@@ -345,6 +393,23 @@ def _rescue_stage_file(
         except Exception:
             pass
         return False
+
+
+def _pdf_needs_render(md_path: Path, pdf_path: Path) -> bool:
+    """True when the PDF is missing OR older than its source markdown.
+
+    Shared render-decision for every PDF gate (final reporter, final
+    auditor, run_final_reporter). The mtime comparison is what keeps
+    delta/daily-sync passes from shipping a fresh .md alongside a stale
+    .pdf from the previous sync. Degrades to rendering on stat errors so
+    a transient OSError can never leave a stale PDF in place.
+    """
+    if not pdf_path.exists():
+        return True
+    try:
+        return md_path.stat().st_mtime > pdf_path.stat().st_mtime
+    except OSError:
+        return True
 
 
 def render_pdf(working_dir: str, stem: str = "final_report") -> bool:
@@ -546,6 +611,13 @@ def _run_final_reporter(
     # Set when the FILE GATE fires, consumed and cleared on the next iteration.
     pending_rescue_warning: str | None = None
     final_stage_touched = False
+    # True only when the finalize stage ran to completion AND left
+    # final_report.md on disk. A pass that ends via stop signal (draft
+    # promotion at the FINAL GATE) must NOT write the commit marker —
+    # otherwise the next pass runs delta mode against a partial baseline
+    # with a near-zero token budget and the missing sections never get
+    # written.
+    finalize_completed = False
 
     for stage in range(1, total_stages + 1):
         # Check for stop signal between stages
@@ -702,7 +774,7 @@ def _run_final_reporter(
                 # but the agent didn't append (content went to OUTPUT instead)
                 elif 1 < stage < total_stages:
                     content = _extract_report_content(output_text)
-                    if content and len(content) > 200:
+                    if content and len(content) > _RESCUE_MIN_CONTENT_CHARS:
                         # Check if this content is already in the draft
                         existing = expected.read_text()
                         # Use first 80 chars of content as fingerprint
@@ -726,6 +798,16 @@ def _run_final_reporter(
 
                 if stage == total_stages and _file_signature(expected) != expected_before:
                     final_stage_touched = True
+                if stage == total_stages and expected.exists() and final_stage_touched:
+                    # Finalize stage ran AND actually changed final_report.md
+                    # this pass (agent-written or plausibly rescued) — the
+                    # commit marker may be written at the FINAL GATE. A file
+                    # left over from a PRIOR pass must not satisfy this gate:
+                    # committing it would poison every later delta pass with
+                    # a baseline this pass never produced. (Conservative
+                    # edge: a byte-identical rewrite withholds the marker and
+                    # the next pass re-runs fresh — accepted.)
+                    finalize_completed = True
 
             # Auto-compact — same pattern as standard reporter
             if total_ctx >= compact_at:
@@ -809,6 +891,10 @@ def _run_final_reporter(
                     )
                 elif expected and stage == total_stages:
                     final_stage_touched = True
+                # Same gating as the primary path: only a finalize stage that
+                # actually changed the file this pass may arm the commit marker.
+                if expected and stage == total_stages and expected.exists() and final_stage_touched:
+                    finalize_completed = True
 
                 # Auto-compact on retry path too
                 if total_ctx >= compact_at:
@@ -874,10 +960,22 @@ def _run_final_reporter(
         size_kb = final_md.stat().st_size // 1024
         print(f"[long-exposure]   Final report: {final_md.name} ({size_kb} KB)", flush=True)
 
-        if not final_pdf.exists():
-            print("[long-exposure]   FINAL GATE: PDF missing — rendering now.", flush=True)
+        if _pdf_needs_render(final_md, final_pdf):
+            print("[long-exposure]   FINAL GATE: PDF missing or stale — rendering now.", flush=True)
             _render_final_pdf(working_dir)
-        _write_commit_marker(marker_path, run_id=results.get("run_id") or score_inputs.get("run_id"), mode=mode, token_count=budget_tokens)
+        if finalize_completed:
+            _write_commit_marker(marker_path, run_id=results.get("run_id") or score_inputs.get("run_id"), mode=mode, token_count=budget_tokens)
+        else:
+            # Pass ended via stop signal / draft promotion, not a verified
+            # finalize stage. Withhold the marker so the next pass re-runs
+            # against the full input set instead of treating this partial
+            # report as a committed delta baseline.
+            print(
+                "[long-exposure]   FINAL GATE: commit marker withheld — "
+                "finalize stage did not complete (stop/draft promotion). "
+                "Next pass will re-synthesize from full inputs.",
+                flush=True,
+            )
     else:
         print(
             "[long-exposure]   FINAL GATE: final_report.md not produced. "

@@ -56,11 +56,15 @@ The Python parser cannot enforce (a)–(c) directly — they require
 semantic judgment. What the parser **does** enforce structurally:
 
 1. **K must be in [2, dynamic_cap]**, where `dynamic_cap =
-   pool.fanout_cap()` (= `available_slots() - 1`) when a single-provider
-   pool is active, `unified_pool.fanout_cap()` when Claude and Codex pools
-   are both configured, else `FANOUT_MAX_BRANCHES = 3`. K > cap is
-   tail-clamped and the dropped branches are surfaced to the next cycle's
-   `live_guidance`. K < 2 rejects the whole block.
+   pool.fanout_cap()` (= `available_slots()`; the root's own slot is
+   already excluded because the root holds a ledger slot) when a
+   single-provider pool is active, `unified_pool.fanout_cap()` when Claude
+   and Codex pools are both configured, else `FANOUT_MAX_BRANCHES = 3`
+   with no pool. A pool that is active but reports zero free capacity
+   yields cap 1, which rejects fan-out for that cycle. K > cap is
+   tail-clamped (logged; the dropped branch objectives are not re-surfaced
+   — the researcher re-proposes from session memory). K < 2 rejects the
+   whole block.
 2. **Output paths must be distinct** under `os.path.normpath`
    (catches `./a.md` vs `a.md`) AND must not be in ancestor/descendant
    relation (catches `dir` vs `dir/file.md`).
@@ -78,8 +82,9 @@ configuration. The researcher sees the current cap each cycle:
 Cap: up to N branches (set by current account-pool capacity, not by you).
 ```
 
-`N = available_slots() - 1`, with one slot reserved for sequential
-root calls. In unified-pool mode, the cap sums available Claude and
+`N = available_slots()` — the root's sequential calls are already
+accounted for by the ledger slot the root acquires at startup, so no
+further reserve is subtracted. In unified-pool mode, the cap sums available Claude and
 Codex pool capacity. With 5 accounts × 3 slots/account = 15 slots →
 cap 14. With 2 accounts → cap 5. Cooling accounts contribute 0; cold
 accounts contribute their full capacity.
@@ -138,6 +143,39 @@ When the parser accepts a block:
 The clone runs its own cycle loop normally. It compacts independently,
 hits its own rate-limits (which terminate it because it can't
 rotate), and writes a `merge_report.md` at exit.
+
+### Clone termination
+
+A clone (and the root loop — same code path) ends a branch through two
+complementary triggers, both funneling into the existing
+`topic_exhausted` exit that drives the proven merge-handoff:
+
+1. **Explicit signal (primary).** The auditor — the designated closure
+   authority — emits the sentinel `[[BRANCH_COMPLETE]]` on its own line
+   as its COMPLETE decision, only when the milestone is validated AND no
+   in-scope work remains. Detection is line-anchored
+   (`BRANCH_COMPLETE_RE` in `conductor.py`), scoped to the auditor's
+   fresh output for the current cycle, so an auditor merely *discussing*
+   the token, or a stale block resurrected from an earlier cycle, cannot
+   terminate the run.
+2. **Relative low-output backstop (deterministic).** A cycle counts as
+   "low output" below `max(500, 5% of the run's own peak cycle output)`;
+   two consecutive low cycles close the topic. The threshold is relative
+   because a fixed floor failed in practice: the mandatory structured
+   output (checkpoint + `[OUTPUT]` blocks + carry-forward) costs ~1.3-2.5k
+   tokens per cycle even with zero work, so genuinely idle clones sat
+   just above the old fixed 2,000-token floor and looped indefinitely.
+   Observed idle floors are ~2% of peak while substantive cycles run
+   ~7-13%, so 5% separates them with margin. Fan-out dispatch cycles and
+   post-merge integration cycles are exempt (forced substantive). The
+   calibration (`peak_cycle_output`, streak) persists across stop/resume
+   and resets when the usage basis changes (e.g. switching to the
+   interactive transport, whose token counts are estimates).
+
+The signal path is prompt-dependent; the backstop is not — the pair has
+no single point of failure. Deferred hardening (deterministic per-clone
+null-cycle cap, pool-independent preemption timer, hard-kill escalation,
+orphan reaping after a root SIGKILL) is tracked in `gaps.md`.
 
 ### Barrier and graceful preemption
 
@@ -407,7 +445,8 @@ the objective (e.g., "Group A — sub-task 1", "Group A — sub-task 2",
 2. Parser enforces structure (path collisions, K bounds, recursion);
    the model is trusted on independence semantics.
 3. Pool capacity dictates parallelism. There is no user-facing
-   branch-count knob. `fanout_cap = available_slots - 1`, summed across
+   branch-count knob. `fanout_cap = available_slots` (the root's held
+   ledger slot is already excluded), summed across
    Claude and Codex pools when unified mode is active.
 4. Clones are pinned at spawn via provider-specific force-account env
    vars. They never rotate; rate-limit on a pinned account exits the

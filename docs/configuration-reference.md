@@ -46,6 +46,12 @@ model_tier: opus
 cli_timeout: 0            # seconds per claude -p call (0 = no timeout)
 provider_idle_timeout_seconds: 1800  # no-progress provider CLI watchdog (0 = disabled)
 provider_idle_poll_seconds: 10       # watchdog poll interval
+claude_transport: headless           # headless | interactive (opt-in; see gaps_interactive_mode.md)
+interactive_driver_model: sonnet     # interactive mode: driver-loop model
+interactive_permission_mode: skip    # skip | scoped (typos fall back to scoped)
+interactive_recycle_turns: 40        # interactive mode: relaunch driver every N turns
+interactive_fetch_window_seconds: 30 # interactive mode: bridge long-poll window
+interactive_turn_timeout_seconds: 1800  # interactive mode: max wait per turn
 ```
 
 | Key | Meaning |
@@ -71,7 +77,9 @@ provider_idle_poll_seconds: 10       # watchdog poll interval
 | `codex_subagents` | Codex subagent runtime caps. `max_threads` limits concurrent child threads; `max_depth: 1` permits direct children but prevents recursive subagent trees. |
 | `model_tier` | Used by template substitution; selects philosophy-tier-specific phrasing |
 | `cli_timeout` | Per-provider CLI call timeout; `0` disables. Override per-agent in score |
-| `provider_idle_timeout_seconds` | No-progress watchdog for provider CLI calls. The call stays alive while stdout/stderr, the Codex final-output file, or an external child tool process is making progress. Provider-only CPU wakeups are not treated as progress. `0` disables. |
+| `provider_idle_timeout_seconds` | No-progress watchdog for provider CLI calls. Progress = growth of stdout/stderr or the Codex final-output file, a change in the process tree's shape, or cumulative CPU accumulation anywhere in the tree (coarsened to ~0.1 s buckets so idle scheduler wakeups don't count). A tree that is alive but accruing no CPU and writing nothing — including one merely *holding* an external child — is idle and gets killed at the timeout. `0` disables (e.g. for turns that legitimately block on quiet network waits). |
+| `claude_transport` | `headless` (default; one `claude -p` per turn, all features intact) or `interactive` (opt-in; routes turns through a persistent interactive session — defers pooling and fan-out; see `gaps_interactive_mode.md`, including its compliance gate). Unknown values warn and fall back to `headless`. Env override: `LONG_EXPOSURE_CLAUDE_TRANSPORT`. |
+| `interactive_*` | Interactive-transport tuning (driver model, permission mode, driver recycle cadence, bridge poll window, per-turn timeout). `interactive_permission_mode` falls back to `scoped` (the restrictive mode) on unknown values. |
 | `provider_idle_poll_seconds` | Poll interval for the provider idle watchdog. |
 
 ### Compaction

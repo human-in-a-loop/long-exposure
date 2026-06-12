@@ -58,6 +58,8 @@ long-exposure does, see the project [README](../README.md).
 | [`figures.md`](figures.md) | Figures as first-class; lexicon framework (scaffold only) | Figures / vocabulary |
 | [`soft-guidance.md`](soft-guidance.md) | Why soft-guidance, where to put it, the two refinements | Adding/editing prompts |
 | [`google-cloud-open-source-llm-costs.md`](google-cloud-open-source-llm-costs.md) | Cost trade-offs showing why Gemini Flash free tier is preferred over self-hosted open models on Google Cloud | Provider planning |
+| [`gaps.md`](gaps.md) | Known gaps: resolved incidents (with root-cause notes) and deliberately deferred items with justifications | Before filing/fixing a bug |
+| [`gaps_interactive_mode.md`](gaps_interactive_mode.md) | Opt-in interactive Claude transport: design, configuration, verification, and its own gaps table | Considering `claude_transport: interactive` |
 
 ---
 
@@ -85,5 +87,6 @@ long-exposure does, see the project [README](../README.md).
 | `figures.md` | ~270 | Contributor |
 | `soft-guidance.md` | ~200 | Contributor |
 
-Total: ~4,800 lines across 15 concept docs after removing stale
-implementation-plan artifacts.
+Total: ~5,000 lines of concept docs (implementation-plan and one-off
+incident artifacts are folded into these and removed; `gaps.md` keeps
+the condensed incident record).

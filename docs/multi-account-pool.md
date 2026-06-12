@@ -122,8 +122,9 @@ Transitions:
 `PER_ACCOUNT_SLOT_CAP = 3` (empirical ceiling on simultaneous in-flight
 provider CLI calls per account). `available_slots()` sums free capacity
 across primary + overflow + cold accounts; cooling accounts contribute
-zero. `fanout_cap()` returns `available_slots() - 1` (reserve 1 for
-sequential root calls).
+zero. `fanout_cap()` returns `available_slots()` — the root's sequential
+calls are covered by the ledger slot it acquires at startup (already
+excluded from `available_slots()`), so no extra reserve is subtracted.
 
 ### Freshness-based promotion
 

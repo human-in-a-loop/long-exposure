@@ -69,11 +69,27 @@ def _print_status(args: argparse.Namespace) -> int:
     state_path = _state_path(args.state, instance_dir)
     notify_path = state_path.parent / NOTIFICATIONS_FILE
     if status_path.exists():
-        print(status_path.read_text().rstrip())
+        try:
+            status_text = status_path.read_text(errors="replace").rstrip()
+        except OSError:
+            status_text = ""
+        if status_text:
+            print(status_text)
+        else:
+            # The writer rewrites this file between cycles; an empty/partial
+            # read means we raced it. Degrade gracefully instead of garbling.
+            print(
+                f"[long-exposure] Status file at {status_path} is empty or "
+                "still being written; retry in a few seconds."
+            )
     else:
         print(f"[long-exposure] No status file found at {status_path}")
     if notify_path.exists():
-        last = [ln for ln in notify_path.read_text().splitlines() if ln.strip()]
+        try:
+            notify_text = notify_path.read_text(errors="replace")
+        except OSError:
+            notify_text = ""
+        last = [ln for ln in notify_text.splitlines() if ln.strip()]
         if last:
             try:
                 notice = json.loads(last[-1])

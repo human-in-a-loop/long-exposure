@@ -39,6 +39,10 @@ run-configs/
 # Health / event streams
 health_events.jsonl
 
+# Launcher-captured run prompts (operator directives; may reference
+# private project context)
+.run_prompt_*.txt
+
 # Signal files
 *.stop
 *.clear

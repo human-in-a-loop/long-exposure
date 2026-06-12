@@ -1,5 +1,6 @@
 """Compaction logic: summary generation, storage, and bootstrap."""
 
+import sys
 import uuid
 from datetime import datetime, timezone
 
@@ -127,6 +128,40 @@ def generate_summary(
         system=system,
         messages=conversation,
     )
+
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        # Truncation cuts off the trailing <catalog> element, leaving the
+        # session with topic=NULL and invisible to gem ranking. The retry
+        # exists solely to recover that catalog — if the truncated response
+        # already contains a closed catalog, retrying would re-bill the full
+        # conversation for nothing, so accept the response with a warning.
+        truncated_text = (
+            response.content[0].text
+            if response.content and hasattr(response.content[0], "text")
+            else ""
+        )
+        if "</catalog>" in truncated_text:
+            print(
+                f"[auto-compact] WARNING: summary truncated at {max_tokens} "
+                f"tokens (stop_reason=max_tokens) but <catalog> is complete; "
+                f"accepting without retry.",
+                file=sys.stderr,
+            )
+        else:
+            # Catalog missing — retry once with double the budget.
+            response = client.messages.create(
+                model=model,
+                max_tokens=max_tokens * 2,
+                system=system,
+                messages=conversation,
+            )
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                print(
+                    f"[auto-compact] WARNING: summary still truncated at "
+                    f"{max_tokens * 2} tokens (stop_reason=max_tokens); "
+                    f"catalog may be missing, session may be gem-invisible.",
+                    file=sys.stderr,
+                )
 
     if not response.content or not hasattr(response.content[0], 'text'):
         raise ValueError("Summary generation returned no text content")

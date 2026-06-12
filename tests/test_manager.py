@@ -7,9 +7,12 @@ from unittest.mock import patch
 from long_exposure import cli
 from long_exposure.exploration import DEFAULT_SCORE_PATH, load_exploration_score
 from long_exposure.manager import (
+    GUIDE_MAX_CHARS,
+    GUIDE_TRIM_NOTE,
     VERDICT_ACT,
     VERDICT_HEALTHY,
     VERDICT_WATCH,
+    _write_guidance,
     build_manager_snapshot,
     decide_from_snapshot,
     run_manager_poll,
@@ -249,6 +252,43 @@ class ManagerTests(unittest.TestCase):
             guidance = (inst / "long-exposure.guide").read_text()
             self.assertIn("deterministic fallback used", guidance)
             self.assertIn("mechanism-overdue", guidance)
+
+    def test_write_guidance_skips_exact_duplicate_intervention(self):
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td)
+            text = "Cycle 5 intervention: tighten the mechanism."
+            _write_guidance(data, text)
+            _write_guidance(data, text)
+            _write_guidance(data, text)
+            content = (data / "long-exposure.guide").read_text()
+        self.assertEqual(content.count("tighten the mechanism"), 1)
+
+    def test_write_guidance_appends_distinct_interventions(self):
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td)
+            _write_guidance(data, "first intervention")
+            _write_guidance(data, "second intervention")
+            content = (data / "long-exposure.guide").read_text()
+        self.assertIn("first intervention", content)
+        self.assertIn("second intervention", content)
+
+    def test_write_guidance_caps_file_size_keeping_tail(self):
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td)
+            guide = data / "long-exposure.guide"
+            blocks = "\n\n".join(
+                f"old guidance block {n}: " + ("x" * 200) for n in range(200)
+            )
+            guide.write_text(blocks + "\n")
+            self.assertGreater(len(guide.read_text()), GUIDE_MAX_CHARS)
+            _write_guidance(data, "newest intervention text")
+            content = guide.read_text()
+        self.assertLessEqual(
+            len(content), GUIDE_MAX_CHARS + len(GUIDE_TRIM_NOTE) + 4
+        )
+        self.assertTrue(content.startswith(GUIDE_TRIM_NOTE))
+        self.assertIn("newest intervention text", content)
+        self.assertNotIn("old guidance block 0:", content)
 
     def test_healthy_snapshot_no_action(self):
         decision = decide_from_snapshot({

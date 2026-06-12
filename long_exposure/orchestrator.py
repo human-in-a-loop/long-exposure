@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as _ET
@@ -1520,6 +1521,11 @@ DEFAULT_CONTEXT_PROXIMITY = {
     "min_score": 0.3,
 }
 
+# Provider idle-watchdog defaults. These back both load_config()'s defaults
+# dict and call_claude()'s kwarg fallback, so they can't drift apart.
+DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS = 1800
+DEFAULT_PROVIDER_IDLE_POLL_SECONDS = 10
+
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -1530,7 +1536,7 @@ def load_config(path: str | Path | None = None) -> dict:
     """Load and validate config.yaml, applying defaults for missing keys."""
     path = Path(path) if path else DEFAULT_CONFIG_PATH
     with open(path) as f:
-        config = yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
 
     defaults = {
         "model": "opus",
@@ -1546,6 +1552,17 @@ def load_config(path: str | Path | None = None) -> dict:
         "local_temperature": 0.2,
         "local_top_p": 0.95,
         "context_window": 1_000_000,
+        # Claude transport: "headless" (default, `claude -p` subprocess per turn)
+        # or "interactive" (opt-in; route turns through a persistent interactive
+        # Claude session — see docs/gaps_interactive_mode.md). Only affects the
+        # Claude provider; codex/gemini/local are unaffected. Default keeps the
+        # existing `claude -p` behavior and advanced features intact.
+        "claude_transport": "headless",
+        "interactive_driver_model": "sonnet",
+        "interactive_permission_mode": "skip",  # skip | scoped
+        "interactive_recycle_turns": 40,
+        "interactive_fetch_window_seconds": 30,
+        "interactive_turn_timeout_seconds": 1800,
         "codex_context_window": 400_000,
         "gemini_context_window": 1_000_000,
         "codex_yolo": True,
@@ -1568,8 +1585,8 @@ def load_config(path: str | Path | None = None) -> dict:
         "working_directory": "",
         "allowed_tools": ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "WebSearch"],
         "cli_timeout": 0,
-        "provider_idle_timeout_seconds": 1800,
-        "provider_idle_poll_seconds": 10,
+        "provider_idle_timeout_seconds": DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS,
+        "provider_idle_poll_seconds": DEFAULT_PROVIDER_IDLE_POLL_SECONDS,
         "context_proximity": dict(DEFAULT_CONTEXT_PROXIMITY),
         "relevance_profiles": dict(DEFAULT_RELEVANCE_PROFILES),
         "telemetry": {
@@ -1596,6 +1613,32 @@ def load_config(path: str | Path | None = None) -> dict:
         config["telemetry"] = telemetry_cfg
     _provider.configure_provider(config)
     config["llm_provider"] = _provider.current_provider()
+    # Env override for the opt-in interactive transport (Claude only).
+    _env_transport = os.environ.get("LONG_EXPOSURE_CLAUDE_TRANSPORT")
+    if _env_transport:
+        config["claude_transport"] = _env_transport.strip().lower()
+    # Validate transport + permission mode (covers both config.yaml and the
+    # env override path above). Unknown values must fail toward the safe
+    # side: headless transport, and the RESTRICTIVE "scoped" permission mode
+    # — a typo must never silently select permission-skipping.
+    _transport = str(config.get("claude_transport") or "headless").strip().lower()
+    if _transport not in ("headless", "interactive"):
+        print(
+            f"[config] Unknown claude_transport {_transport!r}; "
+            "forcing 'headless'.",
+            flush=True,
+        )
+        _transport = "headless"
+    config["claude_transport"] = _transport
+    _perm_mode = str(config.get("interactive_permission_mode") or "scoped").strip().lower()
+    if _perm_mode not in ("skip", "scoped"):
+        print(
+            f"[config] Unknown interactive_permission_mode {_perm_mode!r}; "
+            "forcing 'scoped' (restrictive).",
+            flush=True,
+        )
+        _perm_mode = "scoped"
+    config["interactive_permission_mode"] = _perm_mode
     if _provider.is_codex():
         config["_claude_model"] = config.get("model")
         if config.get("codex_model"):
@@ -2505,6 +2548,13 @@ def _parse_accounts() -> list[str | None]:
     an empty list — a pathological CLAUDE_ACCOUNTS value like ",, " falls
     back to [None] so rotate_to_next_account can't divide by zero.
     """
+    # Gemini account pooling is deliberately disabled (mirrors
+    # provider.parse_pool_env): per-home OAuth pooling needs operator-managed
+    # auth flows and has not been live-validated. Honor the same guard here
+    # so GEMINI_ACCOUNT_POOL/GEMINI_HOMES can't re-enable rotation through
+    # this duplicate parser.
+    if _provider.is_gemini():
+        return [None]
     raw = ""
     for env_name in _provider.account_pool_envs():
         raw = os.environ.get(env_name, "").strip()
@@ -2833,6 +2883,35 @@ def _provider_process_activity(root_pid: int) -> tuple[int, int, bool]:
     return len(seen), total_ticks, external_child
 
 
+# Coarsen cumulative CPU time to ~0.1s buckets (the usual USER_HZ is 100)
+# before it enters the activity signature, so the handful of ticks a
+# sleeping tree accrues from scheduler noise doesn't register as progress.
+_CPU_TICK_GRANULARITY = 10
+
+
+def _activity_signature(tree: tuple[int, int, bool]) -> tuple[int, bool, int]:
+    """Reduce a _provider_process_activity tuple to a progress signature.
+
+    Progress = the signature CHANGES between polls: tree shape (size,
+    external-child presence) or cumulative CPU crossing a granularity
+    bucket. A genuinely working tool child (including a long-lived MCP
+    server doing real work) keeps accumulating CPU and satisfies the
+    watchdog; a sleeping/deadlocked tree stops accumulating and the idle
+    timeout fires. The mere EXISTENCE of an external child is not progress.
+    """
+    tree_size, cpu_ticks, has_external_child = tree
+    return tree_size, has_external_child, cpu_ticks // _CPU_TICK_GRANULARITY
+
+
+def _bounded_tail(path: Path, limit: int = 500) -> str:
+    """Last `limit` chars of a capture file, for timeout forensics."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return ""
+    return text[-limit:]
+
+
 def _file_progress_signature(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
     sig: list[tuple[str, int, int]] = []
     for path in paths:
@@ -2909,35 +2988,46 @@ def _run_cli_subprocess(
     )
     try:
         if proc.stdin is not None:
-            try:
-                proc.stdin.write(stdin_text)
-                proc.stdin.close()
-            except BrokenPipeError:
-                pass
+            # Feed stdin from a daemon thread: a wedged child that never
+            # drains its pipe would block a synchronous write forever on
+            # prompts larger than the pipe buffer. With the write off the
+            # main thread, the hard/idle watchdog below stays in charge —
+            # killing the process unblocks (and ends) the writer thread.
+            def _feed_stdin(stdin_pipe=proc.stdin) -> None:
+                try:
+                    stdin_pipe.write(stdin_text)
+                    stdin_pipe.close()
+                except (OSError, ValueError):
+                    # Pipe torn down by a kill/cleanup race (BrokenPipeError
+                    # is an OSError subclass); nothing to do.
+                    pass
+
+            threading.Thread(target=_feed_stdin, daemon=True).start()
 
         progress_paths = [stdout_path, stderr_path]
         if output_file is not None:
             progress_paths.append(output_file)
         last_sig = _file_progress_signature(progress_paths)
-        last_tree = _provider_process_activity(proc.pid)
-        last_tree_shape = (last_tree[0], last_tree[2])
+        last_activity = _activity_signature(_provider_process_activity(proc.pid))
         last_progress = time.monotonic()
 
         while proc.poll() is None:
             now = time.monotonic()
             if timeout and (now - start) >= timeout:
                 _terminate_process_group(proc)
-                raise subprocess.TimeoutExpired(cmd, timeout)
+                raise subprocess.TimeoutExpired(
+                    cmd,
+                    timeout,
+                    output=f"stdout tail: {_bounded_tail(stdout_path)!r}",
+                    stderr=_bounded_tail(stderr_path),
+                )
 
             sig = _file_progress_signature(progress_paths)
-            tree = _provider_process_activity(proc.pid)
-            has_external_child = tree[2]
-            tree_shape = (tree[0], tree[2])
-            if sig != last_sig or has_external_child or tree_shape != last_tree_shape:
+            activity = _activity_signature(_provider_process_activity(proc.pid))
+            if sig != last_sig or activity != last_activity:
                 last_progress = now
                 last_sig = sig
-                last_tree = tree
-                last_tree_shape = tree_shape
+                last_activity = activity
             elif idle_timeout and (now - last_progress) >= idle_timeout:
                 _terminate_process_group(proc)
                 raise subprocess.TimeoutExpired(
@@ -2945,11 +3035,12 @@ def _run_cli_subprocess(
                     int(now - start),
                     output=(
                         f"provider CLI idle timeout after {idle_timeout}s "
-                        "with no stdout/stderr/output-file progress or external child tool"
+                        "with no stdout/stderr/output-file progress and no "
+                        "process-tree CPU activity; "
+                        f"stdout tail: {_bounded_tail(stdout_path)!r}"
                     ),
+                    stderr=_bounded_tail(stderr_path),
                 )
-            else:
-                last_tree = tree
             sleep_for = idle_poll
             if timeout:
                 remaining = max(0.1, timeout - (time.monotonic() - start))
@@ -2977,10 +3068,17 @@ def _run_cli_subprocess(
                 pass
 
 
-def _extract_codex_envelope(stdout: str, final_text: str, duration_ms: int) -> dict | None:
+def _extract_codex_envelope(
+    stdout: str,
+    final_text: str,
+    duration_ms: int,
+    *,
+    output_file_error: bool = False,
+) -> dict | None:
     thread_id = None
     usage = {}
     saw_event = False
+    turn_completed = False
     for line in (stdout or "").splitlines():
         line = line.strip()
         if not line:
@@ -2999,6 +3097,7 @@ def _extract_codex_envelope(stdout: str, final_text: str, duration_ms: int) -> d
         if event.get("type") == "thread.started":
             thread_id = event.get("thread_id") or thread_id
         elif event.get("type") == "turn.completed":
+            turn_completed = True
             usage = event.get("usage") or usage
         elif event.get("type") == "error":
             return {
@@ -3010,6 +3109,23 @@ def _extract_codex_envelope(stdout: str, final_text: str, duration_ms: int) -> d
             }
     if not saw_event and not final_text:
         return None
+    if output_file_error and saw_event and turn_completed and not final_text:
+        # The turn completed but the `-o` output file was missing/unreadable,
+        # so the final text was silently lost. Surface as an error so the
+        # failure-streak path handles it instead of recording a fake
+        # successful empty turn. (An existing-but-empty output file is NOT
+        # this case — the model genuinely returned nothing, which stays a
+        # success.)
+        return {
+            "result": (
+                "codex turn completed but the -o output file was missing or "
+                "unreadable; final message lost"
+            ),
+            "usage": usage,
+            "duration_ms": duration_ms,
+            "session_id": thread_id,
+            "is_error": True,
+        }
     return {
         "result": final_text,
         "usage": usage,
@@ -3222,22 +3338,39 @@ def _invoke_claude(
                 output_file.unlink()
             except OSError:
                 pass
-        raise ClaudeCliError(f"{_provider.current_provider()} CLI timed out after {timeout}s") from e
+        # _run_cli_subprocess attaches bounded stdout/stderr tails to the
+        # exception before its temp files are unlinked — surface them so a
+        # hang leaves some forensics behind.
+        detail_parts = []
+        if isinstance(e.output, str) and e.output.strip():
+            detail_parts.append(e.output.strip())
+        if isinstance(e.stderr, str) and e.stderr.strip():
+            detail_parts.append(f"stderr tail: {e.stderr.strip()!r}")
+        detail = "; ".join(detail_parts)
+        raise ClaudeCliError(
+            f"{_provider.current_provider()} CLI timed out after {timeout}s"
+            + (f" — {detail}" if detail else "")
+        ) from e
 
     duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
 
     if _is_codex_command(cmd):
         final_text = ""
+        output_file_error = False
         if output_file:
             try:
                 final_text = output_file.read_text()
             except OSError:
                 final_text = ""
+                output_file_error = True
             try:
                 output_file.unlink()
             except OSError:
                 pass
-        envelope = _extract_codex_envelope(result.stdout, final_text, duration_ms)
+        envelope = _extract_codex_envelope(
+            result.stdout, final_text, duration_ms,
+            output_file_error=output_file_error,
+        )
         if _is_rate_limit(result.returncode, result.stderr, result.stdout, envelope):
             snippet = (result.stderr or result.stdout or final_text or "")[:300]
             raise ClaudeRateLimitError(
@@ -3345,6 +3478,8 @@ def call_claude(
     cwd: str | None = None,
     permission_flags: list[str] | None = None,
     effort: str | None = None,
+    idle_timeout: int | None = None,
+    idle_poll: int | None = None,
 ) -> dict:
     """Call Claude via CLI subprocess. Returns the parsed JSON envelope.
 
@@ -3430,18 +3565,36 @@ def call_claude(
         prompt_for_cli = prompt
         cwd_for_cli = cwd
 
+    # Idle-watchdog wiring for the orchestrator's own calls (compaction,
+    # checkpoint, run_loop turns) — without it, cli_timeout=0 (the default)
+    # means a wedged CLI hangs these call sites forever. Callers are expected
+    # to pass explicit values threaded from the run's config; these
+    # module-level defaults only cover call sites that omit the kwargs.
+    # (A load_config() fallback here would read DEFAULT_CONFIG_PATH, not the
+    # run's --config file, and re-run YAML parsing per call.)
+    if idle_timeout is None:
+        idle_timeout = DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS
+    if idle_poll is None:
+        idle_poll = DEFAULT_PROVIDER_IDLE_POLL_SECONDS
+
     accounts = _parse_accounts()
     is_forced, _pin = _resolve_force_account(accounts)
 
     if is_forced or len(accounts) == 1:
         # Single-account or pinned: one attempt, rate-limit bubbles up.
-        return _invoke_claude(cmd, prompt_for_cli, cwd=cwd_for_cli, timeout=timeout or None)
+        return _invoke_claude(
+            cmd, prompt_for_cli, cwd=cwd_for_cli, timeout=timeout or None,
+            idle_timeout=idle_timeout, idle_poll=idle_poll,
+        )
 
     # Multi-account: try up to len(accounts) times, rotating on rate-limit.
     last_err: ClaudeRateLimitError | None = None
     for attempt in range(len(accounts)):
         try:
-            return _invoke_claude(cmd, prompt_for_cli, cwd=cwd_for_cli, timeout=timeout or None)
+            return _invoke_claude(
+                cmd, prompt_for_cli, cwd=cwd_for_cli, timeout=timeout or None,
+                idle_timeout=idle_timeout, idle_poll=idle_poll,
+            )
         except ClaudeRateLimitError as e:
             last_err = e
             prev, new, new_dir = rotate_to_next_account()
@@ -3691,7 +3844,7 @@ def build_allowed_tools_flags(config: dict) -> list[str]:
     """Build --allowedTools CLI flags from config.
 
     Returns a list of CLI arguments, e.g.:
-        ["--allowedTools", "Read(//data/home/user/**)", "--allowedTools", "Bash"]
+        ["--allowedTools", "Read(//home/user/**)", "--allowedTools", "Bash"]
 
     If allowed_tools is "dangerously_skip_all", returns
     ["--dangerously-skip-permissions"] instead.
@@ -3920,6 +4073,8 @@ def compact_with_conditioning(
         model=config["model"],
         timeout=config.get("cli_timeout", 0),
         disable_tools=True,
+        idle_timeout=config.get("provider_idle_timeout_seconds"),
+        idle_poll=config.get("provider_idle_poll_seconds"),
     )
 
     envelope = call_claude_pool_aware(**summary_call_kwargs)
@@ -4088,6 +4243,8 @@ def checkpoint_without_compaction(
         model=config["model"],
         timeout=config.get("cli_timeout", 0),
         disable_tools=True,
+        idle_timeout=config.get("provider_idle_timeout_seconds"),
+        idle_poll=config.get("provider_idle_poll_seconds"),
     )
 
     # Checkpoint is best-effort observability; on empty/malformed payload we
@@ -4273,6 +4430,8 @@ def run_loop(
                 cwd=config.get("working_directory") or None,
                 permission_flags=permission_flags,
                 effort=_effort,
+                idle_timeout=config.get("provider_idle_timeout_seconds"),
+                idle_poll=config.get("provider_idle_poll_seconds"),
             )
         except ClaudeCliError as e:
             print(f"\n[ERROR] {e}\n")
@@ -4292,7 +4451,16 @@ def run_loop(
 
         response_text = envelope.get("result", "")
         usage = envelope.get("usage", {})
-        total_tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+        # Include cache tokens: the CLI reports cache reads/creation
+        # separately from input_tokens, and in exactly the long-conversation
+        # regime most of the context arrives via cache — omitting them makes
+        # the compaction trigger fire late or never.
+        total_tokens = (
+            usage.get("input_tokens", 0)
+            + usage.get("output_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+        )
 
         if response_text:
             print(f"\nAssistant: {response_text}\n")

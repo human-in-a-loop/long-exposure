@@ -320,8 +320,30 @@ def build_agent_prompt(
 
 # Tier 1: exact regex match
 _OUTPUT_RE = re.compile(
-    r"\[OUTPUT:\s*(\S+)\](.*?)\[END OUTPUT\]",
+    # Accept both the bare close tag ([END OUTPUT]) and the named form
+    # ([END OUTPUT: <name>]) that agents frequently emit. Matching only the
+    # bare form silently dropped well-formed named blocks: Tier-1 found 0
+    # matches and Tier-2 then dumped the entire message. See docs/gaps.md
+    # (periodic report captured cover-note instead of report body).
+    r"\[OUTPUT:\s*(\S+)\](.*?)\[END OUTPUT(?::[^\]]*)?\]",
     re.DOTALL,
+)
+
+# Explicit, machine-readable "this branch/topic is fully explored" signal.
+# Emitted by the auditor (the closure authority) as its COMPLETE decision; the
+# exploration cycle loop watches the auditor's fresh output for it and ends the
+# loop (vs. inferring exhaustion only from output volume, which idle-but-verbose
+# clones can defeat — see docs/parallelism.md "Clone termination").
+BRANCH_COMPLETE_SIGNAL = "[[BRANCH_COMPLETE]]"
+
+# Line-anchored detection of the signal. The score instructs the auditor to
+# emit it "on its own line"; a plain substring check also fired when an
+# auditor merely DISCUSSED the token ("I am NOT emitting [[BRANCH_COMPLETE]]
+# because...") and terminated the run. Single source of truth: importers must
+# use this pattern, not `BRANCH_COMPLETE_SIGNAL in text`.
+BRANCH_COMPLETE_RE = re.compile(
+    r"^\s*" + re.escape(BRANCH_COMPLETE_SIGNAL) + r"\s*$",
+    re.MULTILINE,
 )
 
 
@@ -337,11 +359,14 @@ def parse_outputs(
     """
     found: dict[str, str] = {}
 
-    # Tier 1: regex extraction
+    # Tier 1: regex extraction. Keep the longest block for a given name:
+    # agents sometimes mention the marker inline in trailing prose or emit a
+    # short stub after the real block, and last-write-wins would clobber the
+    # real content with the later, shorter occurrence.
     for match in _OUTPUT_RE.finditer(response_text):
         name = match.group(1).strip()
         content = match.group(2).strip()
-        if name in expected_outputs:
+        if name in expected_outputs and len(content) >= len(found.get(name, "")):
             found[name] = content
 
     # Tier 2: single-output fallback
@@ -354,6 +379,99 @@ def parse_outputs(
             found[name] = f"[PARSE_FAILED: {name}] No output block found in agent response"
 
     return found
+
+
+def _is_user_prompt_entry(obj: dict) -> bool:
+    """True for a genuine user prompt entry in a session JSONL.
+
+    A real prompt's message content is either a plain string or a content
+    list containing a {"type": "text"} chunk. Content lists holding only
+    tool_result chunks are tool returns echoed back to the model mid-turn,
+    not prompts — they must NOT reset the current-turn boundary.
+    """
+    if obj.get("type") != "user":
+        return False
+    content = obj.get("message", {}).get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return any(
+            isinstance(chunk, dict) and chunk.get("type") == "text"
+            for chunk in content
+        )
+    return False
+
+
+def _session_transcript_text(session_id: str | None) -> str:
+    """Concatenate assistant text blocks from the CURRENT turn of a Claude
+    session transcript.
+
+    The Claude CLI envelope exposes only the final assistant message
+    (``result``). When an agent emits its deliverable in an earlier message
+    of the turn and then ends with a trailing checkpoint/cover-note, that
+    deliverable is absent from ``result`` and ``parse_outputs`` cannot see
+    it. Reading the session JSONL recovers the full assistant text.
+
+    Scoped to text AFTER the last genuine user prompt: sessions span cycles
+    (and ``--resume`` forks copy history), so concatenating the whole file
+    let a prior cycle's [OUTPUT: ...] block win longest-block selection and
+    resurrect stale deliverables (or falsely re-trigger BRANCH_COMPLETE).
+
+    Best-effort: returns "" if the transcript cannot be located or read.
+    """
+    if not session_id:
+        return ""
+    try:
+        # Function-level import avoids a module-load circular import
+        # (exploration imports parse_outputs from this module).
+        from .exploration import _claude_config_dir
+        projects = _claude_config_dir() / "projects"
+    except Exception:
+        return ""
+    if not projects.is_dir():
+        return ""
+    blocks: list[str] = []
+    try:
+        for project in projects.iterdir():
+            jsonl = project / f"{session_id}.jsonl"
+            if not jsonl.is_file():
+                continue
+            # Line-by-line: long-run transcripts grow unbounded, so never
+            # read_text() the whole file into memory.
+            with jsonl.open(errors="replace") as fh:
+                for line in fh:
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    # Task-subagent (sidechain) entries interleave with the
+                    # main thread in the same JSONL. A sidechain's seed
+                    # prompt is a plain-string "user" entry — a false turn
+                    # boundary that would wipe the main turn's collected
+                    # blocks — and its assistant text is the SUBAGENT's
+                    # output, not the agent's own (it could even inject a
+                    # subagent's [[BRANCH_COMPLETE]]). Skip sidechain
+                    # entries for both boundary detection and collection.
+                    if obj.get("isSidechain"):
+                        continue
+                    if _is_user_prompt_entry(obj):
+                        blocks = []  # new turn — discard earlier turns' text
+                        continue
+                    if obj.get("type") != "assistant":
+                        continue
+                    content = obj.get("message", {}).get("content")
+                    if isinstance(content, list):
+                        for chunk in content:
+                            if (
+                                chunk.get("type") == "text"
+                                and chunk.get("text", "").strip()
+                            ):
+                                blocks.append(chunk["text"])
+            if blocks:
+                break
+    except OSError:
+        return ""
+    return "\n\n".join(blocks)
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +547,12 @@ def run_agent(
             effort=agent_def.get("effort") or PHILOSOPHY_EFFORT_MAP.get(
                 agent_config.get("philosophy", "efficient"), "high"
             ),
+            # Explicit pass-through from the run's config (same keys the
+            # exploration call path threads to _invoke_claude). Omitting
+            # these would leave call_claude on its module-level defaults
+            # rather than the values from this run's --config file.
+            idle_timeout=agent_config.get("provider_idle_timeout_seconds"),
+            idle_poll=agent_config.get("provider_idle_poll_seconds"),
         )
 
         response_text = envelope.get("result", "")

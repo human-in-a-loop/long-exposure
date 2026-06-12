@@ -1,7 +1,7 @@
 # config.yaml
 
 # === Model ===
-llm_provider: codex                   # claude | codex | gemini | local (local is an unsupported extension point)
+llm_provider: claude                  # claude | codex | gemini | local (local is an unsupported extension point)
 model: opus                          # alias (sonnet, opus, haiku) or full name
 codex_model: gpt-5.5                  # used when llm_provider: codex unless agent overrides model
 gemini_model: gemini-3-flash-preview  # used when llm_provider: gemini unless agent overrides model
@@ -27,6 +27,21 @@ model_tier: opus
 cli_timeout: 0                       # seconds per claude -p call (0 = no timeout)
 provider_idle_timeout_seconds: 1800  # no-progress hold before killing a silent provider CLI (0 = disabled)
 provider_idle_poll_seconds: 10       # provider watchdog poll interval
+
+# === Claude transport (opt-in) ===
+# headless (default): one `claude -p` subprocess per turn — unchanged behavior,
+#   all advanced features (multi-account pooling, parallel fan-out) intact.
+# interactive: route Claude turns through a persistent interactive session so
+#   they draw on the included Max subscription instead of the metered Agent-SDK
+#   credit pool that `claude -p` uses from 2026-06-15. Claude-only; codex/gemini
+#   are unaffected. Defers pooling + parallel fan-out (sequential cycles).
+#   See docs/gaps_interactive_mode.md. Env override: LONG_EXPOSURE_CLAUDE_TRANSPORT.
+claude_transport: headless           # headless | interactive
+interactive_driver_model: sonnet     # model for the lightweight driver loop
+interactive_permission_mode: skip    # skip (--dangerously-skip-permissions, like --yolo) | scoped
+interactive_recycle_turns: 40        # relaunch the stateless driver every N turns to bound context
+interactive_fetch_window_seconds: 30 # bridge long-poll window before the driver re-polls
+interactive_turn_timeout_seconds: 1800  # max wait for one interactive turn's response
 
 # === Compact ===
 compact_threshold: 0.90

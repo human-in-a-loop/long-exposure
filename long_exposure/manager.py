@@ -40,6 +40,8 @@ VERDICT_ACT = "act"
 VERDICT_ESCALATE = "escalate"
 
 GUIDE_FILE = "long-exposure.guide"
+GUIDE_MAX_CHARS = 32 * 1024
+GUIDE_TRIM_NOTE = "[long-exposure manager] older guidance trimmed to cap guide-file size."
 PAUSE_FILE = "long-exposure.pause-for-user"
 NOTIFICATIONS_FILE = "manager_notifications.jsonl"
 
@@ -506,8 +508,17 @@ def _write_guidance(data_dir: Path, text: str) -> Path:
     if path.exists():
         existing = path.read_text().strip()
     body = text.strip()
+    if body and body in existing:
+        # Repeated polls against a stopped/stuck instance would otherwise
+        # append the identical intervention every poll; nothing consumes the
+        # guide file until the next cycle, so skip exact duplicates.
+        return path
     if existing:
         body = existing + "\n\n" + body
+    if len(body) > GUIDE_MAX_CHARS:
+        # Keep the tail (which includes the new intervention) and note the
+        # trim so consumers know older guidance was dropped.
+        body = GUIDE_TRIM_NOTE + "\n\n" + body[-GUIDE_MAX_CHARS:].lstrip()
     path.write_text(body.strip() + "\n")
     return path
 

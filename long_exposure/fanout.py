@@ -102,17 +102,21 @@ def _fanout_branch_cap() -> int:
     """Maximum branches the researcher may propose this cycle.
 
     When the account pool (Stage 1) is active, derive from pool capacity
-    (`pool.fanout_cap()` = available_slots - 1 reserved for sequential root
-    calls). Otherwise fall back to FANOUT_MAX_BRANCHES.
+    (`pool.fanout_cap()`; the root's sequential calls are covered by its
+    own ledger slot). Otherwise fall back to FANOUT_MAX_BRANCHES.
+
+    A cap of 0 from an ACTIVE pool means "saturated/cooling right now" —
+    return 1 so the parser rejects fan-out blocks (K must be ≥ 2), same
+    as the cap==1 path. Falling back to FANOUT_MAX_BRANCHES here would
+    invite branches that all PoolExhausted-fallback onto the root's
+    account. The legacy cap applies only when no pool is configured.
     """
     try:
         from long_exposure import pool as _pool
         if unified_pool.is_unified_active():
-            cap = unified_pool.fanout_cap()
-            return max(1, cap) if cap > 0 else FANOUT_MAX_BRANCHES
+            return max(1, unified_pool.fanout_cap())
         if _pool.is_active():
-            cap = _pool.fanout_cap()
-            return max(1, cap) if cap > 0 else FANOUT_MAX_BRANCHES
+            return max(1, _pool.fanout_cap())
     except Exception:
         pass
     return FANOUT_MAX_BRANCHES
@@ -1089,6 +1093,22 @@ def _spawn_clone(
                 f"post-acquire ({_err}); update_slot_pid will be skipped",
                 flush=True,
             )
+        # Capture the pinned provider's raw pool config BEFORE popping the
+        # pool env vars below, and stash it under the clone fallback name.
+        # pool.parse_pool_config falls back to it, so clone-side pool state
+        # functions (is_active, update_slot_pid + atexit release in the
+        # exploration clone bootstrap, mark_rate_limited + release in the
+        # §6.2 clone rate-limit path) keep working — while the
+        # orchestrator's rotation parser (_parse_accounts), which reads
+        # only the primary env names, still sees a single account.
+        _clone_pool_provider = (
+            unified_holder.provider if unified_holder is not None else None
+        )
+        _clone_pool_raw = ""
+        for env_name in _provider.account_pool_envs(_clone_pool_provider):
+            _clone_pool_raw = env.get(env_name, "").strip()
+            if _clone_pool_raw:
+                break
         if unified_holder is not None:
             env["LONG_EXPOSURE_LLM_PROVIDER"] = unified_holder.provider
             env[_provider.force_account_env(unified_holder.provider)] = pinned_account_dir
@@ -1102,38 +1122,46 @@ def _spawn_clone(
             # retry loop in call_claude — pinned accounts must single-attempt.
             for env_name in _provider.account_pool_envs():
                 env.pop(env_name, None)
+        if _clone_pool_raw:
+            # Literal name (= pool.CLONE_POOL_CONFIG_ENV) so this still
+            # works in the defensive pool_module-unavailable branch above.
+            env["LONG_EXPOSURE_CLONE_POOL_CONFIG"] = _clone_pool_raw
         print(
             f"[long-exposure]   clone-{clone_k}: pinned to "
             f"{Path(pinned_account_dir).name}"
             + (f" ({unified_holder.provider})" if unified_holder is not None else ""),
             flush=True,
         )
-    python_exe = _resolve_python_exe()
-    cmd = [
-        python_exe, "-m", "long_exposure.exploration",
-        "--score", str(score_path),
-        "--instance-dir", str(clone_dir),
-    ]
-    if config_path:
-        cmd.extend(["--config", str(config_path)])
-    cmd.append("resume")
-    log_path = clone_dir / "clone.log"
-    log_fh = open(log_path, "a")
-    log_fh.write(
-        f"\n\n=== clone spawn {datetime.now(timezone.utc).isoformat()} ===\n"
-        f"python_exe={python_exe}\n"
-    )
-    log_fh.flush()
-
+    log_fh = None
     try:
+        python_exe = _resolve_python_exe()
+        cmd = [
+            python_exe, "-m", "long_exposure.exploration",
+            "--score", str(score_path),
+            "--instance-dir", str(clone_dir),
+        ]
+        if config_path:
+            cmd.extend(["--config", str(config_path)])
+        cmd.append("resume")
+        log_path = clone_dir / "clone.log"
+        log_fh = open(log_path, "a")
+        log_fh.write(
+            f"\n\n=== clone spawn {datetime.now(timezone.utc).isoformat()} ===\n"
+            f"python_exe={python_exe}\n"
+        )
+        log_fh.flush()
         p = subprocess.Popen(
             cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
     except OSError:
-        # Popen failed before any clone process existed. Release the slot
-        # we just acquired so it doesn't leak. Re-raise so the conductor
-        # records this branch as spawn_failed.
+        # Spawn failed before any clone process existed. This guard covers
+        # everything up to and including Popen — interpreter resolution
+        # (FileNotFoundError is an OSError subclass), the clone.log
+        # open/write, and Popen itself — because the caller's
+        # `except OSError` assumes the slot was released on any of these.
+        # Release the slot we just acquired so it doesn't leak. Re-raise so
+        # the conductor records this branch as spawn_failed.
         if pool_slot_acquired and pool_module is not None:
             try:
                 if unified_holder is not None:
@@ -1143,10 +1171,14 @@ def _spawn_clone(
             except Exception as _re:
                 print(
                     f"[long-exposure]   clone-{clone_k}: slot release after "
-                    f"Popen failure also failed ({_re})",
+                    f"spawn failure also failed ({_re})",
                     flush=True,
                 )
-        log_fh.close()
+        if log_fh is not None:
+            try:
+                log_fh.close()
+            except OSError:
+                pass
         raise
 
     # Parent-side post-Popen slot re-tag. Idempotent fallback: the clone
@@ -1705,8 +1737,17 @@ def _run_fanout_conductor(
                     if mrp.exists() or p.poll() is not None:
                         break
                 if mrp.exists():
-                    outcomes[k]["merge_report"] = mrp.read_text()
-                    outcomes[k]["state"] = "done_capped"
+                    try:
+                        outcomes[k]["merge_report"] = mrp.read_text()
+                        outcomes[k]["state"] = "done_capped"
+                    except OSError as e:
+                        # Same degradation as the barrier-poll read above:
+                        # never let a transient read failure crash the
+                        # whole conductor.
+                        outcomes[k]["state"] = "error"
+                        outcomes[k]["merge_report"] = (
+                            f"# Merge Report Unreadable\n\n{e}\n"
+                        )
                 else:
                     # Hard-kill the whole process group so any Claude CLI
                     # subprocess the clone is blocked in also dies. The clone

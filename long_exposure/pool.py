@@ -27,11 +27,24 @@ Backward compatibility:
   - If CLAUDE_ACCOUNT_POOL is set, parse it as a comma-separated list.
   - Else if CLAUDE_ACCOUNTS is set, treat it as the pool (same data, old
     name; existing deployments seamlessly upgrade).
+  - Else if LONG_EXPOSURE_CLONE_POOL_CONFIG is set, parse it the same way.
+    The fan-out conductor pops the primary pool env vars from a pinned
+    clone's env (so the clone never runs the orchestrator's multi-account
+    rotation loop) and stashes the original value under this name so
+    clone-side pool semantics (slot re-tag + atexit release, §6.2
+    rate-limit mark+release) keep working.
   - Else single-account mode (callers see is_active()==False).
 
-CLAUDE_FORCE_ACCOUNT continues to work as the debug pin: when set, the pool
-is bypassed entirely. is_active() returns False so all higher-level logic
-takes the legacy single-account path.
+CLAUDE_FORCE_ACCOUNT does NOT bypass the pool. is_active() deliberately
+ignores the force pin: the pool itself sets CLAUDE_FORCE_ACCOUNT on the
+parent (to pin the active primary) and on each clone (to pin the assigned
+dir), so short-circuiting on the pin would disable every pool operation
+right after startup pinning — the failure mode behind the 9h46m
+no-rotation incident (see is_active's docstring). The pin only restricts
+which account each call uses (orchestrator._resolve_force_account); the
+pool state machine still runs. To debug-pin WITHOUT pool semantics, set
+CLAUDE_FORCE_ACCOUNT while leaving CLAUDE_ACCOUNT_POOL / CLAUDE_ACCOUNTS
+unset — parse_pool_config returns [] and is_active() returns False.
 """
 
 from __future__ import annotations
@@ -103,14 +116,34 @@ COOLING = "cooling"
 # ---------------------------------------------------------------------------
 
 
+# Fallback env var for pinned clones. The fan-out conductor (_spawn_clone)
+# pops the provider pool env vars (CLAUDE_ACCOUNT_POOL etc.) from the clone's
+# env so the clone never runs the orchestrator's multi-account rotation loop
+# (orchestrator._parse_accounts reads only the primary names). It stashes the
+# original value here so clone-side pool state functions — is_active,
+# update_slot_pid, release_slot_by_branch, mark_rate_limited — still see the
+# pool. Without this, a pinned clone saw is_active()==False, never re-tagged
+# or released its slot, and a rate-limited clone could not mark its account
+# cooling or exit the §6.2 path.
+CLONE_POOL_CONFIG_ENV = "LONG_EXPOSURE_CLONE_POOL_CONFIG"
+
+
 def parse_pool_config() -> list[str]:
     """Return the ordered list of account config dirs.
 
-    CLAUDE_ACCOUNT_POOL takes precedence; otherwise CLAUDE_ACCOUNTS (legacy).
-    Returns [] when neither is set — single-account mode.
+    CLAUDE_ACCOUNT_POOL takes precedence; otherwise CLAUDE_ACCOUNTS (legacy);
+    otherwise LONG_EXPOSURE_CLONE_POOL_CONFIG (set by the fan-out conductor
+    in pinned clones — see CLONE_POOL_CONFIG_ENV above).
+    Returns [] when none is set — single-account mode.
     Empty entries are filtered.
     """
-    return _provider.parse_pool_env()
+    dirs = _provider.parse_pool_env()
+    if dirs:
+        return dirs
+    raw = os.environ.get(CLONE_POOL_CONFIG_ENV, "").strip()
+    if raw:
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    return []
 
 
 def is_active() -> bool:
@@ -369,9 +402,16 @@ def available_slots() -> int:
 def fanout_cap() -> int:
     """Maximum branches the researcher may propose this cycle.
 
-    available_slots minus 1 for sequential root calls. Floor at 0.
+    Equal to available_slots(). The reserve for sequential root calls is
+    the root's own ledger slot, acquired at startup (exploration pool-init
+    block, acquire_slot(role="root")) and therefore already excluded from
+    available_slots() — subtracting an extra 1 here double-reserved the
+    root and shrank the documented cap (2 accounts × 3 slots → cap 5,
+    docs/multi-account-pool.md and docs/parallelism.md) to 4. Mirrors the
+    unified_pool.fanout_cap() rationale, which sums provider-local
+    available_slots() for the same reason.
     """
-    return max(0, available_slots() - 1)
+    return max(0, available_slots())
 
 
 # ---------------------------------------------------------------------------

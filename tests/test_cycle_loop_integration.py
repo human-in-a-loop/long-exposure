@@ -1,6 +1,8 @@
 import json
+import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -120,10 +122,16 @@ class CycleLoopIntegrationTests(unittest.TestCase):
                 (agent_name, kwargs["results"].get("live_guidance", ""))
             )
             output_name = agent_def["outputs"][0]
+            # Context must land in the reanchor window: at or above
+            # reanchor_at (5/6 of the compact threshold, 24 576 for a 32 768
+            # window at 0.9) but BELOW compact_at (29 491). Crossing compact_at
+            # correctly compacts the session and resets both the context
+            # counter and the reanchor-emitted flag, so reanchor would
+            # (correctly) never fire on the next cycle.
             return {
                 "agent": agent_name,
                 "outputs": {output_name: f"{agent_name} output " + ("x" * 2100)},
-                "usage": {"input_tokens": 310000, "output_tokens": 2100},
+                "usage": {"input_tokens": 25000, "output_tokens": 2100},
                 "duration_ms": 1,
                 "status": "ok",
                 "error": None,
@@ -153,7 +161,7 @@ class CycleLoopIntegrationTests(unittest.TestCase):
         self.assertNotIn("<reanchor>", researcher_guidance[0])
         self.assertIn("<reanchor>", researcher_guidance[1])
         self.assertTrue(state["_reanchor_emitted"]["researcher"])
-        self.assertEqual(state["agent_context_tokens"]["researcher"], 312100)
+        self.assertEqual(state["agent_context_tokens"]["researcher"], 27100)
 
     def test_final_synthesis_runs_on_stop_or_topic_exhaustion_but_not_clear(self):
         self.assertTrue(_should_run_final_synthesis(
@@ -272,6 +280,117 @@ class CycleLoopIntegrationTests(unittest.TestCase):
         self.assertEqual(state["failures"]["final_auditor"], 1)
         self.assertEqual(state["failures"]["final_reporter"], 1)
         self.assertIn("Status:** completed", status)
+
+
+class CompactionBookkeepingTests(unittest.TestCase):
+    """Reanchor/context bookkeeping must be popped only when compaction
+    actually rotated the agent's session — the DB-failure path keeps the old
+    near-full session, where the reanchor must stay armed."""
+
+    def tearDown(self):
+        telemetry.configure({"telemetry": {"enabled": False}}, None, None)
+
+    def _run_with_fake_compaction(self, fake_compact):
+        def fake_agent(agent_name, agent_def, **kwargs):
+            output_name = agent_def["outputs"][0]
+            # 28000 + 2100 = 30100 >= compact_at (29491 for a 32768 window
+            # at 0.9), so compaction triggers after the call.
+            return {
+                "agent": agent_name,
+                "outputs": {output_name: f"{agent_name} output " + ("x" * 2100)},
+                "usage": {"input_tokens": 28000, "output_tokens": 2100},
+                "duration_ms": 1,
+                "status": "ok",
+                "error": None,
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workspace = root / "workspace"
+            instance = root / "instance"
+            workspace.mkdir()
+            instance.mkdir()
+            score = root / "score.yaml"
+            score.write_text(
+                "task: test directive\n"
+                "loop:\n"
+                "  max_cycles: 1\n"
+                "  cycle_cooldown_seconds: 0\n"
+                "agents:\n"
+                "  researcher:\n"
+                "    inputs: [directive, audit_report]\n"
+                "    outputs: [research_brief]\n"
+                "    role: researcher\n"
+                "flow: [researcher]\n"
+            )
+            config = root / "config.yaml"
+            config.write_text(
+                "llm_provider: local\n"
+                "model: test\n"
+                "local_model: test\n"
+                "local_context_window: 32768\n"
+                "context_window: 32768\n"
+                "compact_threshold: 0.9\n"
+                f"compact_db: {instance / 'sessions.db'}\n"
+                f"working_directory: {workspace}\n"
+                "checkpoint_format: standard\n"
+                "require_checkpoint_first: false\n"
+                "user_gate_approval: false\n"
+                "anti_patterns_enabled: true\n"
+            )
+            state_path = instance / "exploration_state.json"
+            state_path.write_text(json.dumps({
+                "cycle": 0,
+                "results": {"directive": "test directive", "audit_report": "prior"},
+                "failures": {"researcher": 0},
+                "agent_sessions": {"researcher": "sess-1"},
+                "agent_sessions_provider": "local",
+                "agent_summaries": {},
+                "task": "test directive",
+                "run_id": "run-test",
+                "last_daily_sync_at": datetime.now(timezone.utc).isoformat(),
+                "_reanchor_emitted": {"researcher": True},
+                "agent_context_tokens": {"researcher": 30000},
+            }))
+            with (
+                # Pin the provider env so the resume-time provider-mismatch
+                # guard does not clear the seeded local agent_sessions when
+                # an earlier test left a different provider configured.
+                patch.dict(os.environ, {"LONG_EXPOSURE_LLM_PROVIDER": "local"}),
+                patch("long_exposure.exploration._call_exploration_agent", fake_agent),
+                patch("long_exposure.exploration._compact_agent_session", fake_compact),
+            ):
+                run_exploration(
+                    score_path=str(score),
+                    config_path=str(config),
+                    output_dir=instance / "output",
+                    state_path=state_path,
+                    instance_dir=instance,
+                )
+            return json.loads(state_path.read_text())
+
+    def test_keep_path_preserves_bookkeeping(self):
+        def fake_compact_keep(agent_name, agent_def, config, agent_sessions,
+                              agent_summaries, conn, cycle, last_session_id):
+            # DB-write-failure path: session kept, nothing rotated.
+            return last_session_id
+
+        state = self._run_with_fake_compaction(fake_compact_keep)
+        self.assertEqual(state["agent_sessions"], {"researcher": "sess-1"})
+        self.assertTrue(state["_reanchor_emitted"].get("researcher"))
+        self.assertEqual(state["agent_context_tokens"]["researcher"], 30100)
+
+    def test_rotation_path_pops_bookkeeping(self):
+        def fake_compact_rotate(agent_name, agent_def, config, agent_sessions,
+                                agent_summaries, conn, cycle, last_session_id):
+            del agent_sessions[agent_name]
+            agent_summaries[agent_name] = "summary"
+            return "compaction-row"
+
+        state = self._run_with_fake_compaction(fake_compact_rotate)
+        self.assertEqual(state["agent_sessions"], {})
+        self.assertEqual(state["_reanchor_emitted"], {})
+        self.assertEqual(state["agent_context_tokens"], {})
 
 
 if __name__ == "__main__":

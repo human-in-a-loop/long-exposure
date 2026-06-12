@@ -31,6 +31,25 @@ class CodexProviderTests(unittest.TestCase):
         self.assertEqual(env["usage"]["input_tokens"], 4)
         self.assertEqual(env["usage"]["output_tokens"], 5)
 
+    def test_codex_envelope_missing_output_file_after_completed_turn_is_error(self):
+        stdout = "\n".join([
+            '{"msg":{"type":"thread.started","thread_id":"thread-1"}}',
+            '{"msg":{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens":5}}}',
+        ])
+        env = _extract_codex_envelope(stdout, "", 9, output_file_error=True)
+        self.assertIs(env["is_error"], True)
+        self.assertIn("output file", env["result"])
+        self.assertEqual(env["session_id"], "thread-1")
+        self.assertEqual(env["usage"]["input_tokens"], 4)
+
+    def test_codex_envelope_genuinely_empty_output_stays_success(self):
+        # An existing-but-empty output file (model returned nothing) is not
+        # an error; only a missing/unreadable file is.
+        stdout = '{"msg":{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":0}}}'
+        env = _extract_codex_envelope(stdout, "", 9, output_file_error=False)
+        self.assertNotEqual(env.get("is_error"), True)
+        self.assertEqual(env["result"], "")
+
     def test_codex_permission_flags_disable_tools_omits_yolo(self):
         flags = _codex_permission_flags({"codex_yolo": True}, disable_tools=True)
         self.assertNotIn("--yolo", flags)

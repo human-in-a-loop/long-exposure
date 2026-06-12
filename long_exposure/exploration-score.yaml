@@ -639,11 +639,32 @@ agents:
             but newer work makes it obsolete) — invalidated is a
             correction, superseded is an evolution.
 
+         e) COMPLETE — The milestone is validated AND there is no further
+            in-scope work for any future cycle: the directive's scope is
+            fully discharged and continuing would only re-confirm a closed
+            result. This is distinct from VALIDATED (which closes the
+            current sub-topic and advances to the next). When and ONLY when
+            this holds, end your decision with the exact line:
+
+                [[BRANCH_COMPLETE]]
+
+            on its own line. The orchestrator reads this token from your
+            output and terminates the loop (a fan-out clone hands off its
+            merge report; a root run ends cleanly). Do not emit it while any
+            sub-topic, deferred item, or follow-on is still actionable in
+            scope. Emitting it prematurely ends the exploration early, so
+            reserve it for genuine, total scope exhaustion.
+
       <no-null-cycle-validation>
       A cycle whose work_output is only invariant checks, pause memos,
       touchpoint updates, or null-cycle gate statuses cannot receive
-      VALIDATED. Emit PIVOT and instruct the researcher to advance the
-      directive next cycle with substantive scope.
+      VALIDATED. If the milestone is NOT yet complete, emit PIVOT and
+      instruct the researcher to advance the directive next cycle with
+      substantive scope. But if the milestone is already validated and its
+      scope is genuinely exhausted, emit COMPLETE (with the
+      [[BRANCH_COMPLETE]] line) instead of manufacturing new scope to stay
+      busy — repeated null cycles on a finished branch should terminate, not
+      pivot.
       </no-null-cycle-validation>
 
       Focus on CRITICAL and MODERATE issues. Do not block progress
@@ -1716,7 +1737,12 @@ agents:
       </include-policy>
 
       <task>
-      Write CURATION.yaml to the workspace root. Exact format:
+      Write CURATION.yaml to {working_dir}/CURATION.yaml — the absolute
+      workspace-root path. The deterministic packager reads the manifest
+      from exactly that path. Even if you have been working inside a
+      project subdirectory, write the file to {working_dir}/CURATION.yaml,
+      NOT relative to your current directory or any subdirectory; a manifest
+      written elsewhere is treated as if it were never produced. Exact format:
 
           package_name: "<snake_case_slug_derived_from_directive>"
           description: |

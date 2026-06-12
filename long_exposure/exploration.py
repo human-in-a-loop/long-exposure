@@ -41,6 +41,10 @@ from long_exposure.conductor import (
     build_agent_prompt,
     build_role_block,
     parse_outputs,
+    _OUTPUT_RE,
+    _session_transcript_text,
+    BRANCH_COMPLETE_SIGNAL,
+    BRANCH_COMPLETE_RE,
 )
 from long_exposure.workspace_bootstrap import (
     append_ledger_event,
@@ -80,6 +84,7 @@ from long_exposure import paths
 from long_exposure import provider as _provider
 from long_exposure import telemetry
 from long_exposure import unified_pool
+from long_exposure import interactive_transport
 from auto_compact.db import init_db, store_session
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -162,6 +167,10 @@ _clear_requested = False
 _graceful_stop_requested = False  # Stage 1 §6.4 — finish current cycle, then exit.
 _unified_root_holder: unified_pool.UnifiedHolder | None = None
 
+# Agents already warned (once per run) that interactive transport dropped
+# their score-requested session-search MCP.
+_INTERACTIVE_MCP_NOTICE_SEEN: set[str] = set()
+
 
 def _pin_unified_holder_env(holder: unified_pool.UnifiedHolder) -> None:
     """Pin the current process to a unified-pool holder's provider/account."""
@@ -230,6 +239,27 @@ signal.signal(signal.SIGINT, _on_signal)
 signal.signal(signal.SIGTERM, _on_signal)
 
 
+# Run-control signal filenames, grouped by semantics. Single source of truth
+# consumed by BOTH _check_signal_files and the startup stale-signal sweep in
+# run_exploration, so a newly added signal is swept automatically instead of
+# surviving startup as a stale file (the exact recurrence the sweep was built
+# to prevent). External writers reference these literal names: fanout.py
+# writes long-exposure.stop / long-exposure.graceful-stop into clone instance
+# dirs, and manager.py writes long-exposure.pause-for-user. Guide files
+# (long-exposure.guide / exploration.guide) are deliberately excluded —
+# operator guidance for the first cycle must survive startup.
+_STOP_SIGNAL_FILENAMES = ("long-exposure.stop", "exploration.stop")  # (new, legacy)
+_CLEAR_SIGNAL_FILENAMES = ("long-exposure.clear", "exploration.clear")  # (new, legacy)
+_GRACEFUL_STOP_SIGNAL_FILENAME = "long-exposure.graceful-stop"
+_PAUSE_SIGNAL_FILENAME = "long-exposure.pause-for-user"
+_RUN_SIGNAL_FILENAMES = (
+    *_STOP_SIGNAL_FILENAMES,
+    *_CLEAR_SIGNAL_FILENAMES,
+    _GRACEFUL_STOP_SIGNAL_FILENAME,
+    _PAUSE_SIGNAL_FILENAME,
+)
+
+
 def _check_signal_files(data_dir: Path) -> None:
     """Check for stop/clear/graceful-stop signal files. Sets global flags and
     removes files.
@@ -249,12 +279,12 @@ def _check_signal_files(data_dir: Path) -> None:
     """
     global _stop_requested, _clear_requested, _graceful_stop_requested
 
-    clear_file_new = data_dir / "long-exposure.clear"
-    clear_file_old = data_dir / "exploration.clear"
-    stop_file_new = data_dir / "long-exposure.stop"
-    stop_file_old = data_dir / "exploration.stop"
-    graceful_file = data_dir / "long-exposure.graceful-stop"
-    pause_file = data_dir / "long-exposure.pause-for-user"
+    clear_file_new = data_dir / _CLEAR_SIGNAL_FILENAMES[0]
+    clear_file_old = data_dir / _CLEAR_SIGNAL_FILENAMES[1]
+    stop_file_new = data_dir / _STOP_SIGNAL_FILENAMES[0]
+    stop_file_old = data_dir / _STOP_SIGNAL_FILENAMES[1]
+    graceful_file = data_dir / _GRACEFUL_STOP_SIGNAL_FILENAME
+    pause_file = data_dir / _PAUSE_SIGNAL_FILENAME
     guide_paths = (
         data_dir / "long-exposure.guide",
         data_dir / "exploration.guide",
@@ -478,7 +508,10 @@ def save_state(path: Path, cycle: int, results: dict, failures: dict,
                daily_sync_count: int = 0,
                daily_sync_in_progress: bool = False,
                reanchor_emitted: dict | None = None,
-               agent_context_tokens: dict | None = None) -> None:
+               agent_context_tokens: dict | None = None,
+               peak_cycle_output: int = 0,
+               low_output_streak: int = 0,
+               usage_basis: str | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Tag agent_sessions with the provider/account that created them so resume
     # after a provider switch or cross-account rotation can start fresh instead
@@ -503,6 +536,18 @@ def save_state(path: Path, cycle: int, results: dict, failures: dict,
         "_daily_sync_in_progress": daily_sync_in_progress,
         "_reanchor_emitted": reanchor_emitted or {},
         "agent_context_tokens": agent_context_tokens or {},
+        # Exhaustion-detector calibration. Without these a stop/resume reset
+        # the relative low-output threshold and streak, deferring closure.
+        "peak_cycle_output": peak_cycle_output,
+        "low_output_streak": low_output_streak,
+        # Usage basis the calibration was measured on: "interactive" (chars/4
+        # estimate of the final response only) or a headless provider name
+        # (full-turn output_tokens). Resume resets peak/streak when this
+        # differs from the resuming run's basis — the two scales are not
+        # comparable. Callers pass "interactive" explicitly; headless runs
+        # default to the provider active at save time (tracks mid-run
+        # unified-pool provider rotation).
+        "usage_basis": usage_basis or _provider.current_provider(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     # Atomic write: temp file + rename prevents corruption on crash
@@ -766,7 +811,27 @@ def load_state(path: Path) -> dict | None:
         return None
     try:
         return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError:
+        # Graceful but loud: archive the corrupt file for inspection instead
+        # of silently treating it as a fresh start (the next save_state would
+        # overwrite the evidence).
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        archive = path.with_name(f"{path.name}.corrupt-{ts}")
+        try:
+            os.replace(path, archive)
+            print(
+                f"[long-exposure] WARNING: state file is corrupt JSON; "
+                f"archived to {archive.name}; starting fresh.",
+                flush=True,
+            )
+        except OSError as e:
+            print(
+                f"[long-exposure] WARNING: state file is corrupt JSON and "
+                f"archiving failed ({e}); starting fresh.",
+                flush=True,
+            )
+        return None
+    except OSError:
         return None
 
 
@@ -1168,6 +1233,10 @@ def _call_exploration_agent(
     agent_config["effort"] = effort
     agent_config["agent_teams"] = agent_teams_enabled(agent_def, config)
 
+    # Opt-in interactive transport (Claude only). Routes the turn through a
+    # persistent interactive session instead of `claude -p`. Default-off.
+    interactive = _provider.is_claude() and interactive_transport.is_enabled(config)
+
     tmp_last = None
     if _provider.is_local():
         cmd = []
@@ -1212,6 +1281,12 @@ def _call_exploration_agent(
         session_id = str(uuid.uuid4())
         agent_sessions[agent_name] = session_id
     was_resume = session_id is not None
+    if interactive:
+        # Interactive transport has no provider-native per-agent session; every
+        # turn is fresh-context with full conditioning. Force the fresh path so
+        # the complete system prompt is reassembled each call. Continuity stays
+        # file-backed (POR, ledger, inputs, gems) exactly as elsewhere.
+        was_resume = False
     summary = None  # track compaction summary for restoration on failure
 
     cli_stdin = user_prompt
@@ -1239,8 +1314,13 @@ def _call_exploration_agent(
     else:
         if _provider.is_claude():
             session_id = str(uuid.uuid4())
-            agent_sessions[agent_name] = session_id
-            cmd.extend(["--session-id", session_id])
+            if not interactive:
+                # Interactive transport has no provider-native session behind
+                # this UUID; persisting it would make a later headless resume
+                # burn one failed cycle per agent on `--resume <bogus-uuid>`.
+                # The per-call UUID still tags this turn's bookkeeping below.
+                agent_sessions[agent_name] = session_id
+                cmd.extend(["--session-id", session_id])
         elif _provider.is_gemini():
             session_id = str(uuid.uuid4())
             agent_sessions[agent_name] = session_id
@@ -1289,7 +1369,7 @@ def _call_exploration_agent(
 
     # MCP config (session search tools). When instance_dir is set, the config
     # file lives under it so concurrent sessions don't race on a shared path.
-    if agent_def.get("mcp", False) and _provider.is_claude():
+    if agent_def.get("mcp", False) and _provider.is_claude() and not interactive:
         db_path = agent_config.get("compact_db", "")
         if db_path:
             cmd.extend([
@@ -1299,6 +1379,17 @@ def _call_exploration_agent(
                     instance_dir=agent_config.get("instance_dir"),
                 ),
             ])
+    elif agent_def.get("mcp", False) and interactive:
+        # Interactive transport drops the score's mcp:true request silently;
+        # surface it once per agent per run so the operator knows session
+        # search is degraded.
+        if agent_name not in _INTERACTIVE_MCP_NOTICE_SEEN:
+            _INTERACTIVE_MCP_NOTICE_SEEN.add(agent_name)
+            print(
+                f"[long-exposure]   {agent_name}: session-search MCP "
+                f"unavailable in interactive transport",
+                flush=True,
+            )
     elif _provider.is_gemini():
         # Gemini CLI reads built-in tool restrictions and MCP servers from
         # project-local .gemini/settings.json. Merge long-exposure's current
@@ -1319,7 +1410,16 @@ def _call_exploration_agent(
     )
 
     try:
-        if _provider.is_local():
+        if interactive:
+            envelope = interactive_transport.run_turn(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=agent_config.get("model", "opus"),
+                agent_name=agent_name,
+                timeout=agent_config.get("cli_timeout") or None,
+                config=config,
+            )
+        elif _provider.is_local():
             envelope = call_local_llm(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
@@ -1418,6 +1518,33 @@ def _call_exploration_agent(
             agent_sessions[agent_name] = session_id
     expected_outputs = agent_def.get("outputs", [])
     outputs = parse_outputs(response_text, expected_outputs)
+    # Recovery: the CLI envelope's `result` is only the final assistant message.
+    # If an expected output is missing there, the agent likely emitted that
+    # deliverable in an earlier message of the turn (e.g. before a trailing
+    # checkpoint/cover-note). Re-parse the current-turn transcript text so the
+    # block is recovered regardless of which message it landed in. Per-name:
+    # only names whose primary parse failed are recovered — a successfully
+    # parsed fresh block is never overwritten with transcript content.
+    # A name's primary parse "failed" when it carries a Tier-3 marker, OR when
+    # response_text had no marker blocks at all (Tier-2 whole-message fallback
+    # is not a genuine block and stays replaceable by real transcript content).
+    _primary_has_markers = bool(_OUTPUT_RE.search(response_text or ""))
+    _failed_names = [
+        name for name in expected_outputs
+        if not _primary_has_markers
+        or not outputs.get(name)
+        or str(outputs[name]).startswith("[PARSE_FAILED")
+    ]
+    # Interactive transport: session_id is a synthetic uuid4 never handed to a
+    # provider, so no session JSONL can exist — skip the projects/ scan.
+    if _failed_names and not interactive:
+        full_text = _session_transcript_text(session_id)
+        if full_text and _OUTPUT_RE.search(full_text):
+            recovered = parse_outputs(full_text, expected_outputs)
+            for _name in _failed_names:
+                _content = recovered.get(_name, "")
+                if _content and not _content.startswith("[PARSE_FAILED"):
+                    outputs[_name] = _content
     usage = envelope.get("usage", {})
 
     # Observability: when teams were active, count teammate transcripts
@@ -1891,7 +2018,9 @@ def update_status_file(output_dir: Path, cycle: int, status: str,
             f"**Updated:** {datetime.now(timezone.utc).isoformat()[:19]}Z\n\n"
             f"## Failure Tracking\n{fail_lines}\n"
         )
-        (output_dir / "exploration_status.md").write_text(md)
+        # Atomic so a concurrent `long-exposure status` never reads a
+        # truncated file mid-write.
+        _atomic_write_text(output_dir / "exploration_status.md", md)
     except OSError as e:
         print(f"[long-exposure] Status file write failed: {e}", flush=True)
 
@@ -3230,6 +3359,12 @@ def run_exploration(
     if not run_id:
         run_id = derive_run_id()
     telemetry.configure(config, data_dir, run_id)
+    # The final auditor/reporter/curator read run_id from `results` (ledger
+    # cycle counts and reconciliation uuid5 event-ids are keyed on it). It is
+    # not an agent input, so it never reaches a prompt; persisting it inside
+    # `results` also serves run_final_reporter.py, which restores results
+    # from saved state.
+    results["run_id"] = run_id
     telemetry.emit(
         "run_resume" if state else "run_start",
         phase="run",
@@ -3277,13 +3412,28 @@ def run_exploration(
                 flush=True,
             )
 
+    # ---- Interactive transport (opt-in) ----
+    # When enabled, advanced features (multi-account pooling, parallel fan-out)
+    # are intentionally deferred — interactive mode runs sequential cycles on
+    # the active logged-in account. Tear the driver session down at exit.
+    _interactive_mode = interactive_transport.is_enabled(config)
+    if _interactive_mode:
+        import atexit as _atexit
+        _atexit.register(interactive_transport.shutdown)
+        if not _is_clone() and (unified_pool.is_unified_active() or pool.is_active()):
+            print(
+                "[long-exposure] Interactive transport active: multi-account "
+                "pooling is deferred and will be ignored this run.",
+                flush=True,
+            )
+
     # ---- Pool init (Stage 1) ----
     # Root only: initialize the pool ledger, pin the parent process to the
     # current primary via CLAUDE_FORCE_ACCOUNT, and reserve a slot for the
     # root agents (sequential calls share this one slot). Clones inherit
     # CLAUDE_FORCE_ACCOUNT from their fanout-spawn env and are already
     # accounted in the ledger by the fanout conductor.
-    if not _is_clone() and unified_pool.is_unified_active():
+    if not _is_clone() and not _interactive_mode and unified_pool.is_unified_active():
         try:
             unified_pool.init_all_pools()
             holder = unified_pool.acquire_slot(
@@ -3304,7 +3454,7 @@ def run_exploration(
             print(f"[long-exposure] {unified_pool.format_unified_summary()}", flush=True)
         except Exception as _pool_err:
             print(f"[long-exposure] Unified pool init warning: {_pool_err}", flush=True)
-    elif not _is_clone() and pool.is_active():
+    elif not _is_clone() and not _interactive_mode and pool.is_active():
         try:
             pool.init_pool()
             pool.thaw_eligible()
@@ -3345,11 +3495,79 @@ def run_exploration(
     total_failure_streak = 0
     cycles_since_last_report = 0
     cycle_session_log = []
-    low_output_streak = 0  # consecutive cycles with < 200 total output tokens
-    topic_exhausted = False  # set True when low-output streak triggers closure
+    # Consecutive low-output cycles (relative threshold). Restored from state
+    # so a stop/resume doesn't reset exhaustion progress (mirrors
+    # _reanchor_emitted / agent_context_tokens handling above).
+    low_output_streak = int(state.get("low_output_streak") or 0) if state else 0
+    topic_exhausted = False  # set True when low-output streak or agent signal triggers closure
     max_cycles_reached = False
-    LOW_OUTPUT_THRESHOLD = 2000  # tokens — exhausted cycles produce ~20-70
+    # Low-output backstop is RELATIVE to the run's own peak cycle output, so it
+    # self-calibrates to each branch's structured-output floor instead of a
+    # fixed magic number. (A fixed 2000-tok floor failed: idle-but-verbose
+    # clones produced ~2.4k tok/cycle and never tripped it — see the RCA.)
+    # Persisted for the same reason as the streak: resetting peak to 0 on
+    # resume re-inflates it from the next big cycle and defers closure.
+    peak_cycle_output = int(state.get("peak_cycle_output") or 0) if state else 0
+    # Usage-basis guard: peak/streak are calibrated in the transport's own
+    # units — headless envelopes report full-turn output_tokens; interactive
+    # turns report a chars/4 estimate of the final response only, far
+    # smaller. Resuming across a transport (or provider) switch with the old
+    # calibration would either trip a false topic-exhaustion within
+    # LOW_OUTPUT_CLOSURE_COUNT cycles (headless -> interactive) or leave the
+    # backstop far too lax (interactive -> headless). Reset and re-learn.
+    _current_usage_basis = (
+        "interactive" if _interactive_mode else _provider.current_provider()
+    )
+    _saved_usage_basis = state.get("usage_basis") if state else None
+    _usage_basis_mismatch = (
+        _saved_usage_basis != _current_usage_basis
+        if _saved_usage_basis
+        # Legacy state (no usage_basis key): written headless, or by a
+        # pre-fix interactive build. Only the interactive side risks the
+        # false-exhaustion failure, so reset there; headless resumes keep
+        # their calibration (matching prior behavior).
+        else _current_usage_basis == "interactive"
+    )
+    if _usage_basis_mismatch and (peak_cycle_output or low_output_streak):
+        print(
+            f"[long-exposure] Resume: exhaustion calibration was measured "
+            f"on '{_saved_usage_basis or 'unknown'}' but this run reports "
+            f"usage as '{_current_usage_basis}'; resetting "
+            f"peak_cycle_output and low_output_streak.",
+            flush=True,
+        )
+        peak_cycle_output = 0
+        low_output_streak = 0
+    # Passed to every in-loop save_state. None lets save_state stamp the
+    # provider active at save time (headless basis).
+    _usage_basis_arg = "interactive" if _interactive_mode else None
+    LOW_OUTPUT_FRACTION = 0.05  # a cycle is "low" below 5% of peak observed output
+    LOW_OUTPUT_ABS_FLOOR = 500  # absolute floor so early/degenerate cycles aren't mis-flagged
     LOW_OUTPUT_CLOSURE_COUNT = 2  # consecutive low-output cycles to trigger closure
+
+    # Stale-signal sweep: a stop/clear/graceful-stop file written while
+    # nothing was running would be consumed by the first loop-top
+    # _check_signal_files and turn this run into a zero-cycle pass straight
+    # into final synthesis. Guide files are NOT cleared — operator guidance
+    # for the first cycle is legitimate.
+    # Clones skip the sweep entirely: their instance dirs are freshly created
+    # per fan-out, so stale signals from a previous session are impossible —
+    # and the fan-out conductor may write a LIVE stop/graceful-stop signal
+    # into a clone's dir while it is still booting; sweeping here would
+    # delete that live signal.
+    if not _is_clone():
+        for _sig_name in _RUN_SIGNAL_FILENAMES:
+            _sig = data_dir / _sig_name
+            try:
+                if _sig.exists():
+                    _sig.unlink(missing_ok=True)
+                    print(
+                        f"[long-exposure] Cleared stale {_sig_name} signal "
+                        f"from a previous session.",
+                        flush=True,
+                    )
+            except OSError:
+                pass
 
     # Banner
     print(f"[long-exposure] Task: {task.strip()[:120]}", flush=True)
@@ -3403,8 +3621,11 @@ def run_exploration(
 
         # Pool maintenance (root only, cheap): reclaim orphan slots whose
         # PID is dead, and thaw cooling accounts whose cooldown has elapsed.
-        # Both ops short-circuit when the pool is inactive.
-        if not _is_clone() and unified_pool.is_unified_active():
+        # Both ops short-circuit when the pool is inactive. Interactive mode
+        # never initialized the pool (init above is gated on
+        # `not _interactive_mode`), so maintenance must skip too — it would
+        # mutate a never-initialized ledger the transport ignores.
+        if not _is_clone() and not _interactive_mode and unified_pool.is_unified_active():
             try:
                 _swept, _thawed = unified_pool.heartbeat_and_thaw_all()
                 if _swept or _thawed:
@@ -3415,7 +3636,7 @@ def run_exploration(
                     )
             except Exception as _pool_err:
                 print(f"[long-exposure] Unified pool maintenance skipped ({_pool_err})", flush=True)
-        elif not _is_clone() and pool.is_active():
+        elif not _is_clone() and not _interactive_mode and pool.is_active():
             try:
                 _swept = pool.heartbeat_sweep()
                 _thawed = pool.thaw_eligible()
@@ -3442,6 +3663,8 @@ def run_exploration(
         cycle_topic = None  # set by researcher, inherited by worker/auditor
         cycle_ok = True
         cycle_output_tokens = 0  # track total output tokens for exhaustion detection
+        cycle_forced_substantive = False  # post-merge/fan-out cycles never count as low-output
+        agent_signaled_complete = False  # set when the auditor emits BRANCH_COMPLETE_SIGNAL
 
         # --- Post-merge mode ---
         # A cycle immediately after a fan-out runs worker-only (no researcher,
@@ -3631,7 +3854,12 @@ def run_exploration(
                     if agent_live_parts
                     else "[No live guidance this cycle.]"
                 )
-                is_resume = agent_name in agent_sessions
+                # Interactive transport never resumes provider sessions
+                # (was_resume is forced False in _call_exploration_agent), so
+                # a "Resuming" banner would be misleading there.
+                is_resume = (
+                    agent_name in agent_sessions and not _interactive_mode
+                )
                 print(
                     f"[long-exposure] "
                     f"{'Resuming' if is_resume else 'Starting'}: "
@@ -3675,6 +3903,19 @@ def run_exploration(
                 if result["status"] == "ok":
                     results.update(result["outputs"])
                     consecutive_failures[agent_name] = 0
+
+                    # Item 1: explicit agent-driven termination. The auditor is
+                    # the closure authority; when it emits BRANCH_COMPLETE_SIGNAL
+                    # the branch/topic is fully explored. Scope the check to the
+                    # auditor's FRESH output this cycle (results persists across
+                    # cycles; a later agent could echo the token). Line-anchored
+                    # (BRANCH_COMPLETE_RE): an auditor merely DISCUSSING the
+                    # token inline must not end the run.
+                    if agent_name == "auditor" and any(
+                        BRANCH_COMPLETE_RE.search(str(v))
+                        for v in result["outputs"].values()
+                    ):
+                        agent_signaled_complete = True
 
                     total_ctx = _total_context_tokens(usage)
                     agent_context_tokens[agent_name] = total_ctx
@@ -3722,14 +3963,21 @@ def run_exploration(
                             f"({total_ctx/context_window:.0%}) — compacting...",
                             flush=True,
                         )
+                        # Pop reanchor/context bookkeeping only if compaction
+                        # actually rotated the session (entry removed; fresh
+                        # UUID minted on next call). The DB-write-failure path
+                        # keeps the old near-full session — there the next
+                        # reanchor/compaction attempt must stay armed.
+                        _session_before_compact = agent_sessions.get(agent_name)
                         try:
                             last_session_id = _compact_agent_session(
                                 agent_name, agent_def, config,
                                 agent_sessions, agent_summaries,
                                 conn, cycle, last_session_id,
                             )
-                            reanchor_emitted.pop(agent_name, None)
-                            agent_context_tokens.pop(agent_name, None)
+                            if agent_sessions.get(agent_name) != _session_before_compact:
+                                reanchor_emitted.pop(agent_name, None)
+                                agent_context_tokens.pop(agent_name, None)
                         except ClaudeRateLimitError as e:
                             rotation_triggered = True
                             rate_limit_reason = f"compaction: {e}"
@@ -3743,7 +3991,10 @@ def run_exploration(
                     # --- Fan-out trigger (researcher only, root only) ---
                     # Parser no-ops for clones; the _is_clone() short-circuit
                     # here avoids the extra regex work in the common case.
-                    if agent_name == "researcher" and not _is_clone():
+                    # Interactive transport defers parallel fan-out: clones would
+                    # each need their own interactive session. Run sequentially.
+                    if (agent_name == "researcher" and not _is_clone()
+                            and not _interactive_mode):
                         _branches = _parse_fanout_block(
                             results.get("research_brief", "")
                         )
@@ -3832,9 +4083,7 @@ def run_exploration(
                             # Credit as a non-low-output cycle so exhaustion
                             # detector does not mistake fan-out cycles for
                             # null work.
-                            cycle_output_tokens = max(
-                                cycle_output_tokens, LOW_OUTPUT_THRESHOLD
-                            )
+                            cycle_forced_substantive = True
                             # Arm post-merge mode for the NEXT cycle: worker
                             # only, reading the merge as its research_brief.
                             # Researcher and auditor sessions stay at their
@@ -4049,6 +4298,8 @@ def run_exploration(
             # from scratch (first agent in flow).
             cycle_topic = None
             cycle_output_tokens = 0
+            cycle_forced_substantive = False
+            agent_signaled_complete = False
             cycle_ok = True
             # Restore pre-cycle snapshots: `results` mutations from the
             # abandoned attempt, the `last_session_id` parent pointer, and
@@ -4099,18 +4350,24 @@ def run_exploration(
         # of worker output size — integration is substantive even when its
         # token output is small (same stance as fan-out cycles).
         if cycle_ok and in_post_merge_cycle:
-            cycle_output_tokens = max(
-                cycle_output_tokens, LOW_OUTPUT_THRESHOLD
+            cycle_forced_substantive = True
+        if cycle_ok:
+            # Calibrate the low-output floor to the run's own peak output.
+            peak_cycle_output = max(peak_cycle_output, cycle_output_tokens)
+            low_threshold = max(
+                LOW_OUTPUT_ABS_FLOOR,
+                int(LOW_OUTPUT_FRACTION * peak_cycle_output),
             )
-        if cycle_ok and cycle_output_tokens < LOW_OUTPUT_THRESHOLD:
-            low_output_streak += 1
-            print(
-                f"[long-exposure] Low output: {cycle_output_tokens} tokens "
-                f"(streak: {low_output_streak}/{LOW_OUTPUT_CLOSURE_COUNT})",
-                flush=True,
-            )
-        elif cycle_ok:
-            low_output_streak = 0
+            if not cycle_forced_substantive and cycle_output_tokens < low_threshold:
+                low_output_streak += 1
+                print(
+                    f"[long-exposure] Low output: {cycle_output_tokens} tokens "
+                    f"(< {low_threshold}; streak: {low_output_streak}/"
+                    f"{LOW_OUTPUT_CLOSURE_COUNT})",
+                    flush=True,
+                )
+            else:
+                low_output_streak = 0
 
         if cycle_ok:
             # Post-merge completion: promote the worker's integration output
@@ -4140,7 +4397,10 @@ def run_exploration(
                    last_daily_sync_at=last_daily_sync_at,
                    daily_sync_count=daily_sync_count,
                    reanchor_emitted=reanchor_emitted,
-                   agent_context_tokens=agent_context_tokens)
+                   agent_context_tokens=agent_context_tokens,
+                   peak_cycle_output=peak_cycle_output,
+                   low_output_streak=low_output_streak,
+                   usage_basis=_usage_basis_arg)
 
         elapsed = time.monotonic() - cycle_start
         telemetry.emit(
@@ -4180,7 +4440,10 @@ def run_exploration(
                        daily_sync_count=daily_sync_count,
                        daily_sync_in_progress=True,
                        reanchor_emitted=reanchor_emitted,
-                       agent_context_tokens=agent_context_tokens)
+                       agent_context_tokens=agent_context_tokens,
+                       peak_cycle_output=peak_cycle_output,
+                       low_output_streak=low_output_streak,
+                       usage_basis=_usage_basis_arg)
             try:
                 last_session_id = _run_daily_sync(
                     agents=agents,
@@ -4210,7 +4473,10 @@ def run_exploration(
                            daily_sync_count=daily_sync_count,
                            daily_sync_in_progress=False,
                            reanchor_emitted=reanchor_emitted,
-                           agent_context_tokens=agent_context_tokens)
+                           agent_context_tokens=agent_context_tokens,
+                           peak_cycle_output=peak_cycle_output,
+                           low_output_streak=low_output_streak,
+                           usage_basis=_usage_basis_arg)
 
                 # Plan B: planned 24h rotation. Fires AFTER the
                 # daily-sync agents complete, but only when no rotation has
@@ -4231,8 +4497,13 @@ def run_exploration(
                 #      account fails with "session not found").
                 # Without either step, the rotation is observable in pool
                 # state but invisible to the running agents.
+                # Interactive mode skips this too: the pool was never
+                # initialized there, and the transport ignores the
+                # CLAUDE_FORCE_ACCOUNT repin — the rotation would only
+                # mutate ledger state and clear sessions for nothing.
                 if (pool.is_active()
                         and not _is_clone()
+                        and not _interactive_mode
                         and not post_merge_pending
                         and not _stop_requested):
                     _planned_rotation_threshold = float(
@@ -4291,11 +4562,17 @@ def run_exploration(
                             except Exception:
                                 pass
 
-        # --- Topic exhaustion: stop after N consecutive low-output cycles ---
-        if low_output_streak >= LOW_OUTPUT_CLOSURE_COUNT:
+        # --- Topic exhaustion: explicit agent signal (primary) or N
+        # consecutive low-output cycles (backstop). Both funnel into the same
+        # exit so the proven clone merge-handoff path is reused. ---
+        if agent_signaled_complete or low_output_streak >= LOW_OUTPUT_CLOSURE_COUNT:
+            reason = (
+                "auditor signaled branch complete"
+                if agent_signaled_complete
+                else f"{low_output_streak} consecutive low-output cycles"
+            )
             print(
-                f"\n[long-exposure] Topic exhausted: {low_output_streak} consecutive "
-                f"cycles below {LOW_OUTPUT_THRESHOLD} output tokens.",
+                f"\n[long-exposure] Topic exhausted: {reason}.",
                 flush=True,
             )
             topic_exhausted = True
@@ -4322,7 +4599,10 @@ def run_exploration(
                        last_daily_sync_at=last_daily_sync_at,
                        daily_sync_count=daily_sync_count,
                        reanchor_emitted=reanchor_emitted,
-                       agent_context_tokens=agent_context_tokens)
+                       agent_context_tokens=agent_context_tokens,
+                       peak_cycle_output=peak_cycle_output,
+                       low_output_streak=low_output_streak,
+                       usage_basis=_usage_basis_arg)
 
         # Cooldown
         cooldown = adaptive_cooldown(base_cooldown, total_failure_streak)
@@ -4397,7 +4677,10 @@ def run_exploration(
                    last_daily_sync_at=last_daily_sync_at,
                    daily_sync_count=daily_sync_count,
                    reanchor_emitted=reanchor_emitted,
-                   agent_context_tokens=agent_context_tokens)
+                   agent_context_tokens=agent_context_tokens,
+                   peak_cycle_output=peak_cycle_output,
+                   low_output_streak=low_output_streak,
+                   usage_basis=_usage_basis_arg)
 
         # Clone exit path: skip final_reporter and curator. Run reporter
         # in merge mode to produce the merge_report.md the root conductor's
@@ -4570,7 +4853,10 @@ def run_exploration(
                    last_daily_sync_at=last_daily_sync_at,
                    daily_sync_count=daily_sync_count,
                    reanchor_emitted=reanchor_emitted,
-                   agent_context_tokens=agent_context_tokens)
+                   agent_context_tokens=agent_context_tokens,
+                   peak_cycle_output=peak_cycle_output,
+                   low_output_streak=low_output_streak,
+                   usage_basis=_usage_basis_arg)
         final_status = (
             "cleared" if _clear_requested
             else "completed" if (

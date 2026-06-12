@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re as _re
 import shutil
+import time as _time
 import uuid
 import zipfile
 from pathlib import Path
@@ -76,8 +77,29 @@ _PACKAGE_HARD_EXCLUDE_SUFFIXES = {".tmp", ".zip", ".db", ".log"}
 _PACKAGE_HARD_EXCLUDE_PATTERNS = [
     _re.compile(r"^report_cycles_[^/]+\.md$"),
     _re.compile(r"^report_cycles_[^/]+\.pdf$"),
-    _re.compile(r"(^|/)reports/final(/|$)"),
-    _re.compile(r"(^|/)audits(/|$)"),
+    # reports/final/ holds BOTH the canonical deliverables (final_report.md,
+    # final_report.pdf) and scratch artifacts (outline.md, draft.md,
+    # run_mode.json, the .committed marker). Exclude only the scratch — never
+    # the finals, which are the package's primary documents. A broader
+    # `reports/final/` exclude silently dropped the final report from every
+    # non-fallback curated package.
+    _re.compile(r"(^|/)reports/final/(outline\.md|draft\.md|run_mode\.json|final_report\.committed)$"),
+    # audits/final/ holds BOTH the canonical audit deliverables
+    # (final_audit_report.md, final_audit_report.pdf, final_audit_summary.json)
+    # and scratch artifacts (explore.md, stages/, findings.jsonl,
+    # lessons.jsonl, run_mode.json, the .committed marker). Exclude only the
+    # scratch — same bug class as the reports/final fix above: a broad
+    # `audits/` exclude silently dropped the audit deliverables from every
+    # agent-curated package while the legacy bare-filename spelling shipped.
+    _re.compile(
+        r"(^|/)audits/final/"
+        r"(stages(/|$)|explore\.md$|findings\.jsonl$|lessons\.jsonl$|"
+        r"run_mode\.json$|final_audit_report\.committed$)"
+    ),
+    # Anything under audits/ OUTSIDE final/ stays excluded (cycle-audit
+    # scratch and legacy layouts), as does the bare directory itself.
+    _re.compile(r"(^|/)audits/(?!final(/|$))"),
+    _re.compile(r"(^|/)audits$"),
     _re.compile(r"(^|/)manager_assessments(/|$)"),
 ]
 
@@ -306,10 +328,79 @@ def _canonical_final_src(working_dir: Path, src: str) -> Path | None:
     return by_name.get(Path(src).name)
 
 
+def _locate_curation_file(
+    working_dir: Path,
+    not_before: float | None = None,
+) -> Path | None:
+    """Find the curator agent's CURATION.yaml, even if misplaced in a subdir.
+
+    The curator is instructed to write CURATION.yaml to the workspace root,
+    but when the actual project lives in a subdirectory (the agent's effective
+    cwd is e.g. ``<workspace>/<project>/``) it can write the file relative to
+    that cwd. Recovering a misplaced manifest preserves the curator's work
+    instead of discarding it and shipping the report-only safety package.
+
+    ``not_before`` is a freshness floor (epoch seconds): recovered candidates
+    with an older mtime are ignored at every search depth, so a stale manifest
+    left behind by a previous run can neither ship nor shadow a fresher,
+    deeper one. The canonical root path is exempt — it is the explicitly
+    documented location, not a heuristic recovery. ``None`` disables the
+    filter (backward-compatible).
+
+    Resolution order:
+      1. ``<working_dir>/CURATION.yaml`` — the canonical location.
+      2. The most recently modified loose CURATION.yaml elsewhere under
+         working_dir, excluding audit-trail copies (a ``report/`` subtree) and
+         package staging scratch dirs.
+
+    Returns the resolved path, or None when no CURATION.yaml exists anywhere.
+    """
+    canonical = working_dir / "CURATION.yaml"
+    if canonical.is_file():
+        return canonical
+
+    def _eligible(p: Path) -> bool:
+        if not p.is_file():
+            return False
+        rel_parts = p.relative_to(working_dir).parts
+        # Skip audit-trail copies (report/CURATION.yaml inside a package
+        # tree) and packaging staging scratch.
+        if "report" in rel_parts:
+            return False
+        if any(part.startswith(".package_staging_") for part in rel_parts):
+            return False
+        if not_before is not None:
+            try:
+                if p.stat().st_mtime < not_before:
+                    return False
+            except OSError:
+                return False
+        return True
+
+    # Search shallow-first and stop at the shallowest depth that has a match.
+    # The curator misplaces the manifest at its project-root cwd (1-3 levels
+    # deep), so a bounded search is both faster than a full-tree rglob on a
+    # large workspace and less likely to pick up a stale manifest buried in a
+    # reference subtree. Within a depth tier, prefer the most recent file.
+    for depth in (1, 2, 3):
+        pattern = "/".join(["*"] * depth) + "/CURATION.yaml"
+        try:
+            tier = [p for p in working_dir.glob(pattern) if _eligible(p)]
+        except OSError:
+            return None
+        if tier:
+            try:
+                return max(tier, key=lambda p: p.stat().st_mtime)
+            except OSError:
+                return tier[0]
+    return None
+
+
 def _create_package_zip(
     working_dir: str | Path,
     task: str,
     timestamp_suffix: str | None = None,
+    not_before: float | None = None,
 ) -> str | None:
     """Build a curated handoff zip from CURATION.yaml.
 
@@ -327,6 +418,10 @@ def _create_package_zip(
     atomically. Daily-sync invocations pass a suffix so historical packages
     accumulate; one-shot end-of-run invocations omit it (default behavior).
 
+    ``not_before`` is a freshness floor forwarded to ``_locate_curation_file``
+    (see there); ``_run_curator`` passes the curator-stage start time so a
+    stale recovered manifest from a previous run cannot ship.
+
     Returns the zip filename (relative to working_dir), or None on failure.
     """
     working_dir = Path(working_dir)
@@ -334,15 +429,28 @@ def _create_package_zip(
         print("[long-exposure] Package: working_dir does not exist.", flush=True)
         return None
 
-    curation_path = working_dir / "CURATION.yaml"
-    curation = _parse_curation_manifest(curation_path)
+    # Locate the curator's CURATION.yaml. Prefer the canonical workspace-root
+    # path, but recover a manifest the agent misplaced into a working subdir
+    # rather than discarding its work (see _locate_curation_file).
+    curation_path = _locate_curation_file(working_dir, not_before=not_before)
+    # Base directory for resolving an entry's `src` when it isn't workspace-
+    # relative — i.e. the directory the curator was actually writing from.
+    curation_base = curation_path.parent if curation_path else working_dir
+    if curation_path is not None and curation_path.parent != working_dir:
+        print(
+            "[long-exposure] Package: recovered CURATION.yaml from a "
+            f"non-canonical location ({curation_path.relative_to(working_dir)}); "
+            "resolving its sources relative to that directory.",
+            flush=True,
+        )
+    curation = _parse_curation_manifest(curation_path) if curation_path else None
     fallback_used = curation is None or not curation.get("include")
     if fallback_used:
         # Attribute the failure to the specific cause so the user can fix
         # the upstream issue (usually: final reporter did not write the
         # '## Key Files' section in MANIFEST.md, so the curator agent had
         # nothing to select from).
-        if not curation_path.is_file():
+        if curation_path is None:
             reason = "CURATION.yaml was not produced by the curator agent"
         elif curation is None:
             reason = "CURATION.yaml could not be parsed"
@@ -355,6 +463,8 @@ def _create_package_zip(
             flush=True,
         )
         curation = _minimal_safety_curation(working_dir, task)
+        # The safety curation always uses workspace-relative paths.
+        curation_base = working_dir
         if not curation["include"]:
             print(
                 "[long-exposure] Package: no report documents found either. "
@@ -391,18 +501,56 @@ def _create_package_zip(
     missing: list[str] = []
     try:
         staging_root.mkdir(parents=True, exist_ok=True)
+        try:
+            workspace_resolved = working_dir.resolve()
+        except OSError:
+            workspace_resolved = working_dir
         for entry in curation["include"]:
             src_abs = working_dir / entry["src"]
             if not src_abs.is_file():
-                canonical = _canonical_final_src(working_dir, entry["src"])
-                if canonical and canonical.is_file():
-                    src_abs = canonical
+                # Try relative to where CURATION.yaml was found — handles a
+                # curator that wrote src paths relative to its working subdir.
+                alt = curation_base / entry["src"]
+                if curation_base != working_dir and alt.is_file():
+                    src_abs = alt
                 else:
-                    missing.append(entry["src"])
-                    continue
+                    canonical = _canonical_final_src(working_dir, entry["src"])
+                    if canonical and canonical.is_file():
+                        src_abs = canonical
+                    else:
+                        missing.append(entry["src"])
+                        continue
+            # Symlink containment: the manifest parser's lexical ".." check
+            # cannot stop an in-workspace symlink that points outside the
+            # workspace. Require the resolved source to live under the
+            # resolved workspace root; otherwise treat as missing.
+            try:
+                src_resolved = src_abs.resolve(strict=True)
+            except OSError:
+                missing.append(entry["src"])
+                continue
+            if not src_resolved.is_relative_to(workspace_resolved):
+                print(
+                    f"[long-exposure] Package: entry escapes the workspace "
+                    f"via symlink and was skipped: {entry['src']}",
+                    flush=True,
+                )
+                missing.append(entry["src"])
+                continue
             dest_abs = staging_root / entry["dest"]
-            dest_abs.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_abs, dest_abs)
+            # Per-entry copy failure (e.g. a file-vs-dir dest collision)
+            # skips the entry instead of aborting the whole package.
+            try:
+                dest_abs.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_abs, dest_abs)
+            except OSError as e:
+                print(
+                    f"[long-exposure] Package: copy failed for "
+                    f"{entry['src']} -> {entry['dest']} ({e}); entry skipped.",
+                    flush=True,
+                )
+                missing.append(entry["src"])
+                continue
             copied.append(entry)
 
         if not copied:
@@ -621,6 +769,14 @@ def _run_curator(
     print(f"\n{'='*60}", flush=True)
     print("[long-exposure] === Curator ===", flush=True)
 
+    # Freshness floor for recovered (non-canonical) CURATION.yaml files:
+    # only manifests written during/after this curator pass are eligible,
+    # so a stale manifest from a previous run can neither ship nor shadow
+    # the one the agent writes below. Canonical-root manifests are exempt.
+    # Small slack absorbs coarse filesystem mtime granularity — the stale
+    # case being guarded against is hours-to-days old, not seconds.
+    curator_start_ts = _time.time() - 2.0
+
     # Build results with working_dir for the agent
     dev_results = dict(results)
     dev_results["working_dir"] = working_dir
@@ -681,7 +837,11 @@ def _run_curator(
     # Deterministic step: build the curated zip regardless of agent outcome.
     # On missing/unparseable CURATION.yaml, _create_package_zip falls back to
     # a report-only safety package — never to a whole-workspace dump.
-    zip_name = _create_package_zip(working_dir, task, timestamp_suffix=timestamp_suffix)
+    zip_name = _create_package_zip(
+        working_dir, task,
+        timestamp_suffix=timestamp_suffix,
+        not_before=curator_start_ts,
+    )
     if zip_name:
         print(f"[long-exposure] Package ready: {zip_name}", flush=True)
     else:

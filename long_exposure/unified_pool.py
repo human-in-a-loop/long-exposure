@@ -197,7 +197,10 @@ def heartbeat_and_thaw_all() -> tuple[int, int]:
             except Exception:
                 pass
             try:
-                thawed += int(pool.thaw_eligible() or 0)
+                # thaw_eligible returns the list of thawed dirs — count it
+                # like the single-provider caller does. int(list) raised
+                # TypeError (swallowed below), so real thaws logged as 0.
+                thawed += len(pool.thaw_eligible() or [])
             except Exception:
                 pass
     return swept, thawed

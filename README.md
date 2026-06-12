@@ -196,6 +196,7 @@ Start with [docs/INDEX.md](docs/INDEX.md). Core docs:
 | Telemetry | [docs/telemetry.md](docs/telemetry.md) |
 | Soft guidance | [docs/soft-guidance.md](docs/soft-guidance.md) |
 | Known gaps | [docs/gaps.md](docs/gaps.md) |
+| Interactive transport (opt-in) | [docs/gaps_interactive_mode.md](docs/gaps_interactive_mode.md) |
 
 ## Current Design Boundaries
 

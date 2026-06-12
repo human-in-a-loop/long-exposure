@@ -4,7 +4,17 @@
 Launched as a subprocess by Claude Code via --mcp-config.
 Reads the SQLite database path from the SESSIONS_DB environment variable.
 
-Protocol: JSON-RPC 2.0 over stdio with Content-Length framing (MCP standard).
+Protocol: JSON-RPC 2.0 over stdio with newline-delimited framing
+(MCP stdio transport spec, revision 2024-11-05 and later). Each message
+is a single line of JSON terminated by `\\n`; messages MUST NOT contain
+embedded newlines.
+
+Earlier drafts of MCP inherited LSP-style `Content-Length:` header
+framing, which this server previously used. Current provider CLIs
+(Claude Code 2.1.x, Codex, Gemini CLI) all follow the newline-delimited
+spec, so the header framing caused every claude `-p` invocation to hang
+for the 30 s MCP-connection timeout and fall back to running without
+the `search_sessions` tool. See `docs/gaps.md` for the incident note.
 """
 
 import json
@@ -20,34 +30,35 @@ from auto_compact.db import (
 )
 
 
+# Sentinel returned by read_message when a line is not valid JSON. The
+# main loop turns it into a JSON-RPC -32700 parse-error response and
+# keeps serving instead of crashing on malformed input.
+PARSE_ERROR = object()
+
+
 def read_message():
-    """Read a JSON-RPC message with Content-Length header from stdin."""
-    headers = {}
+    """Read one newline-delimited JSON-RPC message from stdin.
+
+    Returns the decoded message, None on EOF (clean shutdown), or
+    PARSE_ERROR if the line is not valid JSON. Blank lines are skipped.
+    """
     while True:
         line = sys.stdin.buffer.readline()
         if not line:
             return None
-        decoded = line.decode("utf-8")
-        if decoded.strip() == "":
-            break
-        if ":" in decoded:
-            key, value = decoded.split(":", 1)
-            headers[key.strip()] = value.strip()
-
-    content_length = int(headers.get("Content-Length", 0))
-    if content_length == 0:
-        return None
-
-    body = sys.stdin.buffer.read(content_length)
-    return json.loads(body)
+        if not line.strip():
+            continue
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            return PARSE_ERROR
 
 
 def write_message(msg):
-    """Write a JSON-RPC message with Content-Length header to stdout."""
-    body = json.dumps(msg).encode("utf-8")
-    header = f"Content-Length: {len(body)}\r\n\r\n"
-    sys.stdout.buffer.write(header.encode("utf-8"))
-    sys.stdout.buffer.write(body)
+    """Write a JSON-RPC message as one line of JSON to stdout."""
+    body = json.dumps(msg, separators=(",", ":"))
+    sys.stdout.buffer.write(body.encode("utf-8"))
+    sys.stdout.buffer.write(b"\n")
     sys.stdout.buffer.flush()
 
 
@@ -134,37 +145,42 @@ TOOLS = [
 
 
 def handle_tool_call(conn, tool_name, arguments):
-    """Dispatch a tool call and return the result text."""
+    """Dispatch a tool call. Returns (result_text, is_error).
+
+    is_error=True maps to MCP's `isError` flag on the tool result so the
+    agent can distinguish "no matches" from "query failed" and from an
+    unknown tool name.
+    """
     if tool_name == "search_sessions":
         query = arguments.get("query", "")
         limit = min(arguments.get("limit", 5), 20)
         record_type = arguments.get("record_type")
         try:
             results = search_sessions(conn, query, limit, record_type=record_type)
-        except Exception:
-            results = []
+        except Exception as e:
+            return f"search_sessions failed: {e}", True
 
         if results:
             return "\n\n---\n\n".join(
                 f"Session {r['id']} (depth {r['depth']}, {r['created_at']}):\n"
                 f"{r['summary_xml']}"
                 for r in results
-            )
-        return "No matching sessions found."
+            ), False
+        return "No matching sessions found.", False
 
     elif tool_name == "search_sessions_by_id":
         session_id = arguments.get("session_id", "")
         try:
             session = get_session_by_id(conn, session_id)
-        except Exception:
-            session = None
+        except Exception as e:
+            return f"search_sessions_by_id failed: {e}", True
 
         if session:
             return (
                 f"Session {session['id']} (depth {session['depth']}, "
                 f"{session['created_at']}):\n{session['summary_xml']}"
-            )
-        return f"No session found with ID: {session_id}"
+            ), False
+        return f"No session found with ID: {session_id}", False
 
     elif tool_name == "list_session_catalog":
         topic = arguments.get("topic_filter")
@@ -174,8 +190,8 @@ def handle_tool_call(conn, tool_name, arguments):
             rows = list_session_catalog(
                 conn, topic_filter=topic, tools_filter=tools, limit=limit
             )
-        except Exception:
-            rows = []
+        except Exception as e:
+            return f"list_session_catalog failed: {e}", True
 
         if rows:
             lines = []
@@ -185,10 +201,10 @@ def handle_tool_call(conn, tool_name, arguments):
                     f"topic={r.get('topic', '')} subtopic={r.get('subtopic', '')} | "
                     f"tools={r.get('tools', '')} | keywords={r.get('keywords', '')}"
                 )
-            return "\n".join(lines)
-        return "No sessions found matching filters."
+            return "\n".join(lines), False
+        return "No sessions found matching filters.", False
 
-    return f"Unknown tool: {tool_name}"
+    return f"Unknown tool: {tool_name}", True
 
 
 def main():
@@ -204,6 +220,24 @@ def main():
         msg = read_message()
         if msg is None:
             break
+
+        if msg is PARSE_ERROR:
+            # Malformed line — report it and keep serving.
+            write_message({
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": "Parse error"},
+            })
+            continue
+
+        if not isinstance(msg, dict):
+            # Valid JSON but not a request object (e.g. `5`).
+            write_message({
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32600, "message": "Invalid Request"},
+            })
+            continue
 
         method = msg.get("method", "")
         msg_id = msg.get("id")
@@ -222,6 +256,13 @@ def main():
         elif method == "notifications/initialized":
             pass  # Notification — no response
 
+        elif method == "ping":
+            write_message({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {},
+            })
+
         elif method == "tools/list":
             write_message({
                 "jsonrpc": "2.0",
@@ -234,14 +275,15 @@ def main():
             tool_name = params.get("name", "")
             arguments = params.get("arguments", {})
 
-            text = handle_tool_call(conn, tool_name, arguments)
+            text, is_error = handle_tool_call(conn, tool_name, arguments)
 
+            result = {"content": [{"type": "text", "text": text}]}
+            if is_error:
+                result["isError"] = True
             write_message({
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {
-                    "content": [{"type": "text", "text": text}],
-                },
+                "result": result,
             })
 
         elif msg_id is not None:

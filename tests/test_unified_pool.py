@@ -149,6 +149,22 @@ class UnifiedPoolTests(unittest.TestCase):
         rotate.assert_called_once()
         self.assertEqual(sessions, {})
 
+    def test_heartbeat_and_thaw_all_counts_thawed_dirs(self):
+        # Regression: thaw_eligible returns list[str]; int(list) raised
+        # TypeError (swallowed by the bare except) so unified maintenance
+        # always reported thawed=0 on real thaws.
+        with patch.dict(os.environ, {"CLAUDE_ACCOUNT_POOL": "/a,/b", "CODEX_ACCOUNT_POOL": "/c,/d"}, clear=True):
+            with (
+                patch("long_exposure.unified_pool.pool.heartbeat_sweep", return_value=1),
+                patch(
+                    "long_exposure.unified_pool.pool.thaw_eligible",
+                    return_value=["/acct-x", "/acct-y"],
+                ),
+            ):
+                swept, thawed = unified_pool.heartbeat_and_thaw_all()
+        self.assertEqual(swept, 2)   # 1 per provider
+        self.assertEqual(thawed, 4)  # 2 dirs per provider
+
     def test_unified_fanout_cap_sums_remaining_branch_slots(self):
         available = {"claude": 3, "codex": 5}
 
