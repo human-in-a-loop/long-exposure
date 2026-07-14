@@ -337,6 +337,52 @@ limitation, not a correctness bug.
 
 ---
 
+## Interaction with per-agent providers
+
+The `agent_models` block in `config.yaml` (see
+`docs/configuration-reference.md` — Per-agent LLM routing) can assign a
+different provider to each agent type. When agents resolve to **more than one
+distinct provider**, the run enters **per-agent-pinned mode** and multi-account
+pooling is **deferred** for that run — the same posture the interactive
+transport already takes. On startup you'll see:
+
+```
+[long-exposure] Per-agent providers active (claude, codex): each agent is
+pinned to its configured provider; multi-account pooling is deferred for this run.
+```
+
+Why this is a hard XOR rather than a blend: the unified pool's whole model is
+**one active provider per root process**, chosen by capacity and rotated across
+providers on a 429. That is fundamentally incompatible with a *fixed* per-agent
+provider assignment — the pool would rotate the researcher off Claude onto
+Codex mid-run, silently overriding the template. Rather than let the two
+mechanisms fight, per-agent-pinned mode pins each agent's turn to its configured
+provider (via the same `LONG_EXPOSURE_LLM_PROVIDER` swap the unified pool uses
+internally) and skips pool init, pool-aware rotation, and cross-provider unified
+rotation for the run. Per-agent **model** and **effort** still apply in full.
+
+What still holds in per-agent-pinned mode:
+
+- Each agent runs on its configured provider's **default account** (or the
+  single account you have logged in for that provider).
+- Compaction of an agent's session runs under that agent's provider (it must, to
+  resume a provider-native session).
+- A rate limit on a pinned agent surfaces through the normal adaptive-cooldown
+  path (no account rotation), because rotation across heterogeneous providers is
+  undefined.
+
+What is **not** supported (deferred, see `docs/gaps.md`): heterogeneous per-agent
+providers **and** simultaneous multi-account rotation. If you need many accounts
+of one provider rotated for rate-limit resilience, keep the providers
+homogeneous (the default) and use the pool; if you need deterministic per-agent
+providers, use `agent_models` and rely on single accounts per provider.
+
+Homogeneous routing — every agent on the same provider, including the shipped
+default (all Claude) — is **not** pinned mode: pooling (single-provider and
+unified) works exactly as before.
+
+---
+
 ## Per-account usage tracking
 
 Cumulative four-field token counters per account, hooked at the

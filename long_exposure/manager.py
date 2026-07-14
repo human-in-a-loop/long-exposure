@@ -21,6 +21,7 @@ from typing import Any
 
 from long_exposure import provider as _provider
 from long_exposure import telemetry
+from long_exposure import agent_routing
 from long_exposure.conductor import parse_outputs
 from long_exposure.exploration import (
     DEFAULT_SCORE_PATH,
@@ -586,6 +587,12 @@ def run_manager_poll(
 ) -> int:
     score = load_exploration_score(score_path)
     config = load_config(config_path)
+    # Centralized per-agent LLM routing (config.yaml `agent_models`). The
+    # manager runs as its own process (cron sidecar), so it applies the same
+    # merge + pinned-mode detection as run_exploration before dispatching the
+    # manager agent.
+    agent_routing.apply_agent_models(config, score)
+    config["_per_agent_pinned"] = agent_routing.per_agent_pinned(config, score)
     _provider.configure_provider(config)
     if instance_dir is not None:
         config["instance_dir"] = str(instance_dir)

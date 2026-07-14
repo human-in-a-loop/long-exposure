@@ -134,6 +134,12 @@ allowed_tools:
   - "Bash(uv *)"
   - "Bash(*/uv *)"
 
+# NOTE: Each agent's PROVIDER, MODEL, and EFFORT are controlled centrally from
+# config.yaml `agent_models` (see docs/configuration-reference.md — Per-agent
+# LLM routing). Values set there override the per-agent `effort:` fields below.
+# The `effort:` fields here remain the fallback used only when config.yaml has
+# no `agent_models` block. Role text, inputs/outputs, philosophy, framework,
+# and tool scopes are still defined here.
 agents:
 
   researcher:

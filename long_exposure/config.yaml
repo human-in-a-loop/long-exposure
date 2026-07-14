@@ -24,6 +24,46 @@ codex_subagents:
   max_threads: 3                      # cap concurrent Codex subagent threads
   max_depth: 1                        # direct children only; no recursive subagent trees
 model_tier: opus
+
+# === Per-agent LLM routing (centralized template) ===
+# Single source of truth for the provider, model, and effort of EACH agent
+# type. Edit here to route different roles to different providers/models — e.g.
+# a Claude Fable researcher at xhigh effort alongside a Codex worker at medium.
+# See docs/configuration-reference.md (Per-agent LLM routing).
+#
+# Precedence: a field set here overrides the score's per-agent value and the
+# global settings above; a field left unset falls back to them (so `provider:`
+# omitted => `llm_provider`; `model:` omitted => the provider's default model
+# — `model`/`codex_model`/`gemini_model`/`local_model`).
+#
+# provider: claude | codex | gemini | local
+# model:    provider alias or full id (claude: opus|fable|sonnet|claude-opus-4-8;
+#           codex: gpt-5.5; gemini: gemini-3-flash-preview; ...)
+# effort:   low | medium | high | xhigh | max  (canonical vocabulary)
+#   - claude: passed as `--effort`
+#   - codex:  mapped to `-c model_reasoning_effort=` (max -> xhigh)
+#   - gemini: mapped to settings.json thinkingLevel LOW|MEDIUM|HIGH (best-effort;
+#             see docs/gaps.md — Gemini has no CLI effort flag)
+#   - local:  advisory only (surfaces in the system prompt)
+#
+# Default: Claude Opus for every agent, at each role's preset effort
+# (researcher / worker / auditor / final_auditor / manager = high; reporter /
+# final_reporter / curator = medium). Delete this whole block to fall back
+# entirely to the global settings + the score's per-agent effort (fully
+# backward compatible).
+#
+# NOTE: heterogeneous providers (more than one distinct provider across agents)
+# pin each agent to its provider and DEFER multi-account pooling for the run —
+# see docs/multi-account-pool.md.
+agent_models:
+  researcher:     { provider: claude, model: opus, effort: high }
+  worker:         { provider: claude, model: opus, effort: high }
+  auditor:        { provider: claude, model: opus, effort: high }
+  reporter:       { provider: claude, model: opus, effort: medium }
+  final_auditor:  { provider: claude, model: opus, effort: high }
+  final_reporter: { provider: claude, model: opus, effort: medium }
+  manager:        { provider: claude, model: opus, effort: high }
+  curator:        { provider: claude, model: opus, effort: medium }
 cli_timeout: 0                       # seconds per claude -p call (0 = no timeout)
 provider_idle_timeout_seconds: 1800  # no-progress hold before killing a silent provider CLI (0 = disabled)
 provider_idle_poll_seconds: 10       # provider watchdog poll interval

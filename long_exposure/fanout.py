@@ -111,6 +111,12 @@ def _fanout_branch_cap() -> int:
     invite branches that all PoolExhausted-fallback onto the root's
     account. The legacy cap applies only when no pool is configured.
     """
+    # Per-agent-pinned runs (heterogeneous providers) defer multi-account
+    # pooling, so the pool ledger is never initialized. Use the legacy
+    # (non-pool) cap rather than reading an uninitialized pool. See
+    # docs/multi-account-pool.md.
+    if os.environ.get("LONG_EXPOSURE_PER_AGENT_PINNED") == "1":
+        return FANOUT_MAX_BRANCHES
     try:
         from long_exposure import pool as _pool
         if unified_pool.is_unified_active():

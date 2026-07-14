@@ -172,6 +172,14 @@ def build_agent_config(base_config: dict, agent_def: dict) -> dict:
         if key in agent_def:
             config[key] = agent_def[key]
 
+    # Per-agent provider override (centralized template / score). Maps to the
+    # global `llm_provider` key that configure_provider reads. In per-agent-
+    # pinned runs the LONG_EXPOSURE_LLM_PROVIDER env var is also set around the
+    # call (env wins in configure_provider); setting it here keeps this config
+    # self-consistent on paths that build a config without that context.
+    if agent_def.get("provider"):
+        config["llm_provider"] = agent_def["provider"]
+
     _provider.configure_provider(config)
     if (
         _provider.is_codex()

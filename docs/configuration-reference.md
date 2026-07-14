@@ -82,6 +82,63 @@ interactive_turn_timeout_seconds: 1800  # interactive mode: max wait per turn
 | `interactive_*` | Interactive-transport tuning (driver model, permission mode, driver recycle cadence, bridge poll window, per-turn timeout). `interactive_permission_mode` falls back to `scoped` (the restrictive mode) on unknown values. |
 | `provider_idle_poll_seconds` | Poll interval for the provider idle watchdog. |
 
+### Per-agent LLM routing
+
+The `agent_models` block is the **single, centralized template** for the
+provider, model, and effort of each agent type. It lets one file route
+different roles to different providers/models — for example a Claude Fable
+researcher at `xhigh` effort alongside a Codex worker at `medium`.
+
+```yaml
+agent_models:
+  researcher:     { provider: claude, model: opus, effort: xhigh }
+  worker:         { provider: claude, model: opus, effort: xhigh }
+  auditor:        { provider: claude, model: opus, effort: xhigh }
+  reporter:       { provider: claude, model: opus, effort: xhigh }
+  final_auditor:  { provider: claude, model: opus, effort: xhigh }
+  final_reporter: { provider: claude, model: opus, effort: xhigh }
+  manager:        { provider: claude, model: opus, effort: xhigh }
+  curator:        { provider: claude, model: opus, effort: xhigh }
+```
+
+Each entry accepts three optional fields:
+
+| Field | Values | Notes |
+|---|---|---|
+| `provider` | `claude` \| `codex` \| `gemini` \| `local` | Omit to inherit the global `llm_provider`. |
+| `model` | provider alias or full id | Omit to use that provider's default model (`model` for Claude, `codex_model`, `gemini_model`, `local_model`). So `{provider: codex}` with no `model` runs `codex_model`. |
+| `effort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | Canonical vocabulary (Claude's). See effort translation below. |
+
+**Precedence.** A field set in `agent_models` overrides the score's per-agent
+value and the global settings; a field left unset falls back to them. Deleting
+the whole block restores the fully legacy behavior (global provider/model + the
+score's per-agent `effort:`) — the block is entirely backward compatible.
+
+**Default.** The shipped template routes every agent to Claude Opus at each
+role's preset effort — `high` for researcher, worker, auditor, final_auditor,
+and manager; `medium` for reporter, final_reporter, and curator (the same
+per-role efforts the score defined before this block existed). This is
+homogeneous, so it does not change any pooling behavior. Raise any role to
+`xhigh`/`max` here when you want more depth for that agent.
+
+**Effort translation per provider** (canonical → native control):
+
+| Provider | Mechanism | Mapping |
+|---|---|---|
+| claude | `--effort <e>` CLI flag | pass-through (unknown values warn and fall back inside the CLI) |
+| codex | `-c model_reasoning_effort="<e>"` config override | `max` → `xhigh` (Codex tops out at `xhigh`; `max`/`ultra` are gpt-5.6-only) |
+| gemini | `.gemini/settings.json` `thinkingConfig.thinkingLevel` | `low`→LOW, `medium`→MEDIUM, `high`/`xhigh`/`max`→HIGH (best-effort; no CLI flag — see `docs/gaps.md`) |
+| local | system-prompt text only | advisory (no reasoning field on the OpenAI-compatible payload) |
+
+Unknown providers/models/efforts never abort a run: an unknown effort warns
+once and falls back to `xhigh`; an unknown provider normalizes to `claude`.
+
+**Interaction with multi-account pooling.** If agents resolve to **more than one
+distinct provider** ("per-agent-pinned" mode), each agent is pinned to its
+provider and multi-account pooling is deferred for the run — see
+`docs/multi-account-pool.md`. Homogeneous routing (one provider across all
+agents, including the default) leaves pooling fully intact.
+
 ### Compaction
 
 ```yaml

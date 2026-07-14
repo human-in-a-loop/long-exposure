@@ -85,6 +85,7 @@ from long_exposure import provider as _provider
 from long_exposure import telemetry
 from long_exposure import unified_pool
 from long_exposure import interactive_transport
+from long_exposure import agent_routing
 from auto_compact.db import init_db, store_session
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -1255,6 +1256,7 @@ def _call_exploration_agent(
             "-o", tmp_last,
         ]
         cmd.extend(_codex_permission_flags(agent_config))
+        cmd.extend(agent_routing.provider_reasoning_args("codex", effort))
         cwd = agent_config.get("working_directory") or "/tmp"
         if cwd:
             cmd.extend(["-C", cwd])
@@ -1271,7 +1273,7 @@ def _call_exploration_agent(
             "claude", "-p",
             "--output-format", "json",
             "--model", agent_config.get("model", "opus"),
-            "--effort", effort,
+            *agent_routing.provider_reasoning_args("claude", effort),
         ]
 
     # Session: create or resume. For the generic local connector, the UUID identifies
@@ -1303,6 +1305,7 @@ def _call_exploration_agent(
                 "-m", agent_config.get("model", "gpt-5.5"),
                 "-o", tmp_last,
                 *_codex_permission_flags(agent_config, resume=True),
+                *agent_routing.provider_reasoning_args("codex", effort),
                 session_id,
                 "-",
             ]
@@ -1311,6 +1314,7 @@ def _call_exploration_agent(
             cli_stdin = user_prompt
         else:
             cmd.extend(["--resume", session_id])
+            cmd.extend(agent_routing.provider_reasoning_args("claude", effort))
     else:
         if _provider.is_claude():
             session_id = str(uuid.uuid4())
@@ -1595,6 +1599,19 @@ def _call_agent_with_rotation(
     """
     from long_exposure import pool as _pool
 
+    _cfg = kwargs.get("config") or {}
+    if _cfg.get("_per_agent_pinned"):
+        # Heterogeneous per-agent providers: multi-account pooling is deferred,
+        # so this is a single attempt under the agent's pinned provider (no
+        # cross-account / cross-provider rotation).
+        with agent_routing.agent_provider_context(agent_def, _cfg):
+            return _call_exploration_agent(
+                agent_name=agent_name,
+                agent_def=agent_def,
+                agent_sessions=sessions_dict,
+                **kwargs,
+            )
+
     accounts = _parse_accounts()
     is_forced, _ = _resolve_force_account(accounts)
 
@@ -1704,6 +1721,34 @@ def _call_agent_with_rotation(
 
 
 def _compact_agent_session(
+    agent_name: str,
+    agent_def: dict,
+    config: dict,
+    agent_sessions: dict,
+    agent_summaries: dict,
+    conn,
+    cycle: int,
+    last_session_id: str | None,
+) -> str | None:
+    """Pin compaction to the agent's provider, then delegate.
+
+    Compaction resumes the agent's own provider-native session, so it must run
+    under the same provider the agent used. The context is a no-op unless the
+    run is per-agent-pinned (heterogeneous providers)."""
+    with agent_routing.agent_provider_context(agent_def, config):
+        return _compact_agent_session_impl(
+            agent_name,
+            agent_def,
+            config,
+            agent_sessions,
+            agent_summaries,
+            conn,
+            cycle,
+            last_session_id,
+        )
+
+
+def _compact_agent_session_impl(
     agent_name: str,
     agent_def: dict,
     config: dict,
@@ -3063,7 +3108,28 @@ def run_exploration(
 
     score = load_exploration_score(score_path)
     config = load_config(config_path)
+
+    # Centralized per-agent LLM routing (config.yaml `agent_models`). Merge the
+    # provider/model/effort template onto each score agent_def BEFORE the
+    # provider is configured, so a heterogeneous template is visible to the
+    # pooling decision below and to every downstream build_agent_config.
+    agent_routing.apply_agent_models(config, score)
+    config["_per_agent_pinned"] = agent_routing.per_agent_pinned(config, score)
+    # Signal pinned mode to sibling machinery that can't see `config` (e.g.
+    # fanout cap computation) and to spawned clone processes, which inherit it.
+    if config["_per_agent_pinned"]:
+        os.environ["LONG_EXPOSURE_PER_AGENT_PINNED"] = "1"
+    else:
+        os.environ.pop("LONG_EXPOSURE_PER_AGENT_PINNED", None)
     _provider.configure_provider(config)
+    if config["_per_agent_pinned"]:
+        _provs = ", ".join(sorted(agent_routing.resolved_providers(config, score)))
+        print(
+            "[long-exposure] Per-agent providers active "
+            f"({_provs}): each agent is pinned to its configured provider; "
+            "multi-account pooling is deferred for this run.",
+            flush=True,
+        )
 
     # Thread instance_dir onto config so nested machinery (call_agent_with_session
     # → generate_mcp_config) can pick it up via the agent_config copy produced by
@@ -3417,6 +3483,10 @@ def run_exploration(
     # are intentionally deferred — interactive mode runs sequential cycles on
     # the active logged-in account. Tear the driver session down at exit.
     _interactive_mode = interactive_transport.is_enabled(config)
+    # Heterogeneous per-agent providers pin each agent to its provider and
+    # defer multi-account pooling for this run (same posture as interactive
+    # transport). Homogeneous runs leave this False and keep pooling intact.
+    _per_agent_pinned = bool(config.get("_per_agent_pinned"))
     if _interactive_mode:
         import atexit as _atexit
         _atexit.register(interactive_transport.shutdown)
@@ -3433,7 +3503,7 @@ def run_exploration(
     # root agents (sequential calls share this one slot). Clones inherit
     # CLAUDE_FORCE_ACCOUNT from their fanout-spawn env and are already
     # accounted in the ledger by the fanout conductor.
-    if not _is_clone() and not _interactive_mode and unified_pool.is_unified_active():
+    if not _is_clone() and not _interactive_mode and not _per_agent_pinned and unified_pool.is_unified_active():
         try:
             unified_pool.init_all_pools()
             holder = unified_pool.acquire_slot(
@@ -3454,7 +3524,7 @@ def run_exploration(
             print(f"[long-exposure] {unified_pool.format_unified_summary()}", flush=True)
         except Exception as _pool_err:
             print(f"[long-exposure] Unified pool init warning: {_pool_err}", flush=True)
-    elif not _is_clone() and not _interactive_mode and pool.is_active():
+    elif not _is_clone() and not _interactive_mode and not _per_agent_pinned and pool.is_active():
         try:
             pool.init_pool()
             pool.thaw_eligible()
@@ -3625,7 +3695,7 @@ def run_exploration(
         # never initialized the pool (init above is gated on
         # `not _interactive_mode`), so maintenance must skip too — it would
         # mutate a never-initialized ledger the transport ignores.
-        if not _is_clone() and not _interactive_mode and unified_pool.is_unified_active():
+        if not _is_clone() and not _interactive_mode and not _per_agent_pinned and unified_pool.is_unified_active():
             try:
                 _swept, _thawed = unified_pool.heartbeat_and_thaw_all()
                 if _swept or _thawed:
@@ -3636,7 +3706,7 @@ def run_exploration(
                     )
             except Exception as _pool_err:
                 print(f"[long-exposure] Unified pool maintenance skipped ({_pool_err})", flush=True)
-        elif not _is_clone() and not _interactive_mode and pool.is_active():
+        elif not _is_clone() and not _interactive_mode and not _per_agent_pinned and pool.is_active():
             try:
                 _swept = pool.heartbeat_sweep()
                 _thawed = pool.thaw_eligible()
@@ -3868,22 +3938,25 @@ def run_exploration(
                     flush=True,
                 )
 
-                result = _call_exploration_agent(
-                    agent_name=agent_name,
-                    agent_def=agent_def,
-                    task=task,
-                    config=config,
-                    results=results,
-                    score_inputs=score_inputs,
-                    agent_sessions=agent_sessions,
-                    agent_summaries=agent_summaries,
-                )
+                # Pin this agent to its configured provider for the turn
+                # (no-op unless the run is per-agent-pinned).
+                with agent_routing.agent_provider_context(agent_def, config):
+                    result = _call_exploration_agent(
+                        agent_name=agent_name,
+                        agent_def=agent_def,
+                        task=task,
+                        config=config,
+                        results=results,
+                        score_inputs=score_inputs,
+                        agent_sessions=agent_sessions,
+                        agent_summaries=agent_summaries,
+                    )
                 telemetry.emit_agent_result(
                     agent_name,
                     result,
                     cycle=cycle,
-                    provider=config.get("llm_provider"),
-                    model=config.get("model"),
+                    provider=agent_routing.agent_provider(agent_def, config),
+                    model=agent_def.get("model") or config.get("model"),
                     context_window=context_window,
                 )
 
@@ -4172,7 +4245,7 @@ def run_exploration(
             # regression (clones inherit parent's primary, all
             # land on acct4, retry indefinitely) was caused by exactly that
             # ordering. Pool path first; legacy is the fallback only.
-            if unified_pool.is_unified_active() and not _is_clone():
+            if unified_pool.is_unified_active() and not _is_clone() and not _per_agent_pinned:
                 old_provider = _provider.current_provider()
                 preference = [
                     prv for prv in unified_pool.SUPPORTED_PROVIDERS_FOR_POOL
@@ -4196,7 +4269,7 @@ def run_exploration(
                     )
                     cycle_ok = False
                     break
-            elif pool.is_active():
+            elif pool.is_active() and not _per_agent_pinned:
                 if _is_clone():
                     # §6.2: a pinned clone whose account rate-limits cannot
                     # rotate. Mark cooling, release slot, exit cleanly so

@@ -52,6 +52,7 @@ from auto_compact.proximity import (
 from long_exposure import pool as _pool
 from long_exposure import provider as _provider
 from long_exposure import unified_pool
+from long_exposure import agent_routing
 
 # ---------------------------------------------------------------------------
 # Directory setup
@@ -3517,6 +3518,8 @@ def call_claude(
         ]
         codex_cfg = load_config()
         cmd.extend(_codex_permission_flags(codex_cfg, disable_tools=disable_tools))
+        if effort:
+            cmd.extend(agent_routing.provider_reasoning_args("codex", effort))
         cmd.extend(["-C", effective_cwd])
         combined_prompt = (
             f"[SYSTEM PROMPT]\n\n{system_prompt}\n\n[USER PROMPT]\n\n{prompt}"
@@ -3529,6 +3532,8 @@ def call_claude(
         effective_cwd = cwd or os.getcwd()
         gemini_cfg = load_config()
         gemini_cfg["working_directory"] = effective_cwd
+        if effort:
+            gemini_cfg["effort"] = effort
         if mcp_config:
             gemini_cfg["compact_db"] = gemini_cfg.get("compact_db")
         generate_gemini_project_settings(gemini_cfg)
@@ -3789,6 +3794,22 @@ def generate_gemini_project_settings(config: dict) -> str | None:
         # aligned with core so agent-type permission scopes are not widened.
         tools_cfg["allowed"] = list(tools_cfg["core"])
         current["tools"] = tools_cfg
+
+        # Per-agent effort -> Gemini thinking level. Gemini has no CLI effort
+        # flag; the only supported knob is settings.json thinkingConfig. This is
+        # best-effort: Gemini 3 uses thinkingLevel (LOW|MEDIUM|HIGH); a CLI
+        # version that doesn't honor the key simply ignores it (never breaks the
+        # run). See docs/gaps.md (Gemini per-agent effort). Effort also always
+        # conditions the system prompt, so a role's intended effort is never lost.
+        level = agent_routing.gemini_thinking_level(config.get("effort"))
+        if level:
+            model_cfg = dict(current.get("model") or {})
+            gen_cfg = dict(model_cfg.get("generateContentConfig") or {})
+            thinking_cfg = dict(gen_cfg.get("thinkingConfig") or {})
+            thinking_cfg["thinkingLevel"] = level
+            gen_cfg["thinkingConfig"] = thinking_cfg
+            model_cfg["generateContentConfig"] = gen_cfg
+            current["model"] = model_cfg
 
         db_path = config.get("compact_db")
         if db_path:
