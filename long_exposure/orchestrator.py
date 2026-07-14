@@ -2850,8 +2850,72 @@ def _proc_comm(pid: int) -> str:
         return ""
 
 
-def _provider_process_activity(root_pid: int) -> tuple[int, int, bool]:
-    """Return (tree_size, cpu_ticks, has_external_child)."""
+# Linux exposes a /proc pseudo-filesystem we can read directly; macOS and the
+# BSDs do not, so we fall back to parsing `ps`. Presence doesn't change during
+# a run, so probe once at import.
+_HAS_PROC_FS = Path("/proc").is_dir()
+
+
+def _cputime_to_ticks(text: str) -> int:
+    """Parse a `ps` TIME field ([dd-][hh:]mm:ss[.ss]) to ~USER_HZ ticks.
+
+    /proc reports utime+stime in USER_HZ clock ticks (~100/sec). `ps` reports
+    cumulative CPU as a colon-separated wall-style string; we normalize to the
+    same 100-tick-per-second scale so the activity signature buckets line up
+    regardless of platform.
+    """
+    text = text.strip()
+    days = 0
+    if "-" in text:
+        head, _, text = text.partition("-")
+        try:
+            days = int(head)
+        except ValueError:
+            days = 0
+    try:
+        parts = [float(p) for p in text.split(":")]
+    except ValueError:
+        return 0
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60 + part
+    seconds += days * 86400
+    return int(seconds * 100)
+
+
+def _ps_process_snapshot() -> tuple[dict[int, list[int]], dict[int, int], dict[int, str]]:
+    """(children, cpu_ticks_by_pid, comm_by_pid) via `ps`, for platforms
+    without a /proc filesystem (macOS, *BSD)."""
+    children: dict[int, list[int]] = {}
+    stats: dict[int, int] = {}
+    comms: dict[int, str] = {}
+    try:
+        proc = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid=,time=,comm="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return children, stats, comms
+    for line in proc.stdout.splitlines():
+        # comm is last and may contain spaces (it's a path), so cap the split.
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+        stats[pid] = _cputime_to_ticks(parts[2])
+        comms[pid] = Path(parts[3].strip()).name
+    return children, stats, comms
+
+
+def _proc_snapshot() -> tuple[dict[int, list[int]], dict[int, int]]:
+    """(children, cpu_ticks_by_pid) from the Linux /proc filesystem."""
     children: dict[int, list[int]] = {}
     stats: dict[int, int] = {}
     for entry in Path("/proc").iterdir():
@@ -2864,6 +2928,18 @@ def _provider_process_activity(root_pid: int) -> tuple[int, int, bool]:
         ppid, ticks = stat
         children.setdefault(ppid, []).append(pid)
         stats[pid] = ticks
+    return children, stats
+
+
+def _provider_process_activity(root_pid: int) -> tuple[int, int, bool]:
+    """Return (tree_size, cpu_ticks, has_external_child)."""
+    if _HAS_PROC_FS:
+        children, stats = _proc_snapshot()
+        # Read comm lazily per tree member — cheaper than scanning every pid.
+        comm_of = _proc_comm
+    else:
+        children, stats, comms = _ps_process_snapshot()
+        comm_of = comms.get
 
     stack = [root_pid]
     seen: set[int] = set()
@@ -2877,7 +2953,7 @@ def _provider_process_activity(root_pid: int) -> tuple[int, int, bool]:
         seen.add(pid)
         total_ticks += stats.get(pid, 0)
         if pid != root_pid:
-            comm = _proc_comm(pid)
+            comm = comm_of(pid) or ""
             if comm and comm not in provider_names:
                 external_child = True
         stack.extend(children.get(pid, []))
