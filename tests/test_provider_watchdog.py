@@ -5,7 +5,54 @@ import time
 import unittest
 from pathlib import Path
 
-from long_exposure.orchestrator import _activity_signature, _run_cli_subprocess
+import os
+
+from long_exposure.orchestrator import (
+    _activity_signature,
+    _cputime_to_ticks,
+    _provider_process_activity,
+    _ps_process_snapshot,
+    _run_cli_subprocess,
+)
+
+
+class CpuTimeParsingTests(unittest.TestCase):
+    """The `ps`-based fallback (macOS/BSD, no /proc) parses cumulative CPU
+    time into the same ~USER_HZ tick scale the /proc path reports."""
+
+    def test_parses_minutes_seconds_centiseconds(self):
+        self.assertEqual(_cputime_to_ticks("0:00.01"), 1)
+        self.assertEqual(_cputime_to_ticks("1:02.50"), 6250)
+
+    def test_parses_large_minute_field(self):
+        # macOS `ps` lets the leading field grow unbounded (e.g. launchd).
+        self.assertEqual(_cputime_to_ticks("403:02.02"), 2418202)
+
+    def test_parses_day_prefixed_form(self):
+        # 1 day + 02:03:04 = 93784s.
+        self.assertEqual(_cputime_to_ticks("1-02:03:04"), 9378400)
+
+    def test_unparseable_field_is_zero_not_crash(self):
+        self.assertEqual(_cputime_to_ticks("?"), 0)
+        self.assertEqual(_cputime_to_ticks(""), 0)
+
+
+class PsProcessSnapshotTests(unittest.TestCase):
+    """`_ps_process_snapshot` works on any platform with a POSIX `ps`, so it's
+    exercised even where CI runs on Linux and the live probe uses /proc."""
+
+    def test_snapshot_captures_current_process(self):
+        children, stats, comms = _ps_process_snapshot()
+        pid = os.getpid()
+        self.assertIn(pid, stats)
+        self.assertIn(pid, comms)
+        # Our own pid must appear as a child of its parent.
+        self.assertIn(pid, children.get(os.getppid(), []))
+
+    def test_activity_probe_counts_self_in_tree(self):
+        size, ticks, _ = _provider_process_activity(os.getpid())
+        self.assertGreaterEqual(size, 1)
+        self.assertGreaterEqual(ticks, 0)
 
 
 class ActivitySignatureTests(unittest.TestCase):
