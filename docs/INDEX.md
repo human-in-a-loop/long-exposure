@@ -60,6 +60,7 @@ long-exposure does, see the project [README](../README.md).
 | [`google-cloud-open-source-llm-costs.md`](google-cloud-open-source-llm-costs.md) | Cost trade-offs showing why Gemini Flash free tier is preferred over self-hosted open models on Google Cloud | Provider planning |
 | [`gaps.md`](gaps.md) | Known gaps: resolved incidents (with root-cause notes) and deliberately deferred items with justifications | Before filing/fixing a bug |
 | [`gaps_interactive_mode.md`](gaps_interactive_mode.md) | Opt-in interactive Claude transport: design, configuration, verification, and its own gaps table | Considering `claude_transport: interactive` |
+| [`benchmarking-plan.md`](benchmarking-plan.md) | Sept 2026 evaluation of the harness (verified code-vs-docs findings), survey of harness-labelled public benchmarks, and a phased plan to benchmark long-exposure against peer harnesses | Planning or reading a benchmark campaign |
 
 ---
 
