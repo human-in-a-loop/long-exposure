@@ -524,11 +524,98 @@ class TelemetryCostRollupTests(unittest.TestCase):
         self.assertEqual(summary["cost"]["num_turns"], 3)
 
 
-class FinalAuditorStageCapTests(unittest.TestCase):
-    def test_stage_count_is_capped_at_n_max(self):
+class FinalStageCountTests(unittest.TestCase):
+    """One stage per ~100k input tokens; the auditor floors at 1 and caps at
+    5 (4..12 stages), the reporter floors at 1 and stays uncapped."""
+
+    def test_auditor_stage_count_is_floored_and_capped(self):
         from long_exposure.auditing import _final_auditor_stage_count, _N_MAX
-        self.assertEqual(_N_MAX, 5)
+        from long_exposure.limits import FINAL_STAGE_TOKEN_THRESHOLD
+        self.assertEqual((FINAL_STAGE_TOKEN_THRESHOLD, _N_MAX), (100_000, 5))
+        # Floor: a small workspace still gets one verify and one test pass,
+        # never zero (explore + document alone would skip verification).
         self.assertEqual(_final_auditor_stage_count(0), (1, 4))
-        self.assertEqual(_final_auditor_stage_count(60_000), (3, 8))
+        self.assertEqual(_final_auditor_stage_count(99_999), (1, 4))
+        self.assertEqual(_final_auditor_stage_count(120_000), (1, 4))
+        self.assertEqual(_final_auditor_stage_count(300_000), (3, 8))
+        self.assertEqual(_final_auditor_stage_count(500_000), (5, 12))
+        # Cap.
         self.assertEqual(_final_auditor_stage_count(1_000_000), (5, 12))
         self.assertEqual(_final_auditor_stage_count(10**9), (5, 12))
+
+    def test_reporter_stage_count_is_floored_and_uncapped(self):
+        from long_exposure.limits import FINAL_STAGE_TOKEN_THRESHOLD as T
+
+        def num_body(tokens):  # mirrors reporting.py:_run_final_reporter
+            return max(1, tokens // T)
+
+        self.assertEqual(num_body(0), 1)
+        self.assertEqual(num_body(99_999), 1)
+        self.assertEqual(num_body(1_000_000), 10)
+        self.assertEqual(num_body(10_000_000), 100)
+
+
+class HealthEventsRoutingTests(unittest.TestCase):
+    """Root runs must write health_events.jsonl; only clones used to."""
+
+    def tearDown(self):
+        from long_exposure import health_events
+        health_events.configure(None)
+
+    def test_configure_directs_events_without_the_clone_env_var(self):
+        from long_exposure import health_events
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            health_events.configure(None)
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AGENT_INSTANCE_DIR", None)
+                # Unconfigured and no env var: nothing is written (old
+                # behaviour for a bare tool invocation).
+                health_events.append_event("pdf_render_failed", detail="x")
+                self.assertFalse((root / "health_events.jsonl").exists())
+                # Configured: events land next to the state file.
+                health_events.configure(root)
+                health_events.append_event("pdf_render_failed", detail="y", cycle=3)
+                lines = (root / "health_events.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        record = json.loads(lines[0])
+        self.assertEqual(record["kind"], "pdf_render_failed")
+        self.assertEqual(record["cycle"], 3)
+
+    def test_explicit_data_dir_wins_over_configured_and_env(self):
+        from long_exposure import health_events
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "cfg").mkdir()
+            (root / "arg").mkdir()
+            (root / "env").mkdir()
+            health_events.configure(root / "cfg")
+            with patch.dict(os.environ, {"AGENT_INSTANCE_DIR": str(root / "env")}):
+                health_events.append_event("k", data_dir=root / "arg")
+                health_events.append_event("k")
+            self.assertTrue((root / "arg" / "health_events.jsonl").exists())
+            self.assertTrue((root / "cfg" / "health_events.jsonl").exists())
+            self.assertFalse((root / "env" / "health_events.jsonl").exists())
+
+    def test_clone_env_var_still_works_when_unconfigured(self):
+        from long_exposure import health_events
+        health_events.configure(None)
+        with tempfile.TemporaryDirectory() as td:
+            clone = Path(td)
+            with patch.dict(os.environ, {"AGENT_INSTANCE_DIR": str(clone)}):
+                health_events.append_event("clone_event")
+            self.assertTrue((clone / "health_events.jsonl").exists())
+
+    def test_run_exploration_configures_health_events(self):
+        from long_exposure import health_events
+        seen = []
+        with tempfile.TemporaryDirectory() as td:
+            score, config, inst = _write_files(Path(td))
+            health_events.configure(None)
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AGENT_INSTANCE_DIR", None)
+                with patch("long_exposure.exploration._call_exploration_agent",
+                           _fake_agent_factory(seen)):
+                    _run(score, config, inst)
+                health_events.append_event("post_run_probe")
+            self.assertTrue((inst / "health_events.jsonl").exists())

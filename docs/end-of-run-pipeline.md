@@ -73,14 +73,15 @@ auditor cannot close because it's scoped to a single cycle's work.
 The final auditor's stage count scales with input size:
 
 ```
-N = min(max(1, input_tokens // 20_000), 5)   # _N_MAX = 5 → 4..12 stages
+N = min(max(1, input_tokens // 100_000), 5)   # _N_MAX = 5 → 4..12 stages
 total_stages = 1 + N + N + 1
             = explore → verify×N → test×N → document
 ```
 
-Same heuristic as the final reporter (the
-formula was deliberately unified). For a typical 40-cycle run with
-~120k tokens of inputs, N ≈ 6, giving ~14 stages.
+Same threshold as the final reporter (the constant is shared:
+`limits.FINAL_STAGE_TOKEN_THRESHOLD`). For a typical 40-cycle run with
+~120k tokens of inputs, N = 1, giving 4 stages; N reaches its cap of 5
+(12 stages) at 500k tokens of inputs.
 
 The four canonical stage purposes:
 
@@ -239,14 +240,15 @@ reports, produces a consolidated final report.
 Same heuristic as the final auditor:
 
 ```
-num_body_stages = max(1, total_tokens // 20_000)
+num_body_stages = max(1, total_tokens // 100_000)
 total_stages = 1 + num_body_stages + 1
             = outline → body×N → finalize
 ```
 
-The hard cap on N was removed for multi-day runs
-that accumulate ~1M tokens of prior reports. Wall-cap (10h) is the
-real ceiling.
+Unlike the auditor, the reporter's N is **not** capped: a multi-day run
+that accumulates ~1M tokens of prior reports gets ~10 body stages so the
+synthesis can cover the material section by section. Wall-cap (10h) is
+the real ceiling.
 
 ### Stages
 

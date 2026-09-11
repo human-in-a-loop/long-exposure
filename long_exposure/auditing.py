@@ -170,7 +170,7 @@ def _compute_figure_coverage(workspace: Path) -> dict:
                 for art in (ev.get("artifacts") or []):
                     if not isinstance(art, str):
                         continue
-                    canon = art.lstrip("./").rstrip("/")
+                    canon = paths.canonical_rel_path(art)
                     if canon.lower().endswith(_FIGURE_SUFFIXES):
                         referenced.add(canon)
         except OSError:

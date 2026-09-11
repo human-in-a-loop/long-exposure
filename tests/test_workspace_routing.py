@@ -417,3 +417,40 @@ class WorkspaceRoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_canonical_rel_path_keeps_dotdot_and_dotfiles():
+    """lstrip("./") ate leading dots: "./.config/x" -> "config/x" and
+    "../x" -> "x", which defeated the curator's containment check."""
+    from long_exposure.paths import canonical_rel_path
+    assert canonical_rel_path("./reports/final/final_report.md") == "reports/final/final_report.md"
+    assert canonical_rel_path("././scripts/a.py") == "scripts/a.py"
+    assert canonical_rel_path("  ./data/x.csv  ") == "data/x.csv"
+    assert canonical_rel_path("./.config/x") == ".config/x"
+    assert canonical_rel_path(".hidden/x") == ".hidden/x"
+    assert canonical_rel_path("../escape.txt") == "../escape.txt"
+    assert canonical_rel_path("./../escape.txt") == "../escape.txt"
+    assert canonical_rel_path("//abs/x/") == "abs/x"
+    assert canonical_rel_path("") == ""
+    assert canonical_rel_path(None) == ""
+
+
+def test_curation_staging_rejects_dotdot_entries(tmp_path):
+    """The `..` containment check must actually fire now that the dots survive."""
+    from long_exposure.curator import _parse_curation_manifest
+    manifest = tmp_path / "CURATION.yaml"
+    manifest.write_text(
+        "package_name: pkg\n"
+        "description: d\n"
+        "curation_complete: true\n"
+        "include:\n"
+        "  - src: ../../etc/passwd\n"
+        "    dest: code/passwd\n"
+        "    role: code\n"
+        "  - src: ./scripts/keep.py\n"
+        "    dest: code/keep.py\n"
+        "    role: code\n"
+    )
+    parsed = _parse_curation_manifest(manifest)
+    srcs = [e["src"] for e in (parsed or {}).get("include", [])]
+    assert srcs == ["scripts/keep.py"]

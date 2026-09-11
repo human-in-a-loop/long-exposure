@@ -37,17 +37,38 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+_CONFIGURED_DIR: Path | None = None
+
+
+def configure(data_dir: Path | str | None) -> None:
+    """Set the default log directory for this process.
+
+    `run_exploration` calls this with the run's data dir so root runs write
+    `health_events.jsonl` next to their state file. Without it, only fan-out
+    clones logged anything: they are the only processes that get
+    `AGENT_INSTANCE_DIR` in their environment, so every root-run event
+    (silent fallbacks, rescues, retries) was dropped unless the operator
+    exported that variable by hand.
+    """
+    global _CONFIGURED_DIR
+    _CONFIGURED_DIR = Path(data_dir) if data_dir else None
+
+
 def _resolve_log_path(data_dir: Path | str | None = None) -> Path | None:
-    """Resolve the log path. Honours `AGENT_INSTANCE_DIR` for clones so each
-    clone has its own log; falls back to the explicitly-passed `data_dir`.
+    """Resolve the log path, most specific source first: the explicitly
+    passed `data_dir`, then this process's `configure()` directory, then
+    `AGENT_INSTANCE_DIR` (set for fan-out clones, and the only source for a
+    standalone tool invocation that never called `configure`).
 
     Returns None if no usable directory is available — caller skips logging.
     """
+    if data_dir:
+        return Path(data_dir) / "health_events.jsonl"
+    if _CONFIGURED_DIR is not None:
+        return _CONFIGURED_DIR / "health_events.jsonl"
     instance_dir = os.environ.get("AGENT_INSTANCE_DIR", "").strip()
     if instance_dir:
         return Path(instance_dir) / "health_events.jsonl"
-    if data_dir:
-        return Path(data_dir) / "health_events.jsonl"
     return None
 
 

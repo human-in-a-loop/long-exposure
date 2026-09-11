@@ -612,6 +612,7 @@ def run_agent(
             # exploration call path threads to _invoke_claude). Omitting
             # these would leave call_claude on its module-level defaults
             # rather than the values from this run's --config file.
+            config=agent_config,
             idle_timeout=agent_config.get("provider_idle_timeout_seconds"),
             idle_poll=agent_config.get("provider_idle_poll_seconds"),
         )

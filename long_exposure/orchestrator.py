@@ -3330,8 +3330,14 @@ def _invoke_claude(
     timeout: int | None = None,
     idle_timeout: int | None = None,
     idle_poll: int | None = None,
+    config: dict | None = None,
 ) -> dict:
     """Run one `claude -p` subprocess against the currently active account.
+
+    `config` is the run's resolved configuration. Pass it so provider
+    settings come from the run's `--config` file; when omitted, the Gemini
+    auth selector falls back to the packaged `config.yaml` (legacy
+    behaviour, kept so existing callers are unaffected).
 
     Single attempt, no rotation. Rotation is the caller's responsibility —
     this lets session-ful callers (exploration.py) bubble a rate-limit up
@@ -3356,7 +3362,9 @@ def _invoke_claude(
         env[_provider.child_config_env()] = acct_dir
     if _is_gemini_command(cmd):
         try:
-            _configure_gemini_auth_env(env, load_config())
+            _configure_gemini_auth_env(
+                env, config if config is not None else load_config()
+            )
         except Exception:
             _configure_gemini_auth_env(env, None)
 
@@ -3531,8 +3539,15 @@ def call_claude(
     effort: str | None = None,
     idle_timeout: int | None = None,
     idle_poll: int | None = None,
+    config: dict | None = None,
 ) -> dict:
     """Call Claude via CLI subprocess. Returns the parsed JSON envelope.
+
+    `config` is the run's resolved configuration, used for the local
+    connector settings, Codex permission flags, Gemini project settings and
+    the Gemini auth selector. When omitted these fall back to the packaged
+    `config.yaml` (legacy behaviour), which ignores the run's `--config`.
+    The dict is never mutated: provider branches work on a shallow copy.
 
     Builds a stateless `claude -p` command (--no-session-persistence, explicit
     --system-prompt each call) and delegates to _invoke_claude. On a rate-limit
@@ -3547,7 +3562,7 @@ def call_claude(
             system_prompt=system_prompt,
             model=model,
             timeout=timeout,
-            config=load_config(),
+            config=config if config is not None else load_config(),
         )
 
     tmp_last = None
@@ -3566,7 +3581,7 @@ def call_claude(
             "-m", model,
             "-o", tmp_last,
         ]
-        codex_cfg = load_config()
+        codex_cfg = dict(config) if config is not None else load_config()
         cmd.extend(_codex_permission_flags(codex_cfg, disable_tools=disable_tools))
         if effort:
             cmd.extend(agent_routing.provider_reasoning_args("codex", effort))
@@ -3580,7 +3595,9 @@ def call_claude(
         cwd_for_cli = effective_cwd
     elif _provider.is_gemini():
         effective_cwd = cwd or os.getcwd()
-        gemini_cfg = load_config()
+        # Copy: the branch below mutates working_directory / effort, which
+        # must not leak back into the caller's run config.
+        gemini_cfg = dict(config) if config is not None else load_config()
         gemini_cfg["working_directory"] = effective_cwd
         if effort:
             gemini_cfg["effort"] = effort
@@ -3639,7 +3656,7 @@ def call_claude(
         # Single-account or pinned: one attempt, rate-limit bubbles up.
         return _invoke_claude(
             cmd, prompt_for_cli, cwd=cwd_for_cli, timeout=timeout or None,
-            idle_timeout=idle_timeout, idle_poll=idle_poll,
+            idle_timeout=idle_timeout, idle_poll=idle_poll, config=config,
         )
 
     # Multi-account: try up to len(accounts) times, rotating on rate-limit.
@@ -3648,7 +3665,7 @@ def call_claude(
         try:
             return _invoke_claude(
                 cmd, prompt_for_cli, cwd=cwd_for_cli, timeout=timeout or None,
-                idle_timeout=idle_timeout, idle_poll=idle_poll,
+                idle_timeout=idle_timeout, idle_poll=idle_poll, config=config,
             )
         except ClaudeRateLimitError as e:
             last_err = e
@@ -4501,6 +4518,7 @@ def run_loop(
                 cwd=config.get("working_directory") or None,
                 permission_flags=permission_flags,
                 effort=_effort,
+                config=config,
                 idle_timeout=config.get("provider_idle_timeout_seconds"),
                 idle_poll=config.get("provider_idle_poll_seconds"),
             )

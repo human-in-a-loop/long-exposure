@@ -1576,6 +1576,7 @@ def _call_exploration_agent(
                 timeout=agent_config.get("cli_timeout") or None,
                 idle_timeout=agent_config.get("provider_idle_timeout_seconds"),
                 idle_poll=agent_config.get("provider_idle_poll_seconds"),
+                config=agent_config,
             )
     except ClaudeRateLimitError as e:
         # Rate-limit: signal via status field so the main cycle loop can
@@ -2008,6 +2009,7 @@ def _compact_agent_session_impl(
                 timeout=agent_config.get("cli_timeout") or None,
                 idle_timeout=agent_config.get("provider_idle_timeout_seconds"),
                 idle_poll=agent_config.get("provider_idle_poll_seconds"),
+                config=agent_config,
             )
     except ClaudeRateLimitError:
         # Let the caller decide: the main cycle loop triggers rotation;
@@ -3359,6 +3361,14 @@ def run_exploration(
     else:
         state_path = Path(state_path)
     data_dir = state_path.parent
+    # Off-nominal events land next to the state file. Without this only
+    # fan-out clones (which get AGENT_INSTANCE_DIR in their env) logged
+    # anything; root runs dropped every event.
+    try:
+        from long_exposure import health_events as _he_cfg
+        _he_cfg.configure(data_dir)
+    except Exception:
+        pass
 
     # --- Clone bootstrap (fan-out) ---
     # If this process is a fan-out clone, read the per-branch assignment

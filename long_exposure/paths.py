@@ -23,6 +23,24 @@ from typing import Iterable
 # hardcoding workspace-root filenames.
 
 
+def canonical_rel_path(path: str) -> str:
+    """Canonicalise an agent-supplied workspace-relative path.
+
+    Strips surrounding whitespace, any number of leading ``./`` segments,
+    leading slashes, and trailing slashes.
+
+    Use this instead of ``lstrip("./")``: ``str.lstrip`` takes a SET of
+    characters, so ``"./.config/x".lstrip("./")`` yields ``"config/x"`` and
+    ``"../x".lstrip("./")`` yields ``"x"`` — the latter silently defeats a
+    downstream ``".." in Path(p).parts`` containment check. This helper
+    leaves ``..`` segments intact so callers can reject them.
+    """
+    text = (path or "").strip()
+    while text.startswith("./"):
+        text = text[2:]
+    return text.lstrip("/").rstrip("/")
+
+
 def workspace_root(config_or_workspace) -> Path:
     """Return the effective workspace root for a config dict or Path-like."""
     if isinstance(config_or_workspace, dict):

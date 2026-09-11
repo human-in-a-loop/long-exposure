@@ -166,8 +166,10 @@ def _parse_curation_manifest(path: Path) -> dict | None:
         dest = entry.get("dest")
         if not isinstance(src, str) or not isinstance(dest, str):
             continue
-        src_norm = src.strip().lstrip("./").lstrip("/")
-        dest_norm = dest.strip().lstrip("./").lstrip("/")
+        # canonical_rel_path keeps `..` segments visible so the containment
+        # check below can reject them (a bare lstrip("./") would eat the dots).
+        src_norm = paths.canonical_rel_path(src)
+        dest_norm = paths.canonical_rel_path(dest)
         if not src_norm or not dest_norm:
             continue
         if ".." in Path(src_norm).parts or ".." in Path(dest_norm).parts:

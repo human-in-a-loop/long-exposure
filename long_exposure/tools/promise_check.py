@@ -733,8 +733,15 @@ def _check_artifact_coherence(
 
 
 def _canon(path: str) -> str:
-    """Canonicalise a workspace-relative path: drop ./ prefix, trailing slashes."""
-    return path.lstrip("./").rstrip("/")
+    """Canonicalise a workspace-relative path: drop ./ prefix, trailing slashes.
+
+    Delegates to `paths.canonical_rel_path` (a prefix strip, not the
+    character-set strip that `lstrip("./")` performs) so `.config/...` and
+    `../...` survive intact.
+    """
+    from long_exposure import paths as _paths
+
+    return _paths.canonical_rel_path(path)
 
 
 def _is_in_managed_folder(rel: str) -> bool:
