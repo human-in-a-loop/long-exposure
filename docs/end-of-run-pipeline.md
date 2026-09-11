@@ -73,7 +73,7 @@ auditor cannot close because it's scoped to a single cycle's work.
 The final auditor's stage count scales with input size:
 
 ```
-N = max(1, input_tokens // 20_000)         # capped above by wall-cap
+N = min(max(1, input_tokens // 20_000), 5)   # _N_MAX = 5 → 4..12 stages
 total_stages = 1 + N + N + 1
             = explore → verify×N → test×N → document
 ```

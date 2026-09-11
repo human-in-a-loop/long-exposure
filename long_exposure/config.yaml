@@ -175,7 +175,10 @@ allowed_tools:
 
 # === Context Proximity ===
 # Pre-ranks past sessions and injects the most relevant as "gems"
-# into each agent's system prompt at bootstrap.
+# into the system prompt at bootstrap. STANDALONE REPL ONLY
+# (python -m long_exposure.orchestrator): the cycle loop does not inject
+# gems, so these settings have no effect on a long-exposure run. See
+# docs/persistence-and-gems.md.
 context_proximity:
   enabled: true
   max_gems: 7                        # top N sessions to inject

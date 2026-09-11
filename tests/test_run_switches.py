@@ -522,3 +522,13 @@ class TelemetryCostRollupTests(unittest.TestCase):
         self.assertEqual(summary["cost"]["cost_estimated_usd"], 0.5)
         self.assertEqual(summary["cost"]["tool_calls"], 3)
         self.assertEqual(summary["cost"]["num_turns"], 3)
+
+
+class FinalAuditorStageCapTests(unittest.TestCase):
+    def test_stage_count_is_capped_at_n_max(self):
+        from long_exposure.auditing import _final_auditor_stage_count, _N_MAX
+        self.assertEqual(_N_MAX, 5)
+        self.assertEqual(_final_auditor_stage_count(0), (1, 4))
+        self.assertEqual(_final_auditor_stage_count(60_000), (3, 8))
+        self.assertEqual(_final_auditor_stage_count(1_000_000), (5, 12))
+        self.assertEqual(_final_auditor_stage_count(10**9), (5, 12))

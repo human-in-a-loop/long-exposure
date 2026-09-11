@@ -28,6 +28,12 @@ dependencies = [
 #     sudo apt-get install graphviz   # or equivalent (Plan F)
 figures-arch = ["diagrams>=0.23"]
 
+[dependency-groups]
+# `uv sync` installs this group by default, so `uv run pytest -q` runs the
+# full suite (pytest-style function tests included). unittest discovery
+# skips those and errors on files that import pytest.
+dev = ["pytest>=8.0"]
+
 [project.scripts]
 long-exposure = "long_exposure.cli:main"
 long-exposure-manager = "long_exposure.manager:main"

@@ -81,7 +81,10 @@ def _is_stop_requested() -> bool:
 
 
 _TOKEN_THRESHOLD = FINAL_STAGE_TOKEN_THRESHOLD
-_N_MAX = 5  # Stage 3 §4.4: cap removed; constant kept (one-line revertable).
+# Upper bound on N (verify passes = test passes). Total stages = 2N + 2, so
+# the auditor runs between 4 and 12 stages regardless of input volume;
+# the wall-cap remains the time ceiling within that bound.
+_N_MAX = 5
 
 
 def _count_tokens(path: Path) -> int:
@@ -194,11 +197,12 @@ def _estimate_audit_input_tokens(workspace: Path) -> int:
 def _final_auditor_stage_count(input_tokens: int) -> tuple[int, int]:
     """Returns (N, total_stages) where total = explore (1) + N verify + N test + document (1).
 
-    Stage 3 §4.4: the explicit N cap was removed so multi-day runs with
-    ~1M tokens of prior reports can spend the stages they need. Wall-cap
-    (limits.WALL_CAP_SECONDS) remains the real ceiling.
+    N scales with input volume (one pass per ~20k tokens of plan, ledger,
+    reports and closure docs) and is capped at `_N_MAX` so the pass stays
+    within 4..12 stages; the wall-cap (limits.WALL_CAP_SECONDS) bounds the
+    time spent inside that.
     """
-    n = max(1, input_tokens // _TOKEN_THRESHOLD)
+    n = min(max(1, input_tokens // _TOKEN_THRESHOLD), _N_MAX)
     return n, 1 + n + n + 1
 
 

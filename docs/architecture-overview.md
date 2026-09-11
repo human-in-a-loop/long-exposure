@@ -176,15 +176,19 @@ Every `claude -p` call assembles its system prompt from four templates:
 Each layer is a `.md` template in `long_exposure/templates/` with
 `{variable}` placeholders. Variables come from preset dictionaries in
 `orchestrator.py` (PHILOSOPHY_PRESETS, FRAMEWORK_PRESETS) and the
-score's per-agent overrides. Layer 4 is empty on first call and gets
-populated with the depth-aware compaction summary after the first
-compaction.
+score's per-agent overrides.
 
-The agent role block (`<agent-role>...</agent-role>`) and any
-runtime-injected blocks (gems, agent-teams guidance, parallel-cycle
-guidance, ledger-derived anti-patterns, live operator guidance) are
-appended after layer 3 before layer 4. See `configuration-reference.md`
-for the full assembly order.
+What the cycle loop actually sends: layers 1–3, then the agent role
+block (`<agent-role>...</agent-role>`) with any agent-teams / Codex
+subagent guidance. After a compaction, the summary is appended to the
+system prompt as a plain `[RESTORED CONTEXT ...]` block rather than
+through the layer-4 template. Layer 4 (`session-summary-template.md`)
+and the proximity-ranked `<context_gems>` block are used only by the
+standalone REPL (`python -m long_exposure.orchestrator`); see
+`persistence-and-gems.md`. Per-cycle runtime blocks (parallel-cycle
+guidance, sibling pointers, ledger-derived anti-patterns, live operator
+guidance) go into the `live_guidance` *input*, not the system prompt.
+See `configuration-reference.md` for the full assembly order.
 
 ---
 

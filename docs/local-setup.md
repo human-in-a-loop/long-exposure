@@ -172,8 +172,10 @@ load_exploration_score('long_exposure/exploration-score.yaml')
 print('score validates')
 "
 
-# 5. Focused local test suite
-uv run python -m unittest discover -s tests -v
+# 5. Full local test suite (pytest is a dev dependency installed by `uv sync`;
+#    unittest discovery would skip the function-style tests and error on
+#    files that import pytest)
+uv run pytest -q
 
 # Optional Wolfram smoke. `wolfram-batch` is bundled with long-exposure
 # and is compatible with `wolfram -script FILE.wls`.

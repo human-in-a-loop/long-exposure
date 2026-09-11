@@ -155,7 +155,7 @@ compact_xml_retries: 5    # bounded retry on malformed compaction summary XML
 | `compact_db` | Path to `sessions.db` (relative or absolute) |
 | `max_summary_pct` | Soft guidance to model on summary size (15% × 1M = 150k tokens). Not enforced |
 | `depth_compression` | `gentle` (current) or `aggressive`. Influences depth-aware compaction prompt |
-| `compact_xml_retries` | Bounded retry on malformed XML summary; default 5. After exhaustion, store as-is with off-nominal event |
+| `compact_xml_retries` | Bounded retry on malformed XML summary; default 5. After exhaustion, store as-is with off-nominal event. **Standalone REPL only**: the cycle loop's compaction stores a plain-text summary, checks well-formedness once, logs `compaction_xml_invalid`, and never retries (`persistence-and-gems.md`, "Two compaction paths"). `max_summary_pct` and `depth_compression` are likewise REPL-only. |
 
 ### Fan-out merge synthesis
 
@@ -336,6 +336,10 @@ Generic local connector translation:
 | Tools | No executable local tool bridge. Tool permissions are prompt guidance only for the generic local connector. |
 
 ### Context proximity
+
+**Standalone REPL only.** The cycle loop never injects gems, so this
+block and `relevance_profiles` have no effect on a long-exposure run
+(`persistence-and-gems.md`, "Gems").
 
 ```yaml
 context_proximity:

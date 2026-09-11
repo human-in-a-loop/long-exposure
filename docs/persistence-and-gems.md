@@ -94,7 +94,23 @@ window, auto-compact fires. Claude defaults to
 `context_window = 1_000_000` → 900k tokens. Codex defaults to
 `codex_context_window = 400_000` → 360k tokens.
 
-### The compaction cycle
+### Two compaction paths
+
+There are two implementations and they differ. **The cycle loop**
+(`exploration._compact_agent_session_impl`, what every long-exposure run
+uses) resumes the agent's own session with a plain-text `COMPACTION_PROMPT`,
+stores the reply verbatim as `record_type="compaction"` with
+`topic="Context Summary"` and `keywords="compact"`, checks XML
+well-formedness once and only *logs* a `compaction_xml_invalid` health
+event on failure (no retry), and does not extract catalog fields. The
+next call for that agent starts a fresh session with the summary appended
+to the system prompt as a `[RESTORED CONTEXT ...]` block. **The
+standalone REPL** (`python -m long_exposure.orchestrator`) is the richer
+path described in the numbered steps below: depth-aware XML summary,
+bounded retry, and catalog extraction. `compact_xml_retries`,
+`depth_compression`, and `max_summary_pct` apply to the REPL path only.
+
+### The compaction cycle (standalone REPL path)
 
 1. The orchestrator builds a depth-aware summary system prompt
    (`build_summary_system_prompt`) that asks the model to produce a
@@ -171,7 +187,19 @@ declaration prologue.12b.
 
 ## Gems — proximity-ranked relevance
 
-When a fresh session bootstraps, the orchestrator runs `_compute_gems`
+**Scope: standalone REPL only.** `_compute_gems` is called from the
+REPL's bootstrap and compaction paths in `orchestrator.py`; the cycle loop
+in `exploration.py` never calls it and passes no `gems_xml` to
+`assemble_system_prompt`, so researcher/worker/auditor and the end-of-run
+agents receive no `<context_gems>` block. Cross-cycle memory on the
+harness path comes from (a) the compaction summary carried in
+`agent_summaries`, and (b) the MCP session-search tools for agents with
+`mcp: true`. The `context_proximity` and `relevance_profiles` config
+blocks therefore have no effect on a long-exposure run today; the
+branchial-budget and manager entropy signals also score over rows whose
+topic is mostly "Context Summary", so treat them as weak signals.
+
+When a fresh REPL session bootstraps, the orchestrator runs `_compute_gems`
 to find the most relevant past sessions and inject pointers to them in
 the system prompt as a `<context_gems>` block. Default: top 7
 sessions, score floor 0.3.
@@ -242,7 +270,10 @@ else:
 
 Fork-scoped gems is the only sessions.db change required to make
 gems clean across fan-out clones. No schema migration; the `fork_id`
-column was added preemptively when the fan-out feature shipped.
+column was added preemptively when the fan-out feature shipped. Because
+the cycle loop does not inject gems (see the scope note above), the
+fan-out guidance's "clones inherit your gems" applies to the REPL only;
+clones share `sessions.db` and the MCP search tools instead.
 
 ### Shared infrastructure lemmas
 
