@@ -16,15 +16,14 @@ runs once at end-of-exploration and is freestanding.
 from __future__ import annotations
 
 import json as _json
-import os
 import re as _re
 import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from long_exposure import paths
+from long_exposure import stage_io
 from long_exposure.limits import (
-    DELTA_DETECT_MIN_BYTES,
     FINAL_STAGE_TOKEN_THRESHOLD,
     WALL_CAP_SECONDS,
 )
@@ -111,81 +110,27 @@ def _final_report_expected_file(
     return paths.final_report_draft_path(working_dir)
 
 
-def _file_signature(path: Path) -> tuple[int, int] | None:
-    try:
-        st = path.stat()
-        return st.st_size, st.st_mtime_ns
-    except OSError:
-        return None
+# The staged file primitives live in stage_io (shared with auditing.py, which
+# runs the same staged protocol over the audit artifacts). Private aliases
+# keep every call site in this module unchanged.
+_file_signature = stage_io.file_signature
+_atomic_write_text = stage_io.atomic_write_text
+_marker_metadata = stage_io.marker_metadata
+_committed_baseline = stage_io.committed_baseline
+_write_run_mode = stage_io.write_run_mode
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{int(_time.time() * 1000)}")
-    tmp.write_text(text)
-    os.replace(tmp, path)
-
-
-def _marker_metadata(marker_path: Path) -> dict | None:
-    if not marker_path.exists():
-        return None
-    try:
-        data = _json.loads(marker_path.read_text())
-        return data if isinstance(data, dict) else {}
-    except (_json.JSONDecodeError, OSError):
-        return {}
-
-
-def _committed_baseline(path: Path, marker_path: Path) -> tuple[bool, str, float | None]:
-    """Detect a delta baseline, preferring explicit commit markers."""
-    marker = _marker_metadata(marker_path)
-    if marker is not None and path.exists():
-        ts = marker.get("committed_at")
-        try:
-            boundary = datetime.fromisoformat(str(ts)).timestamp() if ts else marker_path.stat().st_mtime
-        except (OSError, ValueError):
-            boundary = None
-        return True, "marker", boundary
-    try:
-        if path.exists() and path.stat().st_size > DELTA_DETECT_MIN_BYTES:
-            return True, "legacy_size", None
-    except OSError:
-        pass
-    return False, "none", None
-
-
-def _write_commit_marker(marker_path: Path, *, run_id: str | None, mode: str, token_count: int) -> None:
-    payload = {
-        "committed_at": datetime.now(timezone.utc).isoformat(),
-        "run_id": run_id,
-        "mode": mode,
-        "input_tokens": int(token_count),
-    }
-    try:
-        _atomic_write_text(marker_path, _json.dumps(payload, indent=2) + "\n")
-    except OSError as e:
-        print(f"[long-exposure]   Commit marker write skipped: {e}", flush=True)
-
-
-def _write_run_mode(path: Path, payload: dict) -> None:
-    try:
-        _atomic_write_text(path, _json.dumps(payload, indent=2) + "\n")
-    except OSError:
-        pass
+def _write_commit_marker(
+    marker_path: Path, *, run_id: str | None, mode: str, token_count: int,
+) -> None:
+    stage_io.write_commit_marker(
+        marker_path, run_id=run_id, mode=mode, token_count=token_count,
+        label="Commit marker",
+    )
 
 
 def _estimate_delta_report_tokens(report_paths: list[str], boundary_ts: float | None) -> int:
-    if boundary_ts is None:
-        return 0
-    chars = 0
-    for raw in report_paths:
-        p = Path(raw)
-        try:
-            if p.stat().st_mtime > boundary_ts:
-                chars += len(p.read_text())
-        except OSError:
-            continue
-    return chars // 4
+    return stage_io.estimate_delta_tokens(report_paths, boundary_ts)
 
 
 def _load_audit_summary(path: Path) -> tuple[str, str]:

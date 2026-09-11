@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Run the final reporter + curator directly, bypassing the exploration loop.
+"""Run the end-of-run pipeline directly, bypassing the exploration loop.
 
 Usage:
     python run_final_reporter.py [--score SCORE] [--config CONFIG] \
-        [--state STATE] [--instance-dir DIR]
+        [--state STATE] [--instance-dir DIR] [--skip-auditor]
 
-Loads the saved exploration state and invokes _run_final_reporter followed
-by _run_curator, exactly as the main loop would after topic_exhausted.
+Loads the saved exploration state and invokes _run_final_auditor,
+_run_final_reporter and _run_curator in that order, exactly as the main
+loop would after topic_exhausted, honouring the score's `loop.end_of_run`
+switches. Pass --skip-auditor to re-render a report against the existing
+audit summary.
 
 Pass --instance-dir to target a named concurrent-session instance; the
 state file, output dir, and MCP config path will resolve under it exactly
@@ -18,7 +21,9 @@ from pathlib import Path
 
 from long_exposure import paths
 from long_exposure import exploration as _exploration
+from long_exposure.auditing import _run_final_auditor
 from long_exposure.exploration import (
+    _end_of_run_enabled,
     _render_final_pdf,
     _resolve_output_dir,
     _resolve_state_path,
@@ -47,6 +52,14 @@ def main():
             "`python -m long_exposure.exploration --instance-dir`). When set, "
             "--state / --output default to <instance-dir>/ subpaths and "
             "the MCP config is written to <instance-dir>/mcp_config.json."
+        ),
+    )
+    parser.add_argument(
+        "--skip-auditor",
+        action="store_true",
+        help=(
+            "Skip the final auditor and reuse the existing "
+            "final_audit_summary.json (report-only re-render)."
         ),
     )
     args = parser.parse_args()
@@ -116,8 +129,44 @@ def main():
     print(f"[run_final] Loaded state: cycle {cycle}")
     print(f"[run_final] Working dir: {config.get('working_directory')}")
 
+    loop_cfg = score.get("loop", {}) or {}
+
+    # --- Final Auditor ---
+    # Runs BEFORE the reporter, matching the main pipeline: the reporter
+    # ingests final_audit_summary.json, so skipping the auditor here shipped
+    # a report narrated from a stale (or absent) audit.
+    final_auditor_def = agents.get("final_auditor")
+    if final_auditor_def and not _end_of_run_enabled(loop_cfg, "final_auditor"):
+        print("[run_final] Final auditor disabled by loop.end_of_run — skipping.")
+    elif final_auditor_def and args.skip_auditor:
+        print("[run_final] --skip-auditor: reusing the existing audit summary.")
+    elif final_auditor_def:
+        agent_sessions.pop("final_auditor", None)
+        agent_summaries.pop("final_auditor", None)
+        try:
+            last_session_id = _run_final_auditor(
+                final_auditor_def, task, config, results, score_inputs,
+                conn, cycle, last_session_id,
+                context_window, compact_at,
+                data_dir=data_dir,
+                agent_sessions=agent_sessions,
+                agent_summaries=agent_summaries,
+            )
+        except Exception as e:
+            # Same isolation as the main pipeline: the reporter still runs
+            # with whatever audit artifacts exist.
+            print(f"[run_final] Final auditor failed (non-fatal): {e!r}")
+        save_state(state_path, cycle, results, consecutive_failures,
+                   last_session_id, agent_sessions, agent_summaries,
+                   task=task)
+    else:
+        print("[run_final] No final_auditor defined in score. Skipping.")
+
     # --- Final Reporter ---
     final_reporter_def = agents.get("final_reporter")
+    if final_reporter_def and not _end_of_run_enabled(loop_cfg, "final_reporter"):
+        print("[run_final] Final reporter disabled by loop.end_of_run — skipping.")
+        final_reporter_def = None
     if final_reporter_def:
         # Clear any stale final_reporter session so it starts fresh
         agent_sessions.pop("final_reporter", None)
@@ -150,6 +199,9 @@ def main():
 
     # --- Curator / Skill Packager ---
     curator_def = agents.get("curator")
+    if curator_def and not _end_of_run_enabled(loop_cfg, "curator"):
+        print("[run_final] Curator disabled by loop.end_of_run — skipping.")
+        curator_def = None
     if curator_def:
         # Clear any stale curator session
         agent_sessions.pop("curator", None)

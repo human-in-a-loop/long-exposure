@@ -2153,6 +2153,7 @@ def assemble_system_prompt(
     role: str | None = None,
     gems_xml: str | None = None,
     interactive_repl: bool = False,
+    mcp_enabled: bool | None = None,
 ) -> str:
     """Build the full system prompt from templates and config.
 
@@ -2160,6 +2161,12 @@ def assemble_system_prompt(
     human is typing at the prompt (the /complete and /clear commands, "ask
     the user" for out-of-scope files). Conductor agent turns are headless
     and leave it False.
+
+    `mcp_enabled` says whether this turn actually receives the session-search
+    MCP server. Pass the same decision the caller uses to add
+    `--mcp-config`; otherwise an agent with `mcp: false` (the curator, say)
+    is told about tools that were never launched and a call fails. None
+    keeps the legacy behaviour of advertising them to any Claude turn.
     """
     prompt_parts = []
 
@@ -2316,7 +2323,11 @@ def assemble_system_prompt(
         prompt_parts.append(gem_instructions)
 
     # --- Layer 6: Tool Definitions ---
-    if _provider.is_claude():
+    # Only when this turn is actually given the MCP server.
+    advertise_mcp = _provider.is_claude() and (
+        True if mcp_enabled is None else mcp_enabled
+    )
+    if advertise_mcp:
         prompt_parts.append(
             "[AVAILABLE TOOLS]\n\n"
             "You have access to session history tools:\n\n"

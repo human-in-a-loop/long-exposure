@@ -568,7 +568,17 @@ def run_agent(
     )
 
     # Assemble system prompt with conditioning + role
-    system_prompt = assemble_system_prompt(agent_config, role=role_block)
+    # mcp_enabled mirrors the generate_mcp_config decision below: advertise
+    # the session-search tools only when this turn is actually given them.
+    system_prompt = assemble_system_prompt(
+        agent_config,
+        role=role_block,
+        mcp_enabled=(
+            bool(agent_def.get("mcp", False))
+            and _provider.is_claude()
+            and bool(agent_config.get("compact_db"))
+        ),
+    )
 
     # Build user prompt
     user_prompt = build_agent_prompt(

@@ -14,7 +14,8 @@ See docs/end-of-run-pipeline.md for the design. Key invariants this module
 preserves:
 
   * Single-N stage heuristic: same metric and same implementation as the
-    reporter (`min(max(1, tokens // 20_000), 5)` → 2N+2 stages).
+    reporter, from the shared `limits.FINAL_STAGE_TOKEN_THRESHOLD`
+    (`min(max(1, tokens // threshold), _N_MAX)` → 2N+2 stages).
   * Wall-clock cap shared with the reporter via `long_exposure.limits`.
   * File-gate rescue mirrors `reporting.py:_rescue_stage_file`.
   * Reconciliation events committed transactionally at the document stage.
@@ -26,7 +27,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re as _re
 import time
 import uuid
@@ -34,8 +34,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from long_exposure import paths
+from long_exposure import stage_io
 from long_exposure.limits import (
-    DELTA_DETECT_MIN_BYTES,
     FINAL_STAGE_TOKEN_THRESHOLD,
     WALL_CAP_SECONDS,
 )
@@ -229,79 +229,28 @@ def _expected_file_for_stage(stage: int, n: int, workspace: Path) -> Path:
     return paths.final_audit_stage_path(workspace, label)
 
 
-def _file_signature(path: Path) -> tuple[int, int] | None:
-    try:
-        st = path.stat()
-        return st.st_size, st.st_mtime_ns
-    except OSError:
-        return None
+# Shared with reporting.py via stage_io; private aliases keep the call sites
+# in this module unchanged.
+_file_signature = stage_io.file_signature
+_atomic_write_text = stage_io.atomic_write_text
+_marker_metadata = stage_io.marker_metadata
+_committed_baseline = stage_io.committed_baseline
+_write_run_mode = stage_io.write_run_mode
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{int(time.time() * 1000)}")
-    tmp.write_text(text)
-    os.replace(tmp, path)
-
-
-def _marker_metadata(marker_path: Path) -> dict | None:
-    if not marker_path.exists():
-        return None
-    try:
-        data = json.loads(marker_path.read_text())
-        return data if isinstance(data, dict) else {}
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def _committed_baseline(path: Path, marker_path: Path) -> tuple[bool, str, float | None]:
-    marker = _marker_metadata(marker_path)
-    if marker is not None and path.exists():
-        ts = marker.get("committed_at")
-        try:
-            boundary = datetime.fromisoformat(str(ts)).timestamp() if ts else marker_path.stat().st_mtime
-        except (OSError, ValueError):
-            boundary = None
-        return True, "marker", boundary
-    try:
-        if path.exists() and path.stat().st_size > DELTA_DETECT_MIN_BYTES:
-            return True, "legacy_size", None
-    except OSError:
-        pass
-    return False, "none", None
-
-
-def _write_commit_marker(marker_path: Path, *, run_id: str | None, mode: str, token_count: int) -> None:
-    payload = {
-        "committed_at": datetime.now(timezone.utc).isoformat(),
-        "run_id": run_id,
-        "mode": mode,
-        "input_tokens": int(token_count),
-    }
-    try:
-        _atomic_write_text(marker_path, json.dumps(payload, indent=2) + "\n")
-    except OSError as e:
-        print(f"[long-exposure]   Audit commit marker write skipped: {e}", flush=True)
-
-
-def _write_run_mode(path: Path, payload: dict) -> None:
-    try:
-        _atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
-    except OSError:
-        pass
+def _write_commit_marker(
+    marker_path: Path, *, run_id: str | None, mode: str, token_count: int,
+) -> None:
+    stage_io.write_commit_marker(
+        marker_path, run_id=run_id, mode=mode, token_count=token_count,
+        label="Audit commit marker",
+    )
 
 
 def _estimate_delta_report_tokens(workspace: Path, boundary_ts: float | None) -> int:
-    if boundary_ts is None:
-        return 0
-    chars = 0
-    for p in paths.iter_cycle_report_paths(workspace):
-        try:
-            if p.stat().st_mtime > boundary_ts:
-                chars += len(p.read_text())
-        except OSError:
-            continue
-    return chars // 4
+    return stage_io.estimate_delta_tokens(
+        paths.iter_cycle_report_paths(workspace), boundary_ts,
+    )
 
 
 # ---------------------------------------------------------------------------

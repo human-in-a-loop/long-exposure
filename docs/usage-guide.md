@@ -444,22 +444,28 @@ python3 -m long_exposure.conductor long_exposure/exploration-score.yaml \
     --instance-dir ~/agent-instances/score-run
 ```
 
-### Re-run just the final reporter + curator
+### Re-run the end-of-run pipeline
 
 If an exploration stopped before completing its end-of-run packaging
 (e.g., crashed during the final report, or you want to regenerate the
 PDF and skill bundle against updated sources), run the standalone
-final-reporter entry:
+entry:
 
 ```bash
 python3 run_final_reporter.py --state long_exposure/data/exploration_state.json
 ```
 
-Optional flags: `--score`, `--config`, `--instance-dir`. The script
-loads saved state, runs `_run_final_reporter` followed by `_run_curator`
-exactly as the main loop would, and re-saves state with the outputs.
-The final_reporter and curator sessions are cleared on entry so they
-start fresh rather than resuming a stale session.
+Optional flags: `--score`, `--config`, `--instance-dir`, and
+`--skip-auditor`. The script loads saved state and runs the final
+auditor, then the final reporter, then the curator — the same order and
+the same `loop.end_of_run` switches as the main loop — re-saving state
+after each. Each stage's session is cleared on entry so it starts fresh
+rather than resuming a stale one, and the run's usage ledger is loaded
+first so the totals in `long-exposure usage` extend rather than reset.
+
+Pass `--skip-auditor` to re-render a report against the existing
+`final_audit_summary.json` (faster, but the narrative then describes the
+previous audit).
 
 ---
 

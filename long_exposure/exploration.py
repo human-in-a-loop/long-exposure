@@ -81,6 +81,7 @@ from long_exposure.orchestrator import (
 )
 from long_exposure import pool
 from long_exposure import paths
+from long_exposure import stage_io as _stage_io
 from long_exposure import provider as _provider
 from long_exposure import telemetry
 from long_exposure import unified_pool
@@ -1472,7 +1473,18 @@ def _call_exploration_agent(
             inputs=agent_def.get("inputs", []),
             outputs=agent_def.get("outputs", []),
         )
-        system_prompt = assemble_system_prompt(agent_config, role=role_block)
+        # Same decision as the --mcp-config branch below, computed here so
+        # the prompt only advertises session-search tools when the turn
+        # actually gets them.
+        mcp_active = (
+            bool(agent_def.get("mcp", False))
+            and _provider.is_claude()
+            and not interactive
+            and bool(agent_config.get("compact_db"))
+        )
+        system_prompt = assemble_system_prompt(
+            agent_config, role=role_block, mcp_enabled=mcp_active,
+        )
 
         # If resuming after compaction, append the summary
         summary = agent_summaries.pop(agent_name, None)
@@ -2336,12 +2348,12 @@ FALLBACK_AUDIT = (
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Write text to path atomically via sibling .tmp + os.replace."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    """Write text to path atomically (shared implementation in stage_io).
+
+    Kept as a module-level name because fanout.py delegates to
+    `exploration._atomic_write_text` by attribute.
+    """
+    _stage_io.atomic_write_text(path, text)
 
 
 def _render_report_pdf(md_path: Path, pdf_path: Path, cwd: str) -> None:

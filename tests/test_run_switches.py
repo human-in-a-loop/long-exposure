@@ -619,3 +619,147 @@ class HealthEventsRoutingTests(unittest.TestCase):
                     _run(score, config, inst)
                 health_events.append_event("post_run_probe")
             self.assertTrue((inst / "health_events.jsonl").exists())
+
+
+class McpAdvertisingTests(unittest.TestCase):
+    """Only advertise the session-search tools to turns that get them.
+
+    The [AVAILABLE TOOLS] layer is Claude-only, so these tests pin the
+    process-global provider (other tests leave it on `local`).
+    """
+
+    def setUp(self):
+        from long_exposure import provider as _prov
+        self._prev_provider = _prov.current_provider()
+        _prov.configure_provider({"llm_provider": "claude"})
+
+    def tearDown(self):
+        from long_exposure import provider as _prov
+        _prov.configure_provider({"llm_provider": self._prev_provider})
+
+    def _prompt(self, **kw):
+        from long_exposure.orchestrator import assemble_system_prompt, load_config
+        cfg = load_config()
+        cfg["working_directory"] = "/ws"
+        cfg["compact_db"] = "/tmp/sessions.db"
+        return assemble_system_prompt(cfg, role="r", **kw)
+
+    def test_gate(self):
+        on = self._prompt(mcp_enabled=True)
+        self.assertIn("[AVAILABLE TOOLS]", on)
+        self.assertIn("search_sessions(", on)
+        off = self._prompt(mcp_enabled=False)
+        self.assertNotIn("[AVAILABLE TOOLS]", off)
+        self.assertNotIn("search_sessions(", off)
+        # None preserves the legacy behaviour for untouched callers.
+        self.assertIn("[AVAILABLE TOOLS]", self._prompt())
+
+    def test_cycle_agent_prompt_gates_on_the_mcp_flag(self):
+        """Drives the real _call_exploration_agent with the CLI patched, so
+        this covers the harness's own mcp_active computation."""
+        from long_exposure.exploration import _call_exploration_agent
+
+        captured = {}
+
+        def fake_invoke(cmd, stdin_text, **kwargs):
+            # Fresh sessions pass the system prompt as a --system-prompt arg.
+            sp = cmd[cmd.index("--system-prompt") + 1] if "--system-prompt" in cmd else ""
+            captured[kwargs.get("_name", "last")] = {"prompt": sp, "cmd": list(cmd)}
+            return {"result": "[OUTPUT: out]\nbody\n[END OUTPUT: out]",
+                    "usage": {"output_tokens": 5}, "duration_ms": 1, "session_id": None}
+
+        with tempfile.TemporaryDirectory() as td:
+            inst = Path(td)
+            base = {
+                "llm_provider": "claude", "model": "opus",
+                "context_window": 200000, "compact_threshold": 0.9,
+                "compact_db": str(inst / "sessions.db"),
+                "instance_dir": str(inst),
+                "working_directory": str(inst),
+                "philosophy": "efficient", "framework": "staged",
+                "checkpoint_format": "standard", "require_checkpoint_first": False,
+                "user_gate_approval": False, "anti_patterns_enabled": True,
+                "allowed_tools": ["Read"], "wolfram_path": "",
+                "model_tier": "opus", "max_summary_pct": 0.15,
+                "depth_compression": "gentle",
+            }
+            results = {}
+            for name, mcp in (("with_mcp", True), ("without_mcp", False)):
+                agent_def = {
+                    "role": "r", "inputs": [], "outputs": ["out"], "mcp": mcp,
+                }
+                with patch("long_exposure.exploration._invoke_claude",
+                           lambda cmd, stdin_text, **kw: fake_invoke(
+                               cmd, stdin_text, _name=name, **kw)):
+                    _call_exploration_agent(
+                        agent_name=name, agent_def=agent_def, task="t",
+                        config=dict(base), results={}, score_inputs={},
+                        agent_sessions={}, agent_summaries={},
+                    )
+                results[name] = captured[name]
+
+        self.assertIn("[AVAILABLE TOOLS]", results["with_mcp"]["prompt"])
+        self.assertIn("--mcp-config", results["with_mcp"]["cmd"])
+        self.assertNotIn("[AVAILABLE TOOLS]", results["without_mcp"]["prompt"])
+        self.assertNotIn("--mcp-config", results["without_mcp"]["cmd"])
+
+
+class StageIoSharedHelperTests(unittest.TestCase):
+    """reporting.py and auditing.py must use one implementation."""
+
+    def test_aliases_point_at_the_shared_module(self):
+        from long_exposure import auditing, reporting, stage_io
+        for name, shared in (
+            ("_file_signature", stage_io.file_signature),
+            ("_atomic_write_text", stage_io.atomic_write_text),
+            ("_marker_metadata", stage_io.marker_metadata),
+            ("_committed_baseline", stage_io.committed_baseline),
+            ("_write_run_mode", stage_io.write_run_mode),
+        ):
+            self.assertIs(getattr(reporting, name), shared, name)
+            self.assertIs(getattr(auditing, name), shared, name)
+
+    def test_atomic_write_is_unique_per_process_and_cleans_up(self):
+        from long_exposure import stage_io
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "reports" / "final" / "final_report.md"
+            stage_io.atomic_write_text(target, "body")
+            self.assertEqual(target.read_text(), "body")
+            stage_io.atomic_write_text(target, "replaced")
+            self.assertEqual(target.read_text(), "replaced")
+            # No temp residue, and the temp name would have ended in .tmp
+            # so the curator's suffix exclude catches a crashed write.
+            self.assertEqual(list(Path(td).rglob("*.tmp")), [])
+
+    def test_commit_marker_and_baseline_round_trip(self):
+        from long_exposure import stage_io
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            report, marker = root / "r.md", root / "r.committed"
+            self.assertEqual(stage_io.committed_baseline(report, marker), (False, "none", None))
+            report.write_text("x" * 2000)
+            delta, source, _ = stage_io.committed_baseline(report, marker)
+            self.assertEqual((delta, source), (True, "legacy_size"))
+            stage_io.write_commit_marker(marker, run_id="r1", mode="fresh", token_count=42)
+            delta, source, boundary = stage_io.committed_baseline(report, marker)
+            self.assertEqual((delta, source), (True, "marker"))
+            self.assertIsNotNone(boundary)
+            self.assertEqual(stage_io.marker_metadata(marker)["input_tokens"], 42)
+            # Unparsable marker still counts as a baseline ({} not None).
+            marker.write_text("not json")
+            self.assertEqual(stage_io.marker_metadata(marker), {})
+            self.assertEqual(stage_io.committed_baseline(report, marker)[1], "marker")
+
+    def test_delta_token_estimate_counts_only_newer_files(self):
+        import os as _os
+        from long_exposure import stage_io
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            old, new = root / "old.md", root / "new.md"
+            old.write_text("a" * 400)
+            new.write_text("b" * 800)
+            _os.utime(old, (1_000_000, 1_000_000))
+            _os.utime(new, (2_000_000, 2_000_000))
+            self.assertEqual(stage_io.estimate_delta_tokens([old, new], 1_500_000), 200)
+            self.assertEqual(stage_io.estimate_delta_tokens([old, new], None), 0)
+            self.assertEqual(stage_io.estimate_delta_tokens([root / "gone.md"], 1), 0)
