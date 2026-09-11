@@ -17,6 +17,7 @@ import argparse
 from pathlib import Path
 
 from long_exposure import paths
+from long_exposure import exploration as _exploration
 from long_exposure.exploration import (
     _render_final_pdf,
     _resolve_output_dir,
@@ -77,6 +78,10 @@ def main():
     agent_sessions = state.get("agent_sessions", {})
     agent_summaries = state.get("agent_summaries", {})
     consecutive_failures = state.get("failures", {})
+    # This is a fresh process: seed the in-memory usage ledger from the saved
+    # run so the save_state calls below extend the run's totals instead of
+    # overwriting them with only this pass's reporter/curator spend.
+    _exploration._usage.load(state.get("usage_totals") or {})
 
     agents = score["agents"]
     # Prefer the directive saved in state (which reflects any resume-with-

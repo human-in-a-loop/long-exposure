@@ -612,7 +612,16 @@ def save_state(path: Path, cycle: int, results: dict, failures: dict,
                agent_context_tokens: dict | None = None,
                peak_cycle_output: int = 0,
                low_output_streak: int = 0,
-               usage_basis: str | None = None) -> None:
+               usage_basis: str | None = None,
+               usage_totals: dict | None = None) -> None:
+    """Persist run state atomically.
+
+    `usage_totals` defaults to the in-process ledger (`_usage`), which is
+    right for the running conductor. Callers that write a state file for a
+    DIFFERENT process (the fan-out conductor seeding a clone) must pass an
+    explicit dict so the parent's spend is not copied into the child and
+    double-counted at merge.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     # Tag agent_sessions with the provider/account that created them so resume
     # after a provider switch or cross-account rotation can start fresh instead
@@ -651,7 +660,9 @@ def save_state(path: Path, cycle: int, results: dict, failures: dict,
         "usage_basis": usage_basis or _provider.current_provider(),
         # Per-agent usage ledger (tokens, cost, tool calls). Restored on
         # resume; merged into the root by the fan-out conductor.
-        "usage_totals": _usage.to_dict(),
+        "usage_totals": (
+            usage_totals if usage_totals is not None else _usage.to_dict()
+        ),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     # Atomic write: temp file + rename prevents corruption on crash

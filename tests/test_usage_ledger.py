@@ -41,13 +41,64 @@ def test_record_provider_reported_cost_wins():
 def test_record_estimates_from_pricing_when_unreported():
     pricing = {"codex": {"gpt-5.5": {"input": 1.0, "output": 10.0, "cache_read": 0.1, "cache_write": 2.0}}}
     ledger = UsageLedger()
+    # OpenAI-style usage: input_tokens INCLUDES the cached share.
+    usage = {"input_tokens": 6000, "output_tokens": 200, "cached_input_tokens": 5000,
+             "cache_creation_input_tokens": 100}
     added = ledger.record(
-        "worker", _result(), provider="codex", model="gpt-5.5", config={"pricing": pricing},
+        "worker", _result(usage=usage), provider="codex", model="gpt-5.5", config={"pricing": pricing},
     )
-    # 1000*1 + 200*10 + 5000*0.1 + 100*2 = 1000 + 2000 + 500 + 200 = 3700 per-M units
+    # uncached 1000*1 + 200*10 + cached 5000*0.1 + 100*2 = 3700 per-M units
     assert added["cost_source"] == "estimated"
     assert abs(added["cost_estimated_usd"] - 0.0037) < 1e-9
     assert ledger.total_cost_usd() == 0.0037
+    # Raw token columns keep the provider's own numbers.
+    assert ledger.rows()["worker"]["input_tokens"] == 6000
+    assert ledger.rows()["worker"]["cache_read_input_tokens"] == 5000
+
+
+def test_claude_input_is_not_reduced_by_cache_reads_and_defaults_apply():
+    # Claude reports uncached input separately; a row without cache rates
+    # uses 10% / 125% of the input rate.
+    pricing = {"claude": {"opus": {"input": 10.0, "output": 0.0}}}
+    usage = {"input_tokens": 1_000_000, "cache_read_input_tokens": 1_000_000,
+             "cache_creation_input_tokens": 1_000_000, "output_tokens": 0}
+    assert estimate_cost_usd(usage, provider="claude", model="opus", config={"pricing": pricing}) == 10.0 + 1.0 + 12.5
+
+
+def test_gemini_cached_share_is_subtracted_from_prompt_total():
+    pricing = {"gemini": {"_default": {"input": 1.0, "output": 0.0, "cache_read": 0.0}}}
+    usage = {"input_tokens": 1_000_000, "cache_read_input_tokens": 1_000_000, "output_tokens": 0}
+    assert estimate_cost_usd(usage, provider="gemini", model="g", config={"pricing": pricing}) == 0.0
+
+
+def test_unknown_tool_counts_render_as_na():
+    ledger = UsageLedger()
+    ledger.record("x", _result(tool_calls=None), provider="local", model="m", config={})
+    assert ledger.rows()["x"]["tool_calls_unknown"] == 1
+    md = ledger.render_markdown()
+    assert "| x | 1 | n/a |" in md
+    assert "did not report a tool count" in md
+    ledger.record("x", _result(tool_calls=7), provider="local", model="m", config={})
+    assert "| x | 2 | 7 |" in ledger.render_markdown()
+
+
+def test_ledger_is_thread_safe_under_concurrent_records():
+    import threading
+    ledger = UsageLedger()
+
+    def work():
+        for _ in range(500):
+            ledger.record("w", _result(cost_usd=0.001, tool_calls=1), provider="claude", model="m", config={})
+
+    threads = [threading.Thread(target=work) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    row = ledger.rows()["w"]
+    assert row["calls"] == 4000
+    assert row["tool_calls"] == 4000
+    assert abs(row["cost_usd"] - 4.0) < 1e-6
 
 
 def test_pricing_prefix_and_default_lookup():

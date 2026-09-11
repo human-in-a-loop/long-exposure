@@ -277,3 +277,99 @@ class RunSwitchIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProviderToolCountTests(unittest.TestCase):
+    """Tool-call counts per provider envelope and the clone seed guard."""
+
+    def test_codex_envelope_counts_completed_tool_items(self):
+        from long_exposure.orchestrator import _extract_codex_envelope
+        stdout = "\n".join([
+            '{"type":"thread.started","thread_id":"t1"}',
+            '{"type":"item.started","item":{"type":"command_execution","id":"c1"}}',
+            '{"type":"item.completed","item":{"type":"command_execution","id":"c1"}}',
+            '{"type":"item.completed","item":{"type":"reasoning","id":"r1"}}',
+            '{"type":"item.completed","item":{"type":"agent_message","id":"m1"}}',
+            '{"msg":{"type":"item.completed","item":{"type":"mcp_tool_call","id":"x1"}}}',
+            '{"type":"item.completed","item":{"type":"file_change","id":"f1"}}',
+            '{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens":5}}',
+        ])
+        env = _extract_codex_envelope(stdout, "done", 9)
+        self.assertEqual(env["tool_calls"], 3)
+
+    def test_gemini_envelope_reads_tool_stats(self):
+        from long_exposure.orchestrator import _extract_gemini_envelope
+        stdout = json.dumps({
+            "response": "ok",
+            "stats": {"models": {"m": {"tokens": {"input": 1, "candidates": 2}}},
+                      "tools": {"totalCalls": 6, "totalSuccess": 5}},
+        })
+        self.assertEqual(_extract_gemini_envelope(stdout, 1)["tool_calls"], 6)
+        no_tools = json.dumps({"response": "ok", "stats": {"models": {}}})
+        self.assertIsNone(_extract_gemini_envelope(no_tools, 1)["tool_calls"])
+
+    def test_claude_transcript_counts_current_turn_tool_uses_only(self):
+        from long_exposure.conductor import _session_turn_tool_calls
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            proj = root / "projects" / "p"
+            proj.mkdir(parents=True)
+            sid = "abc-123"
+            lines = [
+                {"type": "user", "message": {"content": "turn 1"}},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "a"}, {"type": "text", "text": "x"}]}},
+                # tool_result echo must not reset the turn
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "a"}]}},
+                {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "b"}]}},
+                {"type": "user", "message": {"content": "turn 2"}},
+                {"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "c"}, {"type": "tool_use", "id": "d"}]}},
+                # sidechain (subagent) activity is not the agent's own
+                {"type": "assistant", "isSidechain": True,
+                 "message": {"content": [{"type": "tool_use", "id": "e"}]}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c"}]}},
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "final"}]}},
+            ]
+            (proj / f"{sid}.jsonl").write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+            with patch("long_exposure.exploration._claude_config_dir", lambda: root):
+                self.assertEqual(_session_turn_tool_calls(sid), 2)
+                self.assertIsNone(_session_turn_tool_calls("missing"))
+                self.assertIsNone(_session_turn_tool_calls(None))
+
+    def test_clone_seed_state_starts_with_empty_usage(self):
+        from long_exposure.fanout import _seed_clone_state
+        # Put spend in the root process ledger, then seed a clone.
+        exploration._usage.load({})
+        exploration._usage.record(
+            "worker", {"status": "ok", "usage": {"output_tokens": 5}, "cost_usd": 9.0},
+            provider="claude", model="opus", config={},
+        )
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                clone_dir = Path(td) / "clone-0"
+                clone_dir.mkdir()
+                _seed_clone_state(clone_dir, {"directive": "x"}, {}, {}, parent_run_id="r")
+                seeded = json.loads((clone_dir / "exploration_state.json").read_text())
+            self.assertEqual(seeded["usage_totals"], {})
+            # The root ledger itself is untouched by seeding.
+            self.assertEqual(exploration._usage.rows()["worker"]["cost_usd"], 9.0)
+        finally:
+            exploration._usage.load({})
+
+    def test_save_state_default_uses_process_ledger(self):
+        from long_exposure.exploration import save_state
+        exploration._usage.load({})
+        exploration._usage.record(
+            "auditor", {"status": "ok", "usage": {"output_tokens": 1}, "cost_usd": 2.5},
+            provider="claude", model="opus", config={},
+        )
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                p = Path(td) / "state.json"
+                save_state(p, 3, {}, {})
+                self.assertEqual(json.loads(p.read_text())["usage_totals"]["auditor"]["cost_usd"], 2.5)
+                save_state(p, 3, {}, {}, usage_totals={"x": {"calls": 1}})
+                self.assertEqual(json.loads(p.read_text())["usage_totals"], {"x": {"calls": 1}})
+        finally:
+            exploration._usage.load({})

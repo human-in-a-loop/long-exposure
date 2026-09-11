@@ -967,6 +967,11 @@ def _seed_clone_state(
         agent_summaries=dict(parent_agent_summaries or {}),
         post_merge_pending=False,
         run_id=parent_run_id,
+        # The clone starts with an EMPTY usage ledger. save_state would
+        # otherwise persist this (root) process's ledger into the clone's
+        # seed state, and the merge at barrier collapse would then add the
+        # root's own spend back onto itself.
+        usage_totals={},
     )
 
 

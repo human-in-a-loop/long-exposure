@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,10 @@ COUNTER_FIELDS: tuple[str, ...] = (
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
     "tool_calls",
+    # Calls whose provider path could not report a tool count (interactive
+    # transport, local connector, unreadable transcript). Lets the renderer
+    # say "n/a" instead of a misleading 0.
+    "tool_calls_unknown",
     "turns",
     "duration_ms",
 )
@@ -128,11 +133,22 @@ def estimate_cost_usd(
     out = _int(usage.get("output_tokens"))
     cache_read = _int(usage.get("cache_read_input_tokens") or usage.get("cached_input_tokens"))
     cache_write = _int(usage.get("cache_creation_input_tokens"))
+    # Claude reports uncached input separately from cache reads. OpenAI and
+    # Gemini report a prompt/input total that INCLUDES cached tokens, so the
+    # cached share must come out of the full-price bucket or it is charged
+    # twice.
+    if provider != "claude":
+        inp = max(0, inp - cache_read)
+    in_rate = _float(row.get("input"))
+    # Conventional defaults when a row omits cache rates: reads at 10% of
+    # input, writes at 125% of input.
+    read_rate = _float(row["cache_read"]) if "cache_read" in row else in_rate * 0.1
+    write_rate = _float(row["cache_write"]) if "cache_write" in row else in_rate * 1.25
     cost = (
-        inp * _float(row.get("input")) / per_m
+        inp * in_rate / per_m
         + out * _float(row.get("output")) / per_m
-        + cache_read * _float(row.get("cache_read", row.get("input"))) / per_m
-        + cache_write * _float(row.get("cache_write", row.get("input"))) / per_m
+        + cache_read * read_rate / per_m
+        + cache_write * write_rate / per_m
     )
     return round(cost, 6)
 
@@ -147,6 +163,10 @@ class UsageLedger:
     roll-up of merged fan-out clone ledgers."""
 
     def __init__(self, data: dict | None = None):
+        # The harness records from the main loop and, in `launch --manager`
+        # threaded mode, from the manager poller thread; a lock keeps the
+        # read-modify-write increments consistent.
+        self._lock = threading.RLock()
         self._rows: dict[str, dict[str, Any]] = {}
         self._clones: dict[str, Any] = {"forks": 0, "clones": 0}
         if data:
@@ -155,31 +175,37 @@ class UsageLedger:
     # -- persistence ------------------------------------------------------
 
     def load(self, data: dict) -> None:
-        self._rows = {}
-        for name, raw in (data or {}).items():
-            if name == _CLONES_KEY:
-                if isinstance(raw, dict):
-                    self._clones = {
-                        "forks": _int(raw.get("forks")),
-                        "clones": _int(raw.get("clones")),
-                    }
-                continue
-            if not isinstance(raw, dict):
-                continue
-            row = _empty_row()
-            for k in COUNTER_FIELDS:
-                row[k] = _int(raw.get(k))
-            for k in FLOAT_FIELDS:
-                row[k] = _float(raw.get(k))
-            sources = raw.get("cost_sources")
-            if isinstance(sources, list):
-                row["cost_sources"] = sorted({str(s) for s in sources})
-            self._rows[str(name)] = row
+        with self._lock:
+            self._rows = {}
+            self._clones = {"forks": 0, "clones": 0}
+            for name, raw in (data or {}).items():
+                if name == _CLONES_KEY:
+                    if isinstance(raw, dict):
+                        self._clones = {
+                            "forks": _int(raw.get("forks")),
+                            "clones": _int(raw.get("clones")),
+                        }
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                row = _empty_row()
+                for k in COUNTER_FIELDS:
+                    row[k] = _int(raw.get(k))
+                for k in FLOAT_FIELDS:
+                    row[k] = _float(raw.get(k))
+                sources = raw.get("cost_sources")
+                if isinstance(sources, list):
+                    row["cost_sources"] = sorted({str(s) for s in sources})
+                self._rows[str(name)] = row
 
     def to_dict(self) -> dict[str, Any]:
-        out: dict[str, Any] = {name: dict(row) for name, row in self._rows.items()}
-        out[_CLONES_KEY] = dict(self._clones)
-        return out
+        with self._lock:
+            out: dict[str, Any] = {
+                name: {**row, "cost_sources": list(row["cost_sources"])}
+                for name, row in self._rows.items()
+            }
+            out[_CLONES_KEY] = dict(self._clones)
+            return out
 
     # -- recording --------------------------------------------------------
 
@@ -198,7 +224,8 @@ class UsageLedger:
         added, for telemetry."""
         result = result or {}
         usage = result.get("usage") or {}
-        row = self._rows.setdefault(agent_name, _empty_row())
+        if not isinstance(usage, dict):
+            usage = {}
         reported = result.get("cost_usd")
         estimated = None
         source = "unavailable"
@@ -210,6 +237,7 @@ class UsageLedger:
             )
             if estimated is not None:
                 source = "estimated"
+        tool_calls = result.get("tool_calls")
         added = {
             "calls": 1,
             "ok_calls": 1 if result.get("status") == "ok" else 0,
@@ -219,66 +247,76 @@ class UsageLedger:
                 usage.get("cache_read_input_tokens") or usage.get("cached_input_tokens")
             ),
             "cache_creation_input_tokens": _int(usage.get("cache_creation_input_tokens")),
-            "tool_calls": _int(result.get("tool_calls")),
+            "tool_calls": _int(tool_calls),
+            "tool_calls_unknown": 1 if tool_calls is None else 0,
             "turns": _int(result.get("num_turns")),
             "duration_ms": _int(result.get("duration_ms")),
             "cost_usd": _float(reported),
             "cost_estimated_usd": _float(estimated),
             "cost_source": source,
         }
-        for k in COUNTER_FIELDS:
-            row[k] += added[k]
-        for k in FLOAT_FIELDS:
-            row[k] = round(row[k] + added[k], 6)
-        if source != "unavailable" and source not in row["cost_sources"]:
-            row["cost_sources"] = sorted({*row["cost_sources"], source})
+        with self._lock:
+            row = self._rows.setdefault(agent_name, _empty_row())
+            for k in COUNTER_FIELDS:
+                row[k] += added[k]
+            for k in FLOAT_FIELDS:
+                row[k] = round(row[k] + added[k], 6)
+            if source != "unavailable" and source not in row["cost_sources"]:
+                row["cost_sources"] = sorted({*row["cost_sources"], source})
         return added
 
     def merge(self, other: dict | None, *, is_clone: bool = True) -> None:
         """Fold another ledger's totals into this one (fan-out clones)."""
-        if not other:
+        if not other or not isinstance(other, dict):
             return
-        if is_clone:
-            self._clones["clones"] += 1
-        for name, raw in other.items():
-            if name == _CLONES_KEY:
-                if isinstance(raw, dict):
-                    # Nested clones do not exist (depth=1) but keep the sum honest.
-                    self._clones["clones"] += _int(raw.get("clones"))
-                continue
-            if not isinstance(raw, dict):
-                continue
-            row = self._rows.setdefault(str(name), _empty_row())
-            for k in COUNTER_FIELDS:
-                row[k] += _int(raw.get(k))
-            for k in FLOAT_FIELDS:
-                row[k] = round(row[k] + _float(raw.get(k)), 6)
-            sources = raw.get("cost_sources")
-            if isinstance(sources, list):
-                row["cost_sources"] = sorted({*row["cost_sources"], *map(str, sources)})
+        with self._lock:
+            if is_clone:
+                self._clones["clones"] += 1
+            for name, raw in other.items():
+                if name == _CLONES_KEY:
+                    if isinstance(raw, dict):
+                        # Nested clones do not exist (depth=1) but keep the sum honest.
+                        self._clones["clones"] += _int(raw.get("clones"))
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                row = self._rows.setdefault(str(name), _empty_row())
+                for k in COUNTER_FIELDS:
+                    row[k] += _int(raw.get(k))
+                for k in FLOAT_FIELDS:
+                    row[k] = round(row[k] + _float(raw.get(k)), 6)
+                sources = raw.get("cost_sources")
+                if isinstance(sources, list):
+                    row["cost_sources"] = sorted({*row["cost_sources"], *map(str, sources)})
 
     def note_fork(self) -> None:
-        self._clones["forks"] += 1
+        with self._lock:
+            self._clones["forks"] += 1
 
     # -- queries ----------------------------------------------------------
 
     def rows(self) -> dict[str, dict[str, Any]]:
-        return {name: dict(row) for name, row in sorted(self._rows.items())}
+        with self._lock:
+            return {
+                name: {**row, "cost_sources": list(row["cost_sources"])}
+                for name, row in sorted(self._rows.items())
+            }
 
     def totals(self) -> dict[str, Any]:
-        total = _empty_row()
-        sources: set[str] = set()
-        for row in self._rows.values():
-            for k in COUNTER_FIELDS:
-                total[k] += row[k]
-            for k in FLOAT_FIELDS:
-                total[k] = round(total[k] + row[k], 6)
-            sources.update(row.get("cost_sources") or [])
-        total["cost_sources"] = sorted(sources)
-        total["cost_known_usd"] = round(total["cost_usd"] + total["cost_estimated_usd"], 6)
-        total["forks"] = self._clones["forks"]
-        total["clones"] = self._clones["clones"]
-        return total
+        with self._lock:
+            total = _empty_row()
+            sources: set[str] = set()
+            for row in self._rows.values():
+                for k in COUNTER_FIELDS:
+                    total[k] += row[k]
+                for k in FLOAT_FIELDS:
+                    total[k] = round(total[k] + row[k], 6)
+                sources.update(row.get("cost_sources") or [])
+            total["cost_sources"] = sorted(sources)
+            total["cost_known_usd"] = round(total["cost_usd"] + total["cost_estimated_usd"], 6)
+            total["forks"] = self._clones["forks"]
+            total["clones"] = self._clones["clones"]
+            return total
 
     def total_cost_usd(self) -> float:
         """Reported + estimated dollars across every agent."""
@@ -336,29 +374,34 @@ class UsageLedger:
         ]
         for name, row in rows.items():
             lines.append(
-                f"| {name} | {row['calls']} | {row['tool_calls']:,} | {row['turns']:,} "
+                f"| {name} | {row['calls']} | {_tool_cell(row)} | {row['turns']:,} "
                 f"| {row['input_tokens']:,} | {row['output_tokens']:,} "
                 f"| {row['cache_read_input_tokens']:,} | {row['cache_creation_input_tokens']:,} "
                 f"| {row['duration_ms'] / 1000:,.0f} | {_cost_cell(row)} |"
             )
         lines.append(
-            f"| **Total** | {totals['calls']} | {totals['tool_calls']:,} | {totals['turns']:,} "
+            f"| **Total** | {totals['calls']} | {_tool_cell(totals)} | {totals['turns']:,} "
             f"| {totals['input_tokens']:,} | {totals['output_tokens']:,} "
             f"| {totals['cache_read_input_tokens']:,} | {totals['cache_creation_input_tokens']:,} "
             f"| {totals['duration_ms'] / 1000:,.0f} | {_cost_cell(totals)} |"
         )
         lines.append("")
-        source_note = {
-            (): "Cost: no provider reported a cost and no `pricing:` table is configured.",
-        }.get(tuple(totals["cost_sources"]))
-        if source_note is None:
+        if not totals["cost_sources"]:
+            source_note = "Cost: no provider reported a cost and no `pricing:` table is configured."
+        else:
             parts = []
-            if totals["cost_usd"]:
+            if "provider" in totals["cost_sources"]:
                 parts.append(f"provider-reported ${totals['cost_usd']:,.2f}")
-            if totals["cost_estimated_usd"]:
+            if "estimated" in totals["cost_sources"]:
                 parts.append(f"estimated from `pricing:` ${totals['cost_estimated_usd']:,.2f}")
             source_note = "Cost: " + ", ".join(parts) + "."
         lines.append(source_note)
+        if totals["tool_calls_unknown"]:
+            lines.append(
+                f"Tool calls: {totals['tool_calls_unknown']} of {totals['calls']} call(s) "
+                "did not report a tool count (interactive transport, local connector, "
+                "or unreadable transcript)."
+            )
         if totals["clones"]:
             lines.append(
                 f"Includes {totals['clones']} fan-out clone run(s) across "
@@ -385,6 +428,15 @@ class UsageLedger:
             os.replace(tmp, target)
         except OSError:
             return
+
+
+def _tool_cell(row: dict[str, Any]) -> str:
+    """Tool-call cell: 'n/a' when no call in the row reported a count."""
+    calls = _int(row.get("calls"))
+    unknown = _int(row.get("tool_calls_unknown"))
+    if calls and unknown >= calls:
+        return "n/a"
+    return f"{_int(row.get('tool_calls')):,}"
 
 
 def _cost_cell(row: dict[str, Any]) -> str:
