@@ -2452,7 +2452,17 @@ def build_summary_system_prompt(
 
 
 class ClaudeCliError(Exception):
-    """Claude CLI returned an error."""
+    """Provider CLI returned an error.
+
+    `envelope` carries the parsed provider envelope when one was obtained
+    before the failure (non-zero exit with JSON output, or an in-band
+    `is_error`), so callers can still account for the usage and cost of the
+    failed turn. None when nothing parseable came back.
+    """
+
+    def __init__(self, message: str = "", envelope: dict | None = None):
+        super().__init__(message)
+        self.envelope = envelope if isinstance(envelope, dict) else None
 
 
 class ClaudeRateLimitError(ClaudeCliError):
@@ -3081,6 +3091,7 @@ def _extract_codex_envelope(
     saw_event = False
     turn_completed = False
     tool_calls = 0
+    saw_item_event = False
     for line in (stdout or "").splitlines():
         line = line.strip()
         if not line:
@@ -3102,13 +3113,12 @@ def _extract_codex_envelope(
             turn_completed = True
             usage = event.get("usage") or usage
         elif event.get("type") == "item.completed":
-            # Tool accounting: every completed item that is not the model's
-            # own prose/reasoning is a tool invocation (command_execution,
-            # file_change, mcp_tool_call, web_search, ...).
+            # Tool accounting: count completed items whose type is a tool
+            # invocation. Allowlist, so prose/reasoning/todo/error items are
+            # never mistaken for tools.
+            saw_item_event = True
             item = event.get("item") or {}
-            if isinstance(item, dict) and item.get("type") not in (
-                None, "agent_message", "reasoning", "todo_list",
-            ):
+            if isinstance(item, dict) and item.get("type") in _CODEX_TOOL_ITEM_TYPES:
                 tool_calls += 1
         elif event.get("type") == "error":
             return {
@@ -3142,8 +3152,21 @@ def _extract_codex_envelope(
         "usage": usage,
         "duration_ms": duration_ms,
         "session_id": thread_id,
-        "tool_calls": tool_calls,
+        # None (unknown) when the stream carried no item events at all, e.g.
+        # older CLI builds that only emit thread/turn events.
+        "tool_calls": tool_calls if saw_item_event else None,
     }
+
+
+# Codex `exec --json` item types that represent a tool invocation.
+_CODEX_TOOL_ITEM_TYPES = frozenset({
+    "command_execution",
+    "file_change",
+    "mcp_tool_call",
+    "web_search",
+    "custom_tool_call",
+    "local_shell_call",
+})
 
 
 def _gemini_tool_calls(stats: dict) -> int | None:
@@ -3404,7 +3427,8 @@ def _invoke_claude(
         if result.returncode != 0:
             raise ClaudeCliError(
                 f"codex CLI exited with code {result.returncode}: "
-                f"{_format_cli_failure_context(stderr=result.stderr, stdout=result.stdout, envelope=envelope)}"
+                f"{_format_cli_failure_context(stderr=result.stderr, stdout=result.stdout, envelope=envelope)}",
+                envelope=envelope,
             )
         if envelope is None:
             raise ClaudeCliError(
@@ -3413,7 +3437,7 @@ def _invoke_claude(
             )
         if envelope.get("is_error") is True:
             msg = (envelope.get("result") or "").strip()[:500] or "api error"
-            raise ClaudeCliError(f"codex CLI API error: {msg}")
+            raise ClaudeCliError(f"codex CLI API error: {msg}", envelope=envelope)
         if acct_dir and unified_pool.pool_engaged():
             usage = envelope.get("usage") or {}
             if usage:
@@ -3430,7 +3454,8 @@ def _invoke_claude(
         if result.returncode != 0:
             raise ClaudeCliError(
                 f"gemini CLI exited with code {result.returncode}: "
-                f"{_format_cli_failure_context(stderr=result.stderr, stdout=result.stdout, envelope=envelope)}"
+                f"{_format_cli_failure_context(stderr=result.stderr, stdout=result.stdout, envelope=envelope)}",
+                envelope=envelope,
             )
         if envelope is None:
             raise ClaudeCliError(
@@ -3439,7 +3464,7 @@ def _invoke_claude(
             )
         if envelope.get("is_error") is True:
             msg = (envelope.get("result") or "").strip()[:500] or "api error"
-            raise ClaudeCliError(f"gemini CLI API error: {msg}")
+            raise ClaudeCliError(f"gemini CLI API error: {msg}", envelope=envelope)
         if acct_dir and unified_pool.pool_engaged():
             usage = envelope.get("usage") or {}
             if usage:
@@ -3465,7 +3490,8 @@ def _invoke_claude(
     if result.returncode != 0:
         raise ClaudeCliError(
             f"Claude CLI exited with code {result.returncode}: "
-            f"{_format_cli_failure_context(stderr=result.stderr, stdout=result.stdout, envelope=envelope)}"
+            f"{_format_cli_failure_context(stderr=result.stderr, stdout=result.stdout, envelope=envelope)}",
+            envelope=envelope,
         )
 
     if envelope is None:
@@ -3478,7 +3504,7 @@ def _invoke_claude(
     # as a hard error so it's not treated as a successful low-output cycle.
     if envelope.get("is_error") is True:
         msg = (envelope.get("result") or "").strip()[:500] or "api error"
-        raise ClaudeCliError(f"Claude CLI API error: {msg}")
+        raise ClaudeCliError(f"Claude CLI API error: {msg}", envelope=envelope)
 
     # Plan A: per-account usage tracking. Hook on the success
     # path only — failed calls (rate-limit, CLI error) raise above this

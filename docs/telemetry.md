@@ -50,9 +50,13 @@ Legacy single-session runs use `long_exposure/data/telemetry/`.
   the config `pricing:` table when the provider reports none),
   `cost_source` (`provider` | `estimated` | `unavailable`), `tool_calls`,
   and `num_turns`; `run_end` carries the run's `usage_totals` and a
-  `budget_exhausted` flag. `telemetry summarize` rolls these up under
-  `cost` in `rollups/summary.json`. See `configuration-reference.md`
-  ("Usage ledger, cost, and tool counts") for where each number comes from.
+  `budget_exhausted` flag. A separate `usage_recorded` event is emitted
+  once per ledger record from every call site (cycle agents, reporter,
+  final auditor/reporter, curator, merge synthesis, compaction) with the
+  per-call breakdown; `telemetry summarize` totals `cost` from those in
+  `rollups/summary.json` so it matches the run ledger. See
+  `configuration-reference.md` ("Usage ledger, cost, and tool counts")
+  for where each number comes from.
 - provider/model metadata
 - account usage snapshots when available
 - reporter markdown/PDF status

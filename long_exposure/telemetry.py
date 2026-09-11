@@ -448,14 +448,18 @@ def summarize(
             u = data.get("usage") if isinstance(data, dict) else None
             if isinstance(u, dict):
                 usage.update(_usage_counter(u))
-            if isinstance(data, dict) and ev.get("event_type") == "agent_call_end":
+            # `usage_recorded` is emitted once per ledger record from every
+            # call site (cycle agents, out-of-cycle agents, compaction), so
+            # its sum matches the run ledger; `agent_call_end` covers only
+            # the cycle loop and periodic reporter.
+            if isinstance(data, dict) and ev.get("event_type") == "usage_recorded":
                 for key in ("cost_usd", "cost_estimated_usd"):
                     try:
                         cost[key] += float(data.get(key) or 0.0)
                     except (TypeError, ValueError):
                         pass
                 cost["tool_calls"] += _safe_int(data.get("tool_calls"))
-                cost["num_turns"] += _safe_int(data.get("num_turns"))
+                cost["num_turns"] += _safe_int(data.get("turns"))
             if isinstance(data, dict):
                 ratio = data.get("context_ratio")
                 if isinstance(ratio, (int, float)) and ratio >= context_max["ratio"]:

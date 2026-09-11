@@ -475,10 +475,36 @@ long-exposure usage --json     # output/usage_summary.json verbatim
 
 `config.yaml` `pricing:` supplies USD-per-million rates for the estimate
 (`provider -> model -> {input, output, cache_read, cache_write}`; a model
-key may be an exact id, a prefix, or `_default`). Without a row, cost for
-that provider shows as `n/a` and does not count toward `max_cost_usd`.
-Telemetry `agent_call_end` events carry the same per-call fields and
-`telemetry summarize` rolls them up under `cost`.
+key may be an exact id, a prefix, or `_default`; omitted cache rates
+default to 10% / 125% of `input`). For Codex and Gemini the cached share is
+subtracted from the input total before pricing, since those providers
+report input inclusive of cached tokens. Without a row, cost for that
+provider shows as `n/a` and does not count toward `max_cost_usd`.
+Telemetry emits one `usage_recorded` event per ledger record from every
+call site; `telemetry summarize` totals cost from those under `cost`
+(`agent_call_end` carries the same per-call fields but only for the cycle
+loop and periodic reporter).
+
+Scope and limits of the accounting:
+
+- **Failed calls count.** When a provider CLI fails after producing a
+  parsable envelope (non-zero exit with JSON, or an in-band API error), the
+  failed turn's tokens and cost are recorded with `ok_calls` unchanged.
+  Calls that produce no envelope at all (timeouts, crashes) are not
+  counted.
+- **Fan-out.** Clones start with an empty ledger and evaluate
+  `max_cost_usd` / `max_tool_calls` against their own spend only; the root
+  folds clone ledgers in at barrier collapse. A cap therefore bounds the
+  root plus whatever each clone spent before the merge, and a clone killed
+  mid-cycle (10 h cap, post-merge termination, preemption) loses that
+  partial cycle's spend.
+- **Manager.** In `launch --manager` threaded mode the manager agent's
+  calls land in the run ledger; a cron `manager poll` runs in its own
+  process and its spend is not persisted.
+- **Interactive transport** reports a chars/4 estimate, not provider
+  usage; those tokens are recorded but never priced (`n/a`).
+- **`clear`** resets the ledger; `stop`/`resume` and the standalone
+  `run_final_reporter.py` extend it.
 
 ### Agent definitions
 

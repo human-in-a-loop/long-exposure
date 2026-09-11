@@ -163,27 +163,47 @@ def _record_usage(
     *,
     config: dict | None,
     model: str | None = None,
+    provider: str | None = None,
 ) -> dict:
     """Fold one agent call into the run ledger and annotate `result` with
     the cost breakdown so telemetry can carry it. Returns `result`.
 
-    Rate-limit results carry no envelope and are not counted as calls.
-    Never raises.
+    `provider` should be the agent's resolved provider
+    (`agent_routing.agent_provider`), because in per-agent-pinned runs the
+    process-global provider is only switched for the duration of the call
+    and may already be restored when this runs. Rate-limit results carry no
+    envelope and are not counted as calls. Results flagged
+    `usage_estimated` (interactive transport's chars/4 guess) are recorded
+    for tokens but never priced. Never raises.
     """
     try:
         if not isinstance(result, dict) or result.get("status") == "rate_limit":
             return result
         if not (result.get("usage") or result.get("cost_usd") is not None):
             return result
+        resolved_provider = provider or _provider.current_provider()
         added = _usage.record(
             agent_name,
             result,
-            provider=_provider.current_provider(),
+            provider=resolved_provider,
             model=model or (config or {}).get("model"),
             config=config,
+            allow_estimate=not result.get("usage_estimated"),
         )
         result["cost_estimated_usd"] = added["cost_estimated_usd"] or None
         result["cost_source"] = added["cost_source"]
+        # One event per recorded call, from every site (cycle agents,
+        # out-of-cycle agents, compaction), so `telemetry summarize` can
+        # total cost over the same set of calls the ledger sees.
+        telemetry.emit(
+            "usage_recorded",
+            phase="usage",
+            agent=agent_name,
+            provider=resolved_provider,
+            model=model or (config or {}).get("model"),
+            status=result.get("status"),
+            data=added,
+        )
     except Exception:
         pass
     return result
@@ -1616,7 +1636,7 @@ def _call_exploration_agent(
                 f"{session_id[:8]}... evicted; next cycle starts fresh.",
                 flush=True,
             )
-        return _error_result(agent_name, agent_def, str(e)[:500])
+        return _error_result_from_cli_error(agent_name, agent_def, e)
 
     # Best-effort sweep of any tasks/<team>/ residue created during this turn.
     _post_team_cleanup(agent_config, team_turn_start)
@@ -1693,6 +1713,9 @@ def _call_exploration_agent(
         "cost_usd": envelope.get("total_cost_usd"),
         "num_turns": envelope.get("num_turns"),
         "tool_calls": tool_calls,
+        # Interactive transport reports a chars/4 guess, not provider usage;
+        # the ledger records the tokens but must not price them.
+        "usage_estimated": bool(interactive),
     }
 
 
@@ -1741,11 +1764,13 @@ def _call_agent_with_rotation(
                 ),
                 config=_cfg,
                 model=agent_def.get("model") or _cfg.get("model"),
+                provider=agent_routing.agent_provider(agent_def, _cfg),
             )
 
     accounts = _parse_accounts()
     is_forced, _ = _resolve_force_account(accounts)
     _model = agent_def.get("model") or _cfg.get("model")
+    _prov = agent_routing.agent_provider(agent_def, _cfg)
 
     if is_forced and (_is_clone() or not (pool.is_active() or unified_pool.is_unified_active())):
         # Pinned clone or manually pinned non-pool run. Single attempt:
@@ -1763,6 +1788,7 @@ def _call_agent_with_rotation(
             ),
             config=_cfg,
             model=_model,
+            provider=_prov,
         )
 
     pool_active = _pool.is_active() or unified_pool.is_unified_active()
@@ -1789,7 +1815,9 @@ def _call_agent_with_rotation(
             **kwargs,
         )
         if result["status"] != "rate_limit":
-            return _record_usage(agent_name, result, config=_cfg, model=_model)
+            return _record_usage(
+                agent_name, result, config=_cfg, model=_model, provider=_prov,
+            )
         sessions_dict.pop(agent_name, None)
 
         if unified_pool.is_unified_active():
@@ -2008,6 +2036,7 @@ def _compact_agent_session_impl(
         },
         config=config,
         model=agent_config.get("model"),
+        provider=agent_routing.agent_provider(agent_def, config),
     )
 
     # Strip ``` fences and check for non-empty payload. Empty already means
@@ -2101,6 +2130,27 @@ def _error_result(agent_name: str, agent_def: dict, error: str) -> dict:
         "status": "error",
         "error": error,
     }
+
+
+def _error_result_from_cli_error(agent_name: str, agent_def: dict, exc: Exception) -> dict:
+    """Failure result that keeps the failed turn's usage/cost when the CLI
+    error carried a parsed envelope (`ClaudeCliError.envelope`), so a long
+    tool-heavy turn that ends in an API error still counts toward the
+    ledger and budget. `ok_calls` distinguishes it from successes."""
+    result = _error_result(agent_name, agent_def, str(exc)[:500])
+    envelope = getattr(exc, "envelope", None)
+    if isinstance(envelope, dict):
+        usage = envelope.get("usage")
+        if isinstance(usage, dict) and usage:
+            result["usage"] = dict(usage)
+        result["duration_ms"] = envelope.get("duration_ms", 0) or 0
+        if envelope.get("total_cost_usd") is not None:
+            result["cost_usd"] = envelope.get("total_cost_usd")
+        if envelope.get("num_turns") is not None:
+            result["num_turns"] = envelope.get("num_turns")
+        if envelope.get("tool_calls") is not None:
+            result["tool_calls"] = envelope.get("tool_calls")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -4145,6 +4195,7 @@ def run_exploration(
                     result,
                     config=config,
                     model=agent_def.get("model") or config.get("model"),
+                    provider=agent_routing.agent_provider(agent_def, config),
                 )
                 telemetry.emit_agent_result(
                     agent_name,
@@ -4893,11 +4944,16 @@ def run_exploration(
         # last_daily_sync_at to now so a subsequent resume from this
         # cleared state doesn't fire the daily sync on cycle 1 (with
         # last_daily_sync_at=None, _daily_sync_due returns True).
+        # A cleared run starts over: reset the ledger and persist an empty
+        # one, otherwise the next start/resume would inherit this run's
+        # spend and could trip a budget cap before its first cycle.
+        _usage.load({})
         save_state(state_path, 0, {}, {name: 0 for name in agents},
                    None, {}, {},
                    last_daily_sync_at=datetime.now(timezone.utc).isoformat(),
                    daily_sync_count=0,
-                   daily_sync_in_progress=False)
+                   daily_sync_in_progress=False,
+                   usage_totals={})
         update_status_file(output_dir, cycle, "cleared", consecutive_failures)
         telemetry.emit(
             "run_end",

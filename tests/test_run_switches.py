@@ -296,6 +296,15 @@ class ProviderToolCountTests(unittest.TestCase):
         ])
         env = _extract_codex_envelope(stdout, "done", 9)
         self.assertEqual(env["tool_calls"], 3)
+        # An `error` item is not a tool; a stream with no item events at all
+        # reports an unknown count (None), not a confident zero.
+        with_error = stdout + '\n{"type":"item.completed","item":{"type":"error","id":"e1"}}'
+        self.assertEqual(_extract_codex_envelope(with_error, "done", 9)["tool_calls"], 3)
+        no_items = "\n".join([
+            '{"msg":{"type":"thread.started","thread_id":"t1"}}',
+            '{"msg":{"type":"turn.completed","usage":{"input_tokens":4,"output_tokens":5}}}',
+        ])
+        self.assertIsNone(_extract_codex_envelope(no_items, "done", 9)["tool_calls"])
 
     def test_gemini_envelope_reads_tool_stats(self):
         from long_exposure.orchestrator import _extract_gemini_envelope
@@ -373,3 +382,143 @@ class ProviderToolCountTests(unittest.TestCase):
                 self.assertEqual(json.loads(p.read_text())["usage_totals"], {"x": {"calls": 1}})
         finally:
             exploration._usage.load({})
+
+
+def _reset_signal_globals():
+    # The stop/clear flags are module globals meant for one run per process;
+    # tests that exercise the clear path must reset them for later tests.
+    exploration._stop_requested = False
+    exploration._clear_requested = False
+    if hasattr(exploration, "_graceful_stop_requested"):
+        exploration._graceful_stop_requested = False
+
+
+class LedgerRobustnessTests(unittest.TestCase):
+    """Review findings: clear resets the ledger, per-agent provider
+    attribution, failed calls keep their usage, estimated usage is unpriced."""
+
+    def setUp(self):
+        _reset_signal_globals()
+
+    def tearDown(self):
+        telemetry.configure({"telemetry": {"enabled": False}}, None, None)
+        exploration._usage.load({})
+        _reset_signal_globals()
+
+    def test_clear_resets_ledger_and_next_run_starts_at_zero(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as td:
+            score, config, inst = _write_files(Path(td), loop_extra="  max_cost_usd: 20\n")
+            fake = _fake_agent_factory(seen, cost_usd=6.0)
+
+            def clearing_agent(agent_name, agent_def, **kwargs):
+                result = fake(agent_name, agent_def, **kwargs)
+                if agent_name == "auditor":
+                    # Operator clears mid-run; honoured at the cycle boundary.
+                    (inst / "long-exposure.clear").touch()
+                return result
+
+            with patch("long_exposure.exploration._call_exploration_agent", clearing_agent):
+                _run(score, config, inst)
+            cleared = json.loads((inst / "exploration_state.json").read_text())
+            self.assertEqual(cleared["cycle"], 0)
+            self.assertEqual(cleared["usage_totals"], {})
+            self.assertEqual(exploration._usage.totals()["calls"], 0)
+
+            # Next run resumes from the cleared state: $18 of prior spend must
+            # not count toward the $20 cap, so it completes its full cycle.
+            seen.clear()
+            _reset_signal_globals()
+            with patch("long_exposure.exploration._call_exploration_agent", fake):
+                _run(score, config, inst)
+            state = json.loads((inst / "exploration_state.json").read_text())
+        self.assertEqual(state["cycle"], 1)
+        self.assertEqual(state["usage_totals"]["worker"]["cost_usd"], 6.0)
+        self.assertEqual([s["agent"] for s in seen], ["researcher", "worker", "auditor"])
+
+    def test_per_agent_pinned_provider_is_used_for_pricing(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as td:
+            score, config, inst = _write_files(Path(td))
+            config.write_text(
+                config.read_text()
+                + "agent_models:\n"
+                + "  worker: {provider: codex, model: gpt-5.5}\n"
+                + "pricing:\n"
+                + "  codex:\n"
+                + "    gpt-5.5: {input: 1000000, output: 0}\n"
+            )
+            with patch("long_exposure.exploration._call_exploration_agent", _fake_agent_factory(seen)):
+                _run(score, config, inst)
+            totals = json.loads((inst / "exploration_state.json").read_text())["usage_totals"]
+        # worker: 100 input tokens at $1M per 1M tokens = $100, estimated
+        # from the codex table even though the run's global provider is local.
+        self.assertEqual(totals["worker"]["cost_estimated_usd"], 100.0)
+        self.assertEqual(totals["worker"]["cost_sources"], ["estimated"])
+        self.assertEqual(totals["researcher"]["cost_estimated_usd"], 0.0)
+        self.assertEqual(totals["researcher"]["cost_sources"], [])
+
+    def test_cli_error_keeps_failed_turn_usage(self):
+        from long_exposure.orchestrator import ClaudeCliError
+        from long_exposure.exploration import _error_result_from_cli_error
+        agent_def = {"outputs": ["work_output"]}
+        bare = _error_result_from_cli_error("worker", agent_def, ClaudeCliError("boom"))
+        self.assertEqual(bare["status"], "error")
+        self.assertEqual(bare["usage"], {})
+        self.assertNotIn("cost_usd", bare)
+        exc = ClaudeCliError(
+            "Claude CLI API error: overloaded",
+            envelope={"usage": {"input_tokens": 50, "output_tokens": 7},
+                      "duration_ms": 1234, "total_cost_usd": 0.75, "num_turns": 9},
+        )
+        rich = _error_result_from_cli_error("worker", agent_def, exc)
+        self.assertEqual(rich["status"], "error")
+        self.assertEqual(rich["usage"]["output_tokens"], 7)
+        self.assertEqual(rich["cost_usd"], 0.75)
+        self.assertEqual(rich["num_turns"], 9)
+        self.assertEqual(rich["duration_ms"], 1234)
+        # And the ledger counts it as a call, not an ok call.
+        exploration._usage.load({})
+        exploration._record_usage("worker", rich, config={}, model="opus", provider="claude")
+        row = exploration._usage.rows()["worker"]
+        self.assertEqual((row["calls"], row["ok_calls"], row["cost_usd"]), (1, 0, 0.75))
+        # ClaudeCliError still works with the bare message form everywhere.
+        self.assertIsNone(ClaudeCliError("x").envelope)
+        self.assertIsNone(ClaudeCliError("x", envelope="not a dict").envelope)
+
+    def test_estimated_usage_is_recorded_but_not_priced(self):
+        exploration._usage.load({})
+        pricing = {"pricing": {"claude": {"opus": {"input": 5, "output": 25}}}}
+        result = {"status": "ok", "usage": {"output_tokens": 4000}, "usage_estimated": True}
+        exploration._record_usage("worker", result, config=pricing, model="opus", provider="claude")
+        row = exploration._usage.rows()["worker"]
+        self.assertEqual(row["output_tokens"], 4000)
+        self.assertEqual(row["cost_estimated_usd"], 0.0)
+        self.assertEqual(row["cost_sources"], [])
+        self.assertEqual(result["cost_source"], "unavailable")
+        # The same usage without the flag is priced.
+        exploration._record_usage("worker", {"status": "ok", "usage": {"output_tokens": 4000}},
+                                  config=pricing, model="opus", provider="claude")
+        self.assertEqual(exploration._usage.rows()["worker"]["cost_estimated_usd"], 0.1)
+
+
+class TelemetryCostRollupTests(unittest.TestCase):
+    def tearDown(self):
+        telemetry.configure({"telemetry": {"enabled": False}}, None, None)
+
+    def test_summarize_totals_cost_from_usage_recorded_events(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            telemetry.configure({"telemetry": {"enabled": True}}, root, "run-x")
+            telemetry.emit("usage_recorded", phase="usage", agent="worker", status="ok",
+                           data={"cost_usd": 1.5, "cost_estimated_usd": 0.0, "tool_calls": 3, "turns": 2})
+            telemetry.emit("usage_recorded", phase="usage", agent="worker#compaction", status="ok",
+                           data={"cost_usd": 0.25, "cost_estimated_usd": 0.5, "tool_calls": 0, "turns": 1})
+            # agent_call_end is informational; it must not be double-counted.
+            telemetry.emit("agent_call_end", phase="agent", agent="worker", status="ok",
+                           data={"cost_usd": 99.0, "tool_calls": 99, "num_turns": 99})
+            summary = telemetry.summarize(root)
+        self.assertEqual(summary["cost"]["cost_usd"], 1.75)
+        self.assertEqual(summary["cost"]["cost_estimated_usd"], 0.5)
+        self.assertEqual(summary["cost"]["tool_calls"], 3)
+        self.assertEqual(summary["cost"]["num_turns"], 3)

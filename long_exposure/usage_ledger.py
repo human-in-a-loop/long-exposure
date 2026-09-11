@@ -217,11 +217,13 @@ class UsageLedger:
         provider: str | None = None,
         model: str | None = None,
         config: dict | None = None,
+        allow_estimate: bool = True,
     ) -> dict[str, Any]:
         """Add one provider call. `result` is the harness result dict
         (`usage`, `duration_ms`, `status`, and optionally `cost_usd`,
-        `num_turns`, `tool_calls`). Returns the per-call breakdown that was
-        added, for telemetry."""
+        `num_turns`, `tool_calls`). `allow_estimate=False` records tokens
+        but skips pricing (for usage figures that are themselves estimates).
+        Returns the per-call breakdown that was added, for telemetry."""
         result = result or {}
         usage = result.get("usage") or {}
         if not isinstance(usage, dict):
@@ -231,7 +233,7 @@ class UsageLedger:
         source = "unavailable"
         if reported is not None:
             source = "provider"
-        elif usage:
+        elif usage and allow_estimate:
             estimated = estimate_cost_usd(
                 usage, provider=provider, model=model, config=config
             )
