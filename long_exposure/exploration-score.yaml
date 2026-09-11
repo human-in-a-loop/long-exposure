@@ -75,6 +75,25 @@ loop:
   # Setting BOTH to 0 restores the legacy wait-for-completion barrier.
   min_clone_cycles_before_preempt: 1
   barrier_preempt_timeout_seconds: 3600
+  # Whole-cycle fan-out switch. false removes the <parallel_cycle_fanout>
+  # guidance from the researcher AND ignores any block it emits, so no clone
+  # processes are ever spawned. Env override: LONG_EXPOSURE_FANOUT=0|1.
+  fanout_enabled: true
+  # End-of-run pipeline switches (natural end, max_cycles, stop, budget cap,
+  # and the daily-sync re-run). A stage that is off is skipped even when its
+  # agent is defined above. `end_of_run: false` turns all three off.
+  # Env override: LONG_EXPOSURE_END_OF_RUN=0 disables all stages.
+  end_of_run:
+    enabled: true
+    final_auditor: true
+    final_reporter: true
+    curator: true
+  # Budget gates, checked at every cycle boundary (like max_cycles). Cost is
+  # the sum of provider-reported dollars (Claude `total_cost_usd`) plus
+  # estimates from config.yaml `pricing:` for providers that report none.
+  # Reaching a cap ends the run as a natural end-of-run. null = unlimited.
+  max_cost_usd: null
+  max_tool_calls: null
 
 # Restrict Bash to Wolfram kernel, Python, and file-organization commands.
 # All file reads go through scoped file tools (Read/Glob/Grep), not cat.

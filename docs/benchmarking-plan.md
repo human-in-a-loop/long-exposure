@@ -37,17 +37,21 @@ The short version:
 - **Report-quality venue: DeepResearch Bench II** (132 tasks, 9,430 rubrics),
   with the contamination controls described in §5.
 
-Before any of that can run, the harness needs a **bench mode**: a config
-switch to disable fan-out (there is none today), dollar-cost and tool-call
-capture (neither is recorded today), per-task `sessions.db` isolation, and a
-way to skip the end-of-run pipeline. §3.3 lists the blockers with file:line
-references; §5 Phase 0 lists the work.
+Before any of that can run, the harness needs a **bench mode**. As of
+2026-09-11 three of its four pieces exist: `loop.fanout_enabled`,
+`loop.end_of_run` stage switches, and a per-agent usage ledger (tokens,
+dollars, tool calls) with `loop.max_cost_usd` / `loop.max_tool_calls`
+budget gates surfaced by `long-exposure status`. Per-task `sessions.db`
+isolation is still a config-file step. §3.3 lists the original blockers
+with file:line references and marks what has landed; §5 Phase 0 lists the
+remaining work.
 
-Two compliance notes must be resolved before publishing results: the
-multi-account pool is designed to spread one campaign across several
-consumer Max seats to avoid per-account limits (§3.4), and the interactive
-transport is explicitly gated in the repo pending Anthropic approval. A
-published benchmark should run on a single API key with both features off.
+Two features stay off for the benchmark: the multi-account pool (an
+exploratory feature, last used to pair Claude and Codex accounts for a
+mixed-model run, and left untouched here) and the interactive transport
+(self-gated in the repo). Runs use `claude -p` on a Max subscription, which
+Anthropic's Help Center confirms still draws from the subscription's usage
+limits (the June 15, 2026 credit change was paused before taking effect).
 
 ---
 
@@ -141,20 +145,22 @@ actually ran.
 
 ### 3.3 Blockers for plugging into a benchmark harness
 
-1. **Fan-out has no off switch.** The `<parallel_cycle_fanout>` guidance is
-   always injected at root (`exploration.py:3802-3806`) and any valid 2–3
-   branch block spawns child interpreters that share the workspace and
-   `sessions.db`, all on the same account when no pool is set
-   (`fanout.py:1024-1025, 1144-1162`; default cap `FANOUT_MAX_BRANCHES = 3`
-   at `fanout.py:97`). A benchmark needs this to be a config flag so that
-   fan-out is an ablation, not a random variable.
-2. **No dollar cost, no tool-call counts.** The Claude JSON envelope's
-   `total_cost_usd` and `num_turns` are never read (grep: zero references).
-   Telemetry records per-call `usage` and `duration_ms` only
-   (`telemetry.py:328-367`). Codex JSONL stdout is deleted after parsing
-   (`orchestrator.py:3065-3069`). Clone telemetry is written to the clone's
-   own directory and never merged. AstaBench, HAL and Harbor all report cost
-   per task, so this must be fixed first.
+1. **Fan-out had no off switch** (fixed 2026-09-11: `loop.fanout_enabled`,
+   `LONG_EXPOSURE_FANOUT`). Previously the `<parallel_cycle_fanout>`
+   guidance was always injected at root and any valid 2–3 branch block
+   spawned child interpreters sharing the workspace and `sessions.db`, all
+   on the same account when no pool is set (`fanout.py:1024-1025,
+   1144-1162`; default cap `FANOUT_MAX_BRANCHES = 3`). Fan-out is now an
+   ablation.
+2. **No dollar cost, no tool-call counts** (fixed 2026-09-11: usage ledger,
+   see `configuration-reference.md`). Previously the Claude envelope's
+   `total_cost_usd` and `num_turns` were never read, telemetry recorded
+   per-call `usage` and `duration_ms` only, and clone usage was never
+   merged. Now every call is recorded per agent, clones are folded in at
+   fan-out collapse, and `long-exposure usage` prints the run total.
+   Codex/Gemini cost is an estimate from the `pricing:` table, so for
+   AstaBench route model calls through Inspect's proxy as the authoritative
+   cost source.
 3. **Shared memory across tasks.** `compact_db` resolves relative to the
    config file, not the instance dir (`orchestrator.py:1659-1663`), and the
    MCP `search_sessions` tool is global with no run scoping. Running 40
@@ -199,17 +205,17 @@ actually ran.
     Wolfram guidance always on:
     `templates/operating-protocol-template.md:140-154, 205-246`). This costs
     tokens on every call and may confuse non-Claude providers.
-12. **The end-of-run pipeline is expensive and not switchable.** Minimum
-    cost at `max_cycles` or stop is 9 LLM calls (periodic-report flush 1,
-    final auditor 4, final reporter 3, curator 1), growing linearly with
-    input volume (about 23 calls at 120 k tokens of inputs), with two
-    *independent* 10 h wall caps (`limits.py:11`, `auditing.py:806-822`,
-    `reporting.py:632-641`) and a mandatory rerun every 24 h of run time
-    (`exploration.py:4497-4552`). The only way to skip it today is to
-    delete `final_auditor`/`final_reporter`/`curator` from `agents:` in the
-    score (graceful absence, `exploration.py:4856, 4879, 4898`) or to
-    `clear` instead of stop. An undocumented `LE_FORCE_FINAL_REPORT` env
-    switch jumps straight to synthesis (`exploration.py:3664-3673`).
+12. **The end-of-run pipeline is expensive** (switchable since 2026-09-11:
+    `loop.end_of_run` per-stage switches, `LONG_EXPOSURE_END_OF_RUN`).
+    Minimum cost at `max_cycles` or stop is 9 LLM calls (periodic-report
+    flush 1, final auditor 4, final reporter 3, curator 1), growing
+    linearly with input volume (about 23 calls at 120 k tokens of inputs),
+    with two *independent* 10 h wall caps (`limits.py:11`,
+    `auditing.py:806-822`, `reporting.py:632-641`) and a rerun every 24 h
+    of run time (`exploration.py:4497-4552`) that honours the same
+    switches. The uncapped stage count (`_N_MAX` dead) is still open. An
+    undocumented `LE_FORCE_FINAL_REPORT` env switch jumps straight to
+    synthesis (`exploration.py:3664-3673`).
 13. **No single machine-readable answer.** The deliverable is
     `reports/final/final_report.md` (+ PDF), `audits/final/final_audit_report.md`,
     `audits/final/final_audit_summary.json` (agent-written, schema not
@@ -222,25 +228,23 @@ actually ran.
     dots are removed. Harmless in a sandbox, but it is in the packaging
     path that a benchmark would ship.
 
-### 3.4 Compliance flags
+### 3.4 Features held out of the benchmark
 
-- **Multi-account pool.** `docs/multi-account-pool.md:20-22` describes each
-  entry as "a Claude Max plan seat with its own 5-hour rolling quota
-  window", sizing guidance goes to 33 accounts (`docs/parallelism.md`), and
-  freshness promotion exists to "spread usage across the pool when a primary
-  doesn't naturally rate-limit". This is usage-limit circumvention across
-  consumer subscriptions, whatever the account ownership. The repo already
-  applies exactly this caution to the interactive transport
-  (`docs/gaps_interactive_mode.md:24-29, 103`: "must not be used until the
-  operator has Anthropic's explicit go-ahead") but not to the pool. A
-  published benchmark must run on API keys or a single subscription with
-  `CLAUDE_ACCOUNT_POOL` unset, and the writeup should say so.
-- **Interactive transport.** Its stated purpose is to bill `claude -p` work
-  to a Max subscription instead of the Agent SDK pool
-  (`config.yaml:389-402`). Anthropic paused the June 15 billing change, so
-  the motivation is moot; the feature also disables pooling, fan-out and
-  usage accounting. Keep `claude_transport: headless` for all benchmark
-  runs.
+- **Multi-account pool.** Exploratory and not exercised recently; when it
+  was used, it combined a Claude account and a Codex account so two model
+  families could share one campaign. It is not used in this benchmark and
+  the code is left untouched: `CLAUDE_ACCOUNT_POOL` / `CODEX_ACCOUNT_POOL`
+  stay unset, which makes the pool inert (§3.3 item 8 notes the rate-limit
+  path that remains active on a single account).
+- **Interactive transport.** Self-gated in the repo
+  (`docs/gaps_interactive_mode.md`) and it disables pooling, fan-out and
+  usage accounting. Keep `claude_transport: headless`.
+- **Billing basis.** All benchmark runs use `claude -p` on a Max
+  subscription. Anthropic's Help Center article "Use the Claude Agent SDK
+  with your Claude plan" states that the June 15, 2026 move to a separate
+  Agent SDK credit was paused and that `claude -p` usage "still draw[s] from
+  your subscription's usage limits". Report the subscription tier with the
+  results, since it bounds throughput.
 - **`--yolo` / `dangerously_skip_all`.** Codex and Gemini run with approvals
   bypassed by default. All benchmark venues above run agents in containers,
   which is the sandbox the README asks for.
@@ -356,29 +360,32 @@ hypothesis, and §5 is built around it.
 
 ### 5.1 Phase 0: bench mode and instrumentation (about 2 weeks)
 
-Work items in the repo, each small and independently testable:
+Work items in the repo, each small and independently testable. Items 1, 2,
+3 and 5 landed on 2026-09-11 (see `configuration-reference.md`, "Loop
+knobs" and "Usage ledger, cost, and tool counts"):
 
-1. `loop.fanout_enabled: false` — skip guidance injection and block parsing
-   at root when false (`exploration.py:3802-3806, 4069-4073`). Fan-out
-   becomes an ablation.
-2. Cost capture — read `total_cost_usd` and `num_turns` from the Claude
-   envelope (`orchestrator.py:3270-3275`, `exploration.py:1562-1570`); keep
-   Codex per-turn usage before deleting the JSONL; add both to
-   `agent_call_end`; merge clone `telemetry/events.jsonl` into the root at
-   barrier collapse; sum into `telemetry summarize`. For AstaBench, route
-   model calls through Inspect's proxy so its cost logging is authoritative.
-3. Tool-call counts — parse the provider transcript once per turn (the
-   Claude session JSONL is already located for output recovery,
-   `conductor.py:413-482`) and emit `tool_calls` per agent.
+1. **Done.** `loop.fanout_enabled: false` skips guidance injection and
+   block parsing at root; `LONG_EXPOSURE_FANOUT=0` is the one-launch
+   override. Fan-out is now an ablation.
+2. **Done.** Cost capture: Claude `total_cost_usd` and `num_turns` are read
+   from the envelope; Codex and Gemini fall back to a `pricing:` estimate;
+   every call lands in a per-agent usage ledger persisted in state, merged
+   from clones at fan-out collapse, rendered in `long-exposure status` /
+   `long-exposure usage`, and rolled up by `telemetry summarize`.
+   `loop.max_cost_usd` and `loop.max_tool_calls` stop a run at the next
+   cycle boundary. For AstaBench, still route model calls through
+   Inspect's proxy so its cost logging is authoritative.
+3. **Done.** Tool-call counts: Claude from `tool_use` blocks in the
+   current turn of the session transcript, Codex from completed item
+   events, Gemini from `stats.tools`.
 4. Per-task `sessions.db` — accept `compact_db` on the CLI and resolve
    relative to `--instance-dir`, or make `--instance-dir` imply an
    instance-local DB in bench mode.
-5. `loop.end_of_run_pipeline: skip | full` and `report_interval: 0` —
-   bench mode should produce the final report through the *cycle* agents
-   or a single reporter call, not the unbounded-stage final auditor +
-   reporter, unless the ablation asks for it. Until the flag exists, the
-   bench score simply omits those three agents. Also restore the documented
-   N=5 cap (`_N_MAX`) so the A4 arm has a bounded cost.
+5. **Done.** `loop.end_of_run: {enabled, final_auditor, final_reporter,
+   curator}` gates the end-of-run pipeline and the daily-sync re-run;
+   `LONG_EXPOSURE_END_OF_RUN=0` is the one-launch override. Still open:
+   restore the documented N=5 stage cap (`_N_MAX`) so the A4 arm has a
+   bounded cost, and `report_interval: 0` semantics.
 6. A `long-exposure bench` subcommand: takes `--task-dir`, `--out-dir`,
    `--wall-budget`, `--cost-budget`, `--max-cycles`; writes a `result.json`
    with the report path, artifacts list, tokens, dollars, tool calls, wall
@@ -523,15 +530,14 @@ Score overrides (`bench-score.yaml`, derived from `exploration-score.yaml`):
 loop:
   max_cycles: 3                 # A1; 6 for A2+
   cycle_cooldown_seconds: 0
-  report_interval: 0            # Phase 0 item 5
+  report_interval: 100          # effectively off; Phase 0 item 5 residual
   daily_sync_interval_hours: 0
-  fanout_enabled: false         # Phase 0 item 1; true for A3
-  end_of_run_pipeline: skip     # full for A4
-agents:                         # today: omit final_auditor/final_reporter/curator
-  researcher: {...}             # to skip the end-of-run pipeline (graceful absence)
-  worker: {...}
-  auditor: {...}
-  reporter: {...}               # one call at the end for the report file
+  fanout_enabled: false         # true for A3
+  end_of_run:                   # all true for A4
+    final_auditor: false
+    final_reporter: false
+    curator: false
+  max_cost_usd: 25              # per-task cost cap (checked at cycle boundaries)
 flow: [researcher, worker, auditor]   # [researcher, worker] for A5
 ```
 
@@ -554,8 +560,9 @@ working_directory: /abs/path/<task>/<seed>/workspace
 wolfram_path: ""
 ```
 
-Environment: `CLAUDE_ACCOUNT_POOL` and `CODEX_ACCOUNT_POOL` unset;
-`ANTHROPIC_API_KEY` set; `LONG_EXPOSURE_TELEMETRY=1`;
+Environment: `CLAUDE_ACCOUNT_POOL` and `CODEX_ACCOUNT_POOL` unset; a
+logged-in Claude Code CLI on the Max subscription (`claude -p` draws from
+the subscription's limits); `LONG_EXPOSURE_TELEMETRY=1`;
 `AGENT_INSTANCE_DIR=<instance>` (so health events are written).
 
 Invocation (today, before the bench subcommand exists):

@@ -217,6 +217,35 @@ Manager polls append structured notices to
 launchers read the same file, so manager awareness does not depend on which
 LLM CLI launched the run.
 
+The status file also carries a `## Usage` table: per-agent calls, tool
+calls, turns, tokens, wall time, and cost (provider-reported for Claude,
+estimated from `pricing:` elsewhere), with run totals and progress against
+`loop.max_cost_usd` / `loop.max_tool_calls` when set. The same data is
+available on its own:
+
+```bash
+long-exposure usage
+long-exposure usage --json      # output/usage_summary.json
+```
+
+### Turning off fan-out or the end-of-run pipeline
+
+For bounded or benchmark runs, the score's `loop:` block has switches for
+the two most expensive behaviours (see `configuration-reference.md`):
+
+```yaml
+loop:
+  fanout_enabled: false          # never spawn clone processes
+  end_of_run:
+    final_auditor: false         # skip the staged final audit
+    final_reporter: false        # skip the staged final report
+    curator: true                # still package what exists
+  max_cost_usd: 25               # stop at the next cycle boundary past $25
+```
+
+One-launch env overrides: `LONG_EXPOSURE_FANOUT=0`,
+`LONG_EXPOSURE_END_OF_RUN=0`.
+
 For a **permanent** change of direction, use `resume "<new directive>"`
 instead (stops the run cleanly, saves state, then reruns with the new
 directive).

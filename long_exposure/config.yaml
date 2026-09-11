@@ -83,6 +83,19 @@ interactive_recycle_turns: 40        # relaunch the stateless driver every N tur
 interactive_fetch_window_seconds: 30 # bridge long-poll window before the driver re-polls
 interactive_turn_timeout_seconds: 1800  # max wait for one interactive turn's response
 
+# === Pricing (optional, USD per 1M tokens) ===
+# Used only to ESTIMATE cost for providers whose CLI reports none (Codex,
+# Gemini, local). Claude `claude -p` envelopes carry `total_cost_usd`, which
+# is recorded as-is and never re-estimated. Keys are provider -> model (exact
+# id, a prefix, or `_default`). Fields: input, output, cache_read, cache_write.
+# Leave empty to report cost as "n/a" for those providers.
+# pricing:
+#   codex:
+#     gpt-5.5: {input: 1.25, output: 10.0, cache_read: 0.125}
+#   gemini:
+#     _default: {input: 0.0, output: 0.0}
+pricing: {}
+
 # === Compact ===
 compact_threshold: 0.90
 reanchor_enabled: true

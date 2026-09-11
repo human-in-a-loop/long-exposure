@@ -62,6 +62,54 @@ def _state_path(arg_state: str | None, instance_dir: Path | None) -> Path:
     return exploration._resolve_state_path(arg_state, instance_dir)
 
 
+def _print_usage(args: argparse.Namespace) -> int:
+    """Print the run's usage ledger (per-agent tokens, tool calls, cost).
+
+    Reads `<output>/usage_summary.json`, written alongside the status file
+    after every cycle and at run end; falls back to the `usage_totals`
+    block in the state file for runs that stopped before the summary
+    existed.
+    """
+    from long_exposure import usage_ledger
+
+    instance_dir = resolve_instance_dir(args.instance_dir)
+    output_dir = _output_dir(args.output, instance_dir)
+    state_path = _state_path(args.state, instance_dir)
+    summary = usage_ledger.load_summary(output_dir)
+    loop_cfg = None
+    if summary is None:
+        try:
+            state = json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            state = None
+        totals = (state or {}).get("usage_totals") if isinstance(state, dict) else None
+        if not totals:
+            print(
+                f"[long-exposure] No usage data at {output_dir / 'usage_summary.json'} "
+                f"or in {state_path}."
+            )
+            return 1
+        ledger = usage_ledger.UsageLedger(totals)
+        summary = ledger.summary_dict()
+    else:
+        rows = dict(summary.get("agents") or {})
+        totals_block = summary.get("totals") or {}
+        rows["_clones"] = {
+            "forks": totals_block.get("forks", 0),
+            "clones": totals_block.get("clones", 0),
+        }
+        ledger = usage_ledger.UsageLedger(rows)
+        budget = summary.get("budget") or {}
+        loop_cfg = {
+            k: budget.get(k) for k in ("max_cost_usd", "max_tool_calls") if budget.get(k)
+        }
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(ledger.render_markdown(loop_cfg=loop_cfg).rstrip())
+    return 0
+
+
 def _print_status(args: argparse.Namespace) -> int:
     instance_dir = resolve_instance_dir(args.instance_dir)
     output_dir = _output_dir(args.output, instance_dir)
@@ -380,6 +428,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("stop", help="Send stop signal")
     sub.add_parser("clear", help="Archive and clear state")
     sub.add_parser("status", help="Print status and latest manager notice")
+    p_usage = sub.add_parser(
+        "usage",
+        help="Print per-agent tokens, tool calls, and cost for the run",
+    )
+    p_usage.add_argument("--json", action="store_true", help="Emit usage_summary.json verbatim")
 
     p_tail = sub.add_parser("tail", help="Print a status/log file")
     p_tail.add_argument("--file", default=None)
@@ -450,6 +503,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "status":
         return _print_status(args)
+    if args.command == "usage":
+        return _print_usage(args)
     if args.command == "tail":
         return _tail(args)
     if args.command == "guide":

@@ -87,6 +87,106 @@ from long_exposure import unified_pool
 from long_exposure import interactive_transport
 from long_exposure import agent_routing
 from auto_compact.db import init_db, store_session
+from long_exposure import usage_ledger as _usage_ledger_mod
+from long_exposure.conductor import _session_turn_tool_calls
+
+# ---------------------------------------------------------------------------
+# Usage ledger + run switches
+# ---------------------------------------------------------------------------
+
+# Per-run usage ledger (tokens, cost, tool calls, turns). Reset or restored
+# from state in run_exploration; fed by _record_usage at every provider
+# call; persisted by save_state; rendered by update_status_file.
+_usage: _usage_ledger_mod.UsageLedger = _usage_ledger_mod.UsageLedger()
+# The active score's `loop:` block, kept for status rendering (budget caps).
+_current_loop_cfg: dict = {}
+
+
+def _env_flag(name: str) -> bool | None:
+    """Parse a boolean env override; None when unset/blank."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _fanout_enabled(loop_cfg: dict | None) -> bool:
+    """Whole-cycle fan-out switch.
+
+    `loop.fanout_enabled` (default true) controls both the researcher-facing
+    `<parallel_cycle_fanout>` guidance and the block parser, so a disabled
+    run never spawns clones even if the model emits a block. The env var
+    `LONG_EXPOSURE_FANOUT=0|1` overrides the score for one launch.
+    """
+    env = _env_flag("LONG_EXPOSURE_FANOUT")
+    if env is not None:
+        return env
+    return bool((loop_cfg or {}).get("fanout_enabled", True))
+
+
+_END_OF_RUN_STAGES = ("final_auditor", "final_reporter", "curator")
+
+
+def _end_of_run_enabled(loop_cfg: dict | None, stage: str) -> bool:
+    """End-of-run pipeline switch for `final_auditor`, `final_reporter`,
+    and `curator`.
+
+    `loop.end_of_run` may be a bool (every stage) or a mapping:
+
+        end_of_run:
+          enabled: true          # master switch
+          final_auditor: true
+          final_reporter: true
+          curator: true
+
+    Applies to the natural end-of-run pass AND the daily-sync re-run.
+    `LONG_EXPOSURE_END_OF_RUN=0` disables all stages for one launch. A stage
+    whose agent is absent from the score is skipped regardless (graceful
+    absence, unchanged).
+    """
+    env = _env_flag("LONG_EXPOSURE_END_OF_RUN")
+    if env is False:
+        return False
+    eor = (loop_cfg or {}).get("end_of_run", True)
+    if isinstance(eor, bool):
+        return eor
+    if not isinstance(eor, dict):
+        return True
+    if not bool(eor.get("enabled", True)):
+        return False
+    return bool(eor.get(stage, True))
+
+
+def _record_usage(
+    agent_name: str,
+    result: dict,
+    *,
+    config: dict | None,
+    model: str | None = None,
+) -> dict:
+    """Fold one agent call into the run ledger and annotate `result` with
+    the cost breakdown so telemetry can carry it. Returns `result`.
+
+    Rate-limit results carry no envelope and are not counted as calls.
+    Never raises.
+    """
+    try:
+        if not isinstance(result, dict) or result.get("status") == "rate_limit":
+            return result
+        if not (result.get("usage") or result.get("cost_usd") is not None):
+            return result
+        added = _usage.record(
+            agent_name,
+            result,
+            provider=_provider.current_provider(),
+            model=model or (config or {}).get("model"),
+            config=config,
+        )
+        result["cost_estimated_usd"] = added["cost_estimated_usd"] or None
+        result["cost_source"] = added["cost_source"]
+    except Exception:
+        pass
+    return result
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -549,6 +649,9 @@ def save_state(path: Path, cycle: int, results: dict, failures: dict,
         # default to the provider active at save time (tracks mid-run
         # unified-pool provider rotation).
         "usage_basis": usage_basis or _provider.current_provider(),
+        # Per-agent usage ledger (tokens, cost, tool calls). Restored on
+        # resume; merged into the root by the fan-out conductor.
+        "usage_totals": _usage.to_dict(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     # Atomic write: temp file + rename prevents corruption on crash
@@ -676,9 +779,11 @@ def _run_daily_sync(
     data_dir: Path,
     agent_sessions: dict,
     agent_summaries: dict,
+    loop_cfg: dict | None = None,
 ) -> str | None:
     """Stage 3: run final auditor → final reporter → curator on a wall-clock
-    cadence (revise mode). Each agent reads its prior outputs and updates
+    cadence (revise mode). Each stage honours `loop.end_of_run` (see
+    `_end_of_run_enabled`). Each agent reads its prior outputs and updates
     them; the curator package gets a timestamp suffix and a
     `<slug>_package_latest.zip` symlink.
 
@@ -695,7 +800,7 @@ def _run_daily_sync(
 
     # 1. Final auditor — best-effort.
     final_auditor_def = agents.get("final_auditor")
-    if final_auditor_def:
+    if final_auditor_def and _end_of_run_enabled(loop_cfg, "final_auditor"):
         try:
             from long_exposure.auditing import _run_final_auditor
             last_session_id = _run_final_auditor(
@@ -716,7 +821,7 @@ def _run_daily_sync(
     # 2. Final reporter — file-gate rescue keeps prior final_report.md if it
     #    fails to assemble.
     final_reporter_def = agents.get("final_reporter")
-    if final_reporter_def:
+    if final_reporter_def and _end_of_run_enabled(loop_cfg, "final_reporter"):
         try:
             last_session_id = _run_final_reporter(
                 final_reporter_def, task, config, results, score_inputs,
@@ -736,7 +841,7 @@ def _run_daily_sync(
     # 3. Curator — pass timestamp_suffix so packages accumulate (latest-symlink
     #    points to the freshest one).
     curator_def = agents.get("curator")
-    if curator_def:
+    if curator_def and _end_of_run_enabled(loop_cfg, "curator"):
         try:
             last_session_id = _run_curator(
                 curator_def, task, config, results, score_inputs,
@@ -1559,6 +1664,12 @@ def _call_exploration_agent(
             "teammates": _count_teammates(session_id, team_turn_start),
         }
 
+    # Tool-call accounting. Codex/Gemini envelopes carry a count; Claude's
+    # does not, so read the current turn of the session transcript.
+    tool_calls = envelope.get("tool_calls")
+    if tool_calls is None and _provider.is_claude() and not interactive:
+        tool_calls = _session_turn_tool_calls(session_id)
+
     return {
         "agent": agent_name,
         "outputs": outputs,
@@ -1567,6 +1678,10 @@ def _call_exploration_agent(
         "status": "ok",
         "error": None,
         "team_stats": team_stats,
+        # Provider-reported dollars (Claude `total_cost_usd`); None elsewhere.
+        "cost_usd": envelope.get("total_cost_usd"),
+        "num_turns": envelope.get("num_turns"),
+        "tool_calls": tool_calls,
     }
 
 
@@ -1605,15 +1720,21 @@ def _call_agent_with_rotation(
         # so this is a single attempt under the agent's pinned provider (no
         # cross-account / cross-provider rotation).
         with agent_routing.agent_provider_context(agent_def, _cfg):
-            return _call_exploration_agent(
-                agent_name=agent_name,
-                agent_def=agent_def,
-                agent_sessions=sessions_dict,
-                **kwargs,
+            return _record_usage(
+                agent_name,
+                _call_exploration_agent(
+                    agent_name=agent_name,
+                    agent_def=agent_def,
+                    agent_sessions=sessions_dict,
+                    **kwargs,
+                ),
+                config=_cfg,
+                model=agent_def.get("model") or _cfg.get("model"),
             )
 
     accounts = _parse_accounts()
     is_forced, _ = _resolve_force_account(accounts)
+    _model = agent_def.get("model") or _cfg.get("model")
 
     if is_forced and (_is_clone() or not (pool.is_active() or unified_pool.is_unified_active())):
         # Pinned clone or manually pinned non-pool run. Single attempt:
@@ -1621,11 +1742,16 @@ def _call_agent_with_rotation(
         # silently rotate away from the operator's chosen account. Root pool
         # pins are different: the pool itself uses FORCE env vars to route
         # calls, so they must remain eligible for pool-aware rotation.
-        return _call_exploration_agent(
-            agent_name=agent_name,
-            agent_def=agent_def,
-            agent_sessions=sessions_dict,
-            **kwargs,
+        return _record_usage(
+            agent_name,
+            _call_exploration_agent(
+                agent_name=agent_name,
+                agent_def=agent_def,
+                agent_sessions=sessions_dict,
+                **kwargs,
+            ),
+            config=_cfg,
+            model=_model,
         )
 
     pool_active = _pool.is_active() or unified_pool.is_unified_active()
@@ -1652,7 +1778,7 @@ def _call_agent_with_rotation(
             **kwargs,
         )
         if result["status"] != "rate_limit":
-            return result
+            return _record_usage(agent_name, result, config=_cfg, model=_model)
         sessions_dict.pop(agent_name, None)
 
         if unified_pool.is_unified_active():
@@ -1857,6 +1983,22 @@ def _compact_agent_session_impl(
         )
         return last_session_id
 
+    # Compaction is a real provider call: account for it under its own key so
+    # the status table shows compaction spend separately from agent turns.
+    _record_usage(
+        f"{agent_name}#compaction",
+        {
+            "usage": envelope.get("usage") or {},
+            "duration_ms": envelope.get("duration_ms", 0),
+            "status": "ok",
+            "cost_usd": envelope.get("total_cost_usd"),
+            "num_turns": envelope.get("num_turns"),
+            "tool_calls": envelope.get("tool_calls"),
+        },
+        config=config,
+        model=agent_config.get("model"),
+    )
+
     # Strip ``` fences and check for non-empty payload. Empty already means
     # the rate-limit / cliFailure path is the right next step — clearing
     # the agent's session id forces a fresh resume on the next cycle.
@@ -2048,13 +2190,20 @@ def _store_agent_output(
 
 
 def update_status_file(output_dir: Path, cycle: int, status: str,
-                       failures: dict) -> None:
-    """Write a simple status file with only deterministic data."""
+                       failures: dict, usage_md: str | None = None) -> None:
+    """Write a simple status file with only deterministic data, plus the
+    per-agent usage table from the run ledger. Also refreshes
+    `usage_summary.json` next to it for machine consumers."""
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
         fail_lines = "\n".join(
             f"- {k}: {v} consecutive" for k, v in failures.items() if v > 0
         ) or "None"
+        if usage_md is None:
+            try:
+                usage_md = _usage.render_markdown(loop_cfg=_current_loop_cfg)
+            except Exception:
+                usage_md = ""
 
         md = (
             f"# Exploration Status\n\n"
@@ -2062,10 +2211,12 @@ def update_status_file(output_dir: Path, cycle: int, status: str,
             f"**Status:** {status}\n"
             f"**Updated:** {datetime.now(timezone.utc).isoformat()[:19]}Z\n\n"
             f"## Failure Tracking\n{fail_lines}\n"
+            + (f"\n{usage_md}" if usage_md else "")
         )
         # Atomic so a concurrent `long-exposure status` never reads a
         # truncated file mid-write.
         _atomic_write_text(output_dir / "exploration_status.md", md)
+        _usage.write_summary(output_dir, loop_cfg=_current_loop_cfg)
     except OSError as e:
         print(f"[long-exposure] Status file write failed: {e}", flush=True)
 
@@ -3252,8 +3403,21 @@ def run_exploration(
     conn = init_db(Path(config["compact_db"]))
 
     loop_cfg = score.get("loop", {})
+    global _current_loop_cfg
+    _current_loop_cfg = loop_cfg
     max_cycles = loop_cfg.get("max_cycles")
     base_cooldown = loop_cfg.get("cycle_cooldown_seconds", 0)
+    fanout_enabled = _fanout_enabled(loop_cfg)
+    if not fanout_enabled:
+        print("[long-exposure] Fan-out: disabled (loop.fanout_enabled / LONG_EXPOSURE_FANOUT)", flush=True)
+    _eor_disabled = [s for s in _END_OF_RUN_STAGES if not _end_of_run_enabled(loop_cfg, s)]
+    if _eor_disabled:
+        print(
+            "[long-exposure] End-of-run pipeline: disabled stages = "
+            + ", ".join(_eor_disabled)
+            + " (loop.end_of_run / LONG_EXPOSURE_END_OF_RUN)",
+            flush=True,
+        )
 
     flow = score["flow"]  # list of agent name strings
     agents = score["agents"]
@@ -3329,6 +3493,8 @@ def run_exploration(
         post_merge_pending = state.get("post_merge_pending", False)
         reanchor_emitted = dict(state.get("_reanchor_emitted") or {})
         agent_context_tokens = dict(state.get("agent_context_tokens") or {})
+        # Usage ledger carries across stop/resume so totals stay cumulative.
+        _usage.load(state.get("usage_totals") or {})
         # Stage 3 §5.3 (crash recovery): if a sync was in flight when the
         # process died, the persisted flag would otherwise stay True and
         # silently disable all future syncs. Always clear on resume; the
@@ -3399,6 +3565,7 @@ def run_exploration(
         post_merge_pending = False
         reanchor_emitted = {}
         agent_context_tokens = {}
+        _usage.load({})  # fresh run: no prior spend
         # Stage 3: daily-sync state. Initialize last_daily_sync_at to "now"
         # so the first sync fires interval-hours after fresh start.
         last_daily_sync_at = datetime.now(timezone.utc).isoformat()
@@ -3571,6 +3738,7 @@ def run_exploration(
     low_output_streak = int(state.get("low_output_streak") or 0) if state else 0
     topic_exhausted = False  # set True when low-output streak or agent signal triggers closure
     max_cycles_reached = False
+    budget_exhausted = False  # set True when loop.max_cost_usd / max_tool_calls is hit
     # Low-output backstop is RELATIVE to the run's own peak cycle output, so it
     # self-calibrates to each branch's structured-output floor instead of a
     # fixed magic number. (A fixed 2000-tok floor failed: idle-but-verbose
@@ -3728,6 +3896,16 @@ def run_exploration(
             max_cycles_reached = True
             break
 
+        # Budget gate (loop.max_cost_usd / loop.max_tool_calls). Checked at
+        # the cycle boundary like max_cycles, so a cap can overshoot by at
+        # most one cycle; treated as a natural end so the end-of-run
+        # pipeline (if enabled) still runs.
+        _budget_reason = _usage.budget_exceeded(loop_cfg)
+        if _budget_reason:
+            print(f"\n[long-exposure] Stopping: {_budget_reason}.", flush=True)
+            budget_exhausted = True
+            break
+
         cycle += 1
         cycle_start = time.monotonic()
         cycle_topic = None  # set by researcher, inherited by worker/auditor
@@ -3801,7 +3979,7 @@ def run_exploration(
         # pool is inactive.
         fanout_guide = (
             None
-            if (_is_clone() or in_post_merge_cycle)
+            if (_is_clone() or in_post_merge_cycle or not fanout_enabled)
             else get_fanout_guidance()
         )
 
@@ -3951,6 +4129,12 @@ def run_exploration(
                         agent_sessions=agent_sessions,
                         agent_summaries=agent_summaries,
                     )
+                _record_usage(
+                    agent_name,
+                    result,
+                    config=config,
+                    model=agent_def.get("model") or config.get("model"),
+                )
                 telemetry.emit_agent_result(
                     agent_name,
                     result,
@@ -4067,7 +4251,7 @@ def run_exploration(
                     # Interactive transport defers parallel fan-out: clones would
                     # each need their own interactive session. Run sequentially.
                     if (agent_name == "researcher" and not _is_clone()
-                            and not _interactive_mode):
+                            and not _interactive_mode and fanout_enabled):
                         _branches = _parse_fanout_block(
                             results.get("research_brief", "")
                         )
@@ -4121,6 +4305,11 @@ def run_exploration(
                                 # barrier_preempt_timeout_seconds).
                                 loop_cfg=loop_cfg,
                             )
+                            # Fold clone spend into the root ledger so the
+                            # status table and budget gates cover the fork.
+                            _usage.note_fork()
+                            for _cu in _fanout.get("clone_usage") or []:
+                                _usage.merge(_cu)
                             telemetry.emit(
                                 "fanout_end",
                                 phase="fanout",
@@ -4532,6 +4721,7 @@ def run_exploration(
                     data_dir=data_dir,
                     agent_sessions=agent_sessions,
                     agent_summaries=agent_summaries,
+                    loop_cfg=loop_cfg,
                 )
             finally:
                 # Always advance — failure mode is "next sync 24h later",
@@ -4834,10 +5024,18 @@ def run_exploration(
             operator_clear_requested = _clear_requested
             should_run_final = _should_run_final_synthesis(
                 topic_exhausted=topic_exhausted,
-                max_cycles_reached=max_cycles_reached,
+                # A budget cap is a natural end-of-run, same as max_cycles.
+                max_cycles_reached=max_cycles_reached or budget_exhausted,
                 stop_requested=operator_stop_requested,
                 clear_requested=operator_clear_requested,
             )
+            for _stage in _END_OF_RUN_STAGES:
+                if should_run_final and agents.get(_stage) and not _end_of_run_enabled(loop_cfg, _stage):
+                    print(
+                        f"[long-exposure] End-of-run: {_stage} skipped "
+                        f"(disabled by loop.end_of_run).",
+                        flush=True,
+                    )
             stop_suppressed_for_final = _clear_stop_flag_for_final_synthesis(
                 should_run_final=should_run_final,
                 stop_requested=operator_stop_requested,
@@ -4854,7 +5052,8 @@ def run_exploration(
             #    reporter can ingest final_audit_summary.json structurally.
             #    Graceful absence: missing agent definition skips this stage.
             final_auditor_def = agents.get("final_auditor")
-            if should_run_final and final_auditor_def:
+            if (should_run_final and final_auditor_def
+                    and _end_of_run_enabled(loop_cfg, "final_auditor")):
                 try:
                     from long_exposure.auditing import _run_final_auditor
                     last_session_id = _run_final_auditor(
@@ -4879,7 +5078,8 @@ def run_exploration(
                     )
 
             final_reporter_def = agents.get("final_reporter")
-            if should_run_final and final_reporter_def:
+            if (should_run_final and final_reporter_def
+                    and _end_of_run_enabled(loop_cfg, "final_reporter")):
                 try:
                     last_session_id = _run_final_reporter(
                         final_reporter_def, task, config, results, score_inputs,
@@ -4900,7 +5100,8 @@ def run_exploration(
                     )
 
             curator_def = agents.get("curator")
-            if should_run_final and curator_def:
+            if (should_run_final and curator_def
+                    and _end_of_run_enabled(loop_cfg, "curator")):
                 try:
                     last_session_id = _run_curator(
                         curator_def, task, config, results, score_inputs,
@@ -4952,6 +5153,10 @@ def run_exploration(
                     if "max_cycles_reached" in locals()
                     else False
                 ),
+                "budget_exhausted": (
+                    budget_exhausted if "budget_exhausted" in locals() else False
+                ),
+                "usage_totals": _usage.totals(),
                 "stop_requested": (
                     operator_stop_requested
                     if "operator_stop_requested" in locals()

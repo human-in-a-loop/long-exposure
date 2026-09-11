@@ -482,6 +482,59 @@ def _session_transcript_text(session_id: str | None) -> str:
     return "\n\n".join(blocks)
 
 
+def _session_turn_tool_calls(session_id: str | None) -> int | None:
+    """Count ``tool_use`` blocks the agent emitted in the CURRENT turn of a
+    Claude session transcript (main thread only; sidechain/subagent entries
+    are skipped, matching ``_session_transcript_text``).
+
+    The ``claude -p`` JSON envelope reports ``num_turns`` (assistant
+    messages) but not tool invocations, so the transcript is the only
+    source. Returns None when the transcript cannot be located, so callers
+    can distinguish "zero tools" from "unknown".
+    """
+    if not session_id:
+        return None
+    try:
+        from .exploration import _claude_config_dir
+        projects = _claude_config_dir() / "projects"
+    except Exception:
+        return None
+    if not projects.is_dir():
+        return None
+    try:
+        for project in projects.iterdir():
+            jsonl = project / f"{session_id}.jsonl"
+            if not jsonl.is_file():
+                continue
+            count = 0
+            found = False
+            with jsonl.open(errors="replace") as fh:
+                for line in fh:
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if obj.get("isSidechain"):
+                        continue
+                    if _is_user_prompt_entry(obj):
+                        count = 0  # new turn
+                        found = True
+                        continue
+                    if obj.get("type") != "assistant":
+                        continue
+                    found = True
+                    content = obj.get("message", {}).get("content")
+                    if isinstance(content, list):
+                        count += sum(
+                            1 for chunk in content
+                            if isinstance(chunk, dict) and chunk.get("type") == "tool_use"
+                        )
+            return count if found else None
+    except OSError:
+        return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Single agent execution
 # ---------------------------------------------------------------------------

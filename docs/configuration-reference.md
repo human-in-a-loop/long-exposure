@@ -441,6 +441,44 @@ flow:                            # cycle order
 | `min_clone_cycles_before_preempt` | `1` | Clones must complete this many cycles before being eligible for graceful preemption. See `parallelism.md`. |
 | `barrier_preempt_timeout_seconds` | `3600` | Backup timer for preemption when no organic exit has happened. |
 | `planned_rotation_min_age_hours` | (defaults to `daily_sync_interval_hours`) | Minimum age of the last rotation before a planned rotation will fire after the next daily sync. Set to a value larger than `daily_sync_interval_hours` to space planned rotations farther apart than syncs. |
+| `fanout_enabled` | `true` | Whole-cycle fan-out switch. `false` removes the `<parallel_cycle_fanout>` guidance from the researcher's live guidance and ignores any block it emits, so no clone processes are spawned. Env override for one launch: `LONG_EXPOSURE_FANOUT=0`. |
+| `end_of_run` | all stages on | Bool or mapping `{enabled, final_auditor, final_reporter, curator}`. Gates the end-of-run pipeline at natural end, `max_cycles`, stop, budget cap, and the daily-sync re-run. A stage that is off is skipped even when its agent is defined. `LONG_EXPOSURE_END_OF_RUN=0` disables all stages for one launch. Note: with `final_reporter` off, the curator has no `## Key Files` section and ships the report-only safety package. |
+| `max_cost_usd` | `null` | Stop when the run's cumulative cost (provider-reported plus `pricing:` estimates) reaches this figure. Checked at cycle boundaries, so it can overshoot by one cycle. Treated as a natural end-of-run (the end-of-run pipeline runs if enabled). |
+| `max_tool_calls` | `null` | Same gate on cumulative tool invocations across every agent call. |
+
+### Usage ledger, cost, and tool counts
+
+Every provider call the harness makes (cycle agents, reporter, final
+auditor/reporter, curator, merge synthesis, compaction) is folded into a
+per-agent ledger: calls, tool calls, turns, input/output/cache tokens, wall
+time, and cost. The ledger is persisted in `exploration_state.json` under
+`usage_totals`, so totals survive stop/resume, and fan-out clone ledgers are
+merged into the root at barrier collapse.
+
+Where the numbers come from:
+
+| Field | Claude (`claude -p`) | Codex | Gemini | local |
+|---|---|---|---|---|
+| tokens | envelope `usage` | `turn.completed` usage | `stats.models` | response usage |
+| `cost_usd` | envelope `total_cost_usd` | not reported | not reported | not reported |
+| `cost_estimated_usd` | never (reported cost wins) | from `pricing:` | from `pricing:` | from `pricing:` |
+| `tool_calls` | `tool_use` blocks in the current turn of the session transcript | completed `item` events other than messages/reasoning | `stats.tools.totalCalls` | 0 |
+| `turns` | envelope `num_turns` | — | — | — |
+
+Read it with:
+
+```bash
+long-exposure status           # includes the "## Usage" table
+long-exposure usage            # the table alone
+long-exposure usage --json     # output/usage_summary.json verbatim
+```
+
+`config.yaml` `pricing:` supplies USD-per-million rates for the estimate
+(`provider -> model -> {input, output, cache_read, cache_write}`; a model
+key may be an exact id, a prefix, or `_default`). Without a row, cost for
+that provider shows as `n/a` and does not count toward `max_cost_usd`.
+Telemetry `agent_call_end` events carry the same per-call fields and
+`telemetry summarize` rolls them up under `cost`.
 
 ### Agent definitions
 

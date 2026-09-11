@@ -45,6 +45,14 @@ Legacy single-session runs use `long_exposure/data/telemetry/`.
 - run start/resume/end metadata
 - cycle start/end, duration, failure counters, low-output counters
 - agent call status, duration, output keys, token usage, and context-window ratio
+- per-call cost and tool accounting on `agent_call_end`: `cost_usd`
+  (provider-reported, Claude `total_cost_usd`), `cost_estimated_usd` (from
+  the config `pricing:` table when the provider reports none),
+  `cost_source` (`provider` | `estimated` | `unavailable`), `tool_calls`,
+  and `num_turns`; `run_end` carries the run's `usage_totals` and a
+  `budget_exhausted` flag. `telemetry summarize` rolls these up under
+  `cost` in `rollups/summary.json`. See `configuration-reference.md`
+  ("Usage ledger, cost, and tool counts") for where each number comes from.
 - provider/model metadata
 - account usage snapshots when available
 - reporter markdown/PDF status

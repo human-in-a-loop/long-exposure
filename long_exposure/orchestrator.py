@@ -3080,6 +3080,7 @@ def _extract_codex_envelope(
     usage = {}
     saw_event = False
     turn_completed = False
+    tool_calls = 0
     for line in (stdout or "").splitlines():
         line = line.strip()
         if not line:
@@ -3100,6 +3101,15 @@ def _extract_codex_envelope(
         elif event.get("type") == "turn.completed":
             turn_completed = True
             usage = event.get("usage") or usage
+        elif event.get("type") == "item.completed":
+            # Tool accounting: every completed item that is not the model's
+            # own prose/reasoning is a tool invocation (command_execution,
+            # file_change, mcp_tool_call, web_search, ...).
+            item = event.get("item") or {}
+            if isinstance(item, dict) and item.get("type") not in (
+                None, "agent_message", "reasoning", "todo_list",
+            ):
+                tool_calls += 1
         elif event.get("type") == "error":
             return {
                 "result": event.get("message") or final_text,
@@ -3132,7 +3142,20 @@ def _extract_codex_envelope(
         "usage": usage,
         "duration_ms": duration_ms,
         "session_id": thread_id,
+        "tool_calls": tool_calls,
     }
+
+
+def _gemini_tool_calls(stats: dict) -> int | None:
+    """Gemini CLI `--output-format json` reports aggregate tool statistics
+    under `stats.tools`. Best-effort; None when the block is absent."""
+    tools = (stats or {}).get("tools")
+    if not isinstance(tools, dict):
+        return None
+    try:
+        return int(tools.get("totalCalls") or tools.get("total_calls") or 0)
+    except (TypeError, ValueError):
+        return None
 
 
 def _flatten_gemini_model_stats(stats: dict) -> dict:
@@ -3175,6 +3198,7 @@ def _extract_gemini_envelope(stdout: str, duration_ms: int) -> dict | None:
         "usage": _flatten_gemini_model_stats(raw.get("stats") or {}),
         "duration_ms": duration_ms,
         "session_id": raw.get("session_id"),
+        "tool_calls": _gemini_tool_calls(raw.get("stats") or {}),
     }
 
 

@@ -2083,6 +2083,20 @@ def _run_fanout_conductor(
         },
     )
 
+    # Usage roll-up: each clone persisted its own per-agent usage ledger in
+    # its state file. Hand the raw dicts back so the root can fold them into
+    # its ledger (usage_ledger.UsageLedger.merge) — the root's status file
+    # and budget gates then cover the whole fork, not just the root process.
+    clone_usage: list[dict] = []
+    for _cd in clone_dirs:
+        try:
+            _st = json.loads((Path(_cd) / "exploration_state.json").read_text())
+        except (OSError, ValueError):
+            continue
+        _u = _st.get("usage_totals") if isinstance(_st, dict) else None
+        if isinstance(_u, dict) and _u:
+            clone_usage.append(_u)
+
     return {
         "aggregated_report": aggregated,
         "divergence_table": divergence_table,
@@ -2090,4 +2104,5 @@ def _run_fanout_conductor(
         "fork_dir": str(fork_dir),
         "clone_dirs": [str(p) for p in clone_dirs],
         "outcomes": outcomes,
+        "clone_usage": clone_usage,
     }

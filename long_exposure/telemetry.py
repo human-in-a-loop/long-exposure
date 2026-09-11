@@ -346,6 +346,14 @@ def emit_agent_result(
                 if result.get("error") is not None else None
             ),
             "error_preview": str(result.get("error") or "")[:300],
+            # Cost/tool accounting (see usage_ledger.py). cost_usd is the
+            # provider-reported figure (Claude `total_cost_usd`);
+            # cost_estimated_usd comes from the config `pricing:` table.
+            "cost_usd": result.get("cost_usd"),
+            "cost_estimated_usd": result.get("cost_estimated_usd"),
+            "cost_source": result.get("cost_source"),
+            "tool_calls": result.get("tool_calls"),
+            "num_turns": result.get("num_turns"),
         }
         if context_window:
             context_tokens = _context_tokens_from_usage(usage)
@@ -433,12 +441,21 @@ def summarize(
         by_provider = Counter(str(ev.get("provider")) for ev in events if ev.get("provider") is not None)
         cycles = [ev.get("cycle") for ev in events if isinstance(ev.get("cycle"), int)]
         usage = Counter()
+        cost = {"cost_usd": 0.0, "cost_estimated_usd": 0.0, "tool_calls": 0, "num_turns": 0}
         context_max = {"ratio": 0.0, "tokens": 0, "agent": None, "cycle": None}
         for ev in events:
             data = ev.get("data") or {}
             u = data.get("usage") if isinstance(data, dict) else None
             if isinstance(u, dict):
                 usage.update(_usage_counter(u))
+            if isinstance(data, dict) and ev.get("event_type") == "agent_call_end":
+                for key in ("cost_usd", "cost_estimated_usd"):
+                    try:
+                        cost[key] += float(data.get(key) or 0.0)
+                    except (TypeError, ValueError):
+                        pass
+                cost["tool_calls"] += _safe_int(data.get("tool_calls"))
+                cost["num_turns"] += _safe_int(data.get("num_turns"))
             if isinstance(data, dict):
                 ratio = data.get("context_ratio")
                 if isinstance(ratio, (int, float)) and ratio >= context_max["ratio"]:
@@ -467,6 +484,12 @@ def summarize(
             "by_agent": dict(sorted(by_agent.items())),
             "by_provider": dict(sorted(by_provider.items())),
             "usage": {k: v for k, v in sorted(usage.items()) if v},
+            "cost": {
+                "cost_usd": round(cost["cost_usd"], 6),
+                "cost_estimated_usd": round(cost["cost_estimated_usd"], 6),
+                "tool_calls": cost["tool_calls"],
+                "num_turns": cost["num_turns"],
+            },
             "context": {
                 "max_ratio": context_max["ratio"],
                 "max_tokens": context_max["tokens"],
