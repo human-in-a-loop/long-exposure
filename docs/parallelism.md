@@ -199,9 +199,20 @@ The backup timer `barrier_preempt_timeout_seconds` (default 3600s)
 fires preemption when *all* clones are slow and no organic exit has
 happened yet. Both knobs are in `exploration-score.yaml:loop`.
 
-Hard-kill escalation if the clone ignores the graceful-stop signal:
-SIGTERM after 120s grace → SIGKILL after a further 10s, sent to the
-clone's process group.
+**Both triggers require idle pool capacity.** `_should_preempt_barrier`
+returns early unless a provider pool is active *and* at least one account
+is cold — preemption exists to hand a stalled branch's slot to waiting
+work, so with no pool (the single-account default) neither the primary
+trigger nor the backup timer ever fires, and the barrier waits for organic
+exit or the 10h fan-out cap. The capacity check also reads only the active
+provider's pool, so a unified one-account-per-provider deployment does not
+preempt either (`docs/gaps.md`).
+
+Hard-kill escalation applies at the **10h fan-out cap and at post-merge
+cleanup**: SIGTERM to the clone's process group, then SIGKILL after a
+grace period. Graceful preemption itself only writes the stop file and
+does not escalate, so a clone wedged inside a provider call holds the
+barrier until the cap (`docs/gaps.md`, RCA item 4 cluster).
 
 ### Merge synthesis
 

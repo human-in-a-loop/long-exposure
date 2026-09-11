@@ -46,6 +46,27 @@ def _cmd_list(args) -> int:
     return 0
 
 
+# Per-format "this is probably a blank canvas" floors, in bytes. Raster
+# formats carry a palette/compression preamble, so a real plot is always a
+# few KB. Vector formats are text: a correct single-panel SVG or PDF can be
+# a few hundred bytes, so a flat 1 KB floor failed legitimate output.
+_MIN_PLAUSIBLE_BYTES = {
+    ".png": 1024,
+    ".jpg": 1024,
+    ".jpeg": 1024,
+    ".webp": 1024,
+    ".gif": 1024,
+    # A real single-panel SVG can be under 200 bytes; the floor only has to
+    # exceed an empty root element (`<svg/>` is 6 bytes, a bare
+    # xmlns-only stub ~46) so blank canvases are still caught.
+    ".svg": 120,
+    ".pdf": 400,
+    ".eps": 400,
+    ".ps": 400,
+}
+_DEFAULT_MIN_BYTES = 120
+
+
 def _cmd_check(args) -> int:
     """Quick post-render sanity check: file exists, non-trivial size,
     plausible image dimensions if it parses as an image format we know.
@@ -55,15 +76,16 @@ def _cmd_check(args) -> int:
         print(f"[figure check] missing: {target}", file=sys.stderr)
         return 2
     size = target.stat().st_size
-    if size < 1024:
-        # 1 KB floor catches "blank canvas" outputs (mostly headers, no content).
+    floor = _MIN_PLAUSIBLE_BYTES.get(target.suffix.lower(), _DEFAULT_MIN_BYTES)
+    if size < floor:
+        # Catches "blank canvas" outputs (mostly headers, no content).
         print(
             f"[figure check] WARNING {target} suspiciously small "
-            f"({size} bytes)",
+            f"({size} bytes; expected at least {floor} for {target.suffix or 'this format'})",
             file=sys.stderr,
         )
         return 1
-    print(f"[figure check] {target} OK ({size // 1024} KB)", flush=True)
+    print(f"[figure check] {target} OK ({size:,} bytes)", flush=True)
     return 0
 
 

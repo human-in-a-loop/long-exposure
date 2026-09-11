@@ -356,7 +356,7 @@ Walks the workspace and surfaces:
   instead of `reports/cycles/`).
 - Scripts at root.
 - Large binaries at root.
-- Stale-looking files outside `stale/`.
+- Images under `tools/` or `docs/` (figures belong beside their data).
 
 Allowlist for root: `MANIFEST.md`, `STRUCTURE.md`, `plan_of_record.md`,
 and `promise_ledger.jsonl`. Final report artifacts live under
@@ -364,11 +364,16 @@ and `promise_ledger.jsonl`. Final report artifacts live under
 Legacy root-stage artifacts are reported as notes during the layout
 transition.
 
-The validator scopes orphan detection to managed paths only:
-standard folders + domain folders declared in STRUCTURE.md +
-allowlisted root files. Explicitly excludes `.venv/`, `.git/`,
-`stale/`, gitignored paths, and any directory STRUCTURE.md tags as
-"External".
+Orphan detection (in `promise_check`, not `org_check`) scopes to a fixed
+tuple of managed folders — `reports/`, `scripts/`, `tests/`, `data/`,
+`docs/`, `tools/` — plus the allowlisted root files. Two caveats about
+what the validators actually do:
+
+- Neither validator parses `STRUCTURE.md`. `org_check` only checks that
+  the file exists, so a domain folder declared there is not added to the
+  managed set and an "External" tag has no effect.
+- There is no stale-file detection. Files outside `stale/` are never
+  flagged as stale-looking; only the placement rules above are checked.
 
 ### Frontmatter not enforced (deliberate)
 

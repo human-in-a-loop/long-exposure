@@ -128,20 +128,28 @@ null-harness baseline: the same model, the same tools, no long-exposure.
 These matter because a benchmark report has to describe the system that
 actually ran.
 
-| Documented behaviour | What the code does | Evidence |
+| Documented behaviour | Status | Resolution |
 |---|---|---|
-| Every call gets a four-layer prompt with proximity-ranked "gems" from `sessions.db` (`docs/architecture-overview.md`, `docs/persistence-and-gems.md`) | Cycle agents get layers 1–3 plus the role block only. `_compute_gems` is called solely from the standalone REPL and its compaction path. No `gems_xml` is ever passed on the harness path. | `exploration.py:1339` vs `orchestrator.py:3923-3980, 4223, 4563` |
-| Compaction produces a depth-aware XML summary with a `<catalog>` and up to 5 retries on malformed XML | Harness compaction stores a plain-text summary with hard-coded `topic="Context Summary"`, and does not retry | `exploration.py:1880-1883, 1900-1914` |
-| Branchial entropy and branch-novelty scoring rank recent topics | Both compute over rows whose topic is mostly "Context Summary" or a heading regex, so the signal is largely noise | `branchial.py:74-80`, `branchial_budget.py:58-64` |
-| Preemption backup timer is the "last line of defense" when all clones are stuck | It is gated behind `pool.is_active()` and a cold account; unreachable on a single account | `fanout.py:1417-1426, 1454-1462`; acknowledged in `docs/gaps.md` |
-| `disable_tools` maps to `--disallowedTools all` | Conductor uses `--tools ""`; the cycle path ignores the key | `orchestrator.py:3553-3571` |
-| Health events log silent fallbacks for a run | Root runs drop them unless `AGENT_INSTANCE_DIR` is exported; only clones set it | `health_events.py:40-51`, `fanout.py:1075` |
-| `agent_routing.py` docstring: template ships every agent at `xhigh` | `config.yaml` ships high/medium | `agent_routing.py:51-55`, `config.yaml:376-384` |
-| Final auditor stage count is capped at N=5 (`_N_MAX`, score comment "capped at 5, range [4, 12]") | `n = max(1, input_tokens // 20_000)` with no cap; `_N_MAX` is dead. 1 M tokens of inputs → ~102 auditor stages | `auditing.py:84, 187-195` |
-| End-of-run docs describe `_lookup_existing_lesson` cross-run lesson merging | Function does not exist; code marks merge as a future enhancement | `docs/end-of-run-pipeline.md:503-510`, `auditing.py:429-433` |
-| Explore/document rescues overwrite the stage file | They append, so a re-run document stage with an unchanged file grows `final_audit_report.md` | `auditing.py:340-345` |
-| `final_audit_summary.json` key `wall_cap_hit` | Code writes and reads `wall_cap_exceeded`; documented schema also omits `figure_coverage`, `lessons_emitted` | `auditing.py:1017`, `reporting.py:236` |
-| `org_check` honours domain folders declared in `STRUCTURE.md` and detects stale files | `org_check.py` only checks that `STRUCTURE.md` exists; `promise_check` walks a fixed folder tuple; no stale-file detection exists | `org_check.py:149-151`, `promise_check.py:512` |
+| Every call gets a four-layer prompt with proximity-ranked "gems" from `sessions.db` | Was wrong | Docs now scope gems, layer-4 summaries, XML retry, depth compression and catalog extraction to the standalone REPL, and describe what the cycle loop sends (`persistence-and-gems.md`, `architecture-overview.md`, `config.yaml`) |
+| Compaction produces a depth-aware XML summary with a `<catalog>` and up to 5 retries | Was wrong | Same: "Two compaction paths" in `persistence-and-gems.md` |
+| Branchial entropy and branch-novelty scoring rank recent topics | Still weak | Documented as a weak signal: harness compaction rows all carry `topic="Context Summary"` |
+| Preemption backup timer is the "last line of defense" when all clones are stuck | Was wrong | `parallelism.md` now states both triggers need idle pool capacity (so neither fires on a single account) and that hard-kill escalation belongs to the 10h cap and post-merge cleanup, not preemption |
+| `disable_tools` maps to `--disallowedTools all` | Was wrong | `configuration-reference.md` documents `--tools ""`, conductor-path only, and points cycle agents at an empty `allowed_tools` |
+| Health events log silent fallbacks for a run | **Fixed in code** | `run_exploration` calls `health_events.configure(data_dir)`; root runs now write the log |
+| `agent_routing.py` docstring: template ships every agent at `xhigh` | Was wrong | Docstring now describes `DEFAULT_EFFORT` as the unknown-value fallback and points at the per-role template |
+| Final auditor stage count is capped at N=5; `_N_MAX` was dead | **Fixed in code** | Cap restored; threshold raised to 100k tokens so N=1 at typical volume, 5 at 500k. The reporter keeps a floor of 1 and stays uncapped |
+| End-of-run docs describe `_lookup_existing_lesson` cross-run lesson merging | Was wrong | `end-of-run-pipeline.md` marks cross-run merging as not implemented and describes the within-pass dedup that does happen |
+| Explore/document rescues overwrite the stage file | Was wrong | Documented as appending, with the under-200-char and would-shrink refusals |
+| `final_audit_summary.json` key `wall_cap_hit` | Was wrong | Schema corrected to `wall_cap_exceeded` plus `lessons_emitted` and `figure_coverage` |
+| `org_check` honours `STRUCTURE.md` domain folders and detects stale files | Was wrong | `workspace-conventions.md` states neither validator parses `STRUCTURE.md` and there is no stale-file detection; orphan scoping is a fixed folder tuple in `promise_check` |
+| Stale run banner (`exploration.stop|clear`) and a score comment referencing a `vm-startup.sh` that is not in the repo | **Fixed in code** | Banner prints the current signal names; score comment describes the adaptive cooldown |
+| `health_events.py` kind list named four events no call site emits | **Fixed in code** | List regenerated from the call sites, grouped by subsystem |
+
+Also fixed in code while here: interactive-only guidance (slash commands,
+"ask the user"), the REPL-only context-gems section, Wolfram guidance with
+no kernel configured, and one operator's machine paths are no longer
+injected into headless agent prompts; `prompt_toolkit` is imported lazily;
+`figure check` uses per-format size floors.
 
 ### 3.3 Blockers for plugging into a benchmark harness
 

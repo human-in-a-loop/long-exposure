@@ -48,9 +48,11 @@ AGENT_TYPES = (
     "curator",
 )
 
-# Canonical effort vocabulary is Claude's, ordered low -> high. The default
-# template ships every agent at ``xhigh`` (Claude Code's default; best for
-# agentic/coding work on Opus 4.8 / Fable 5 / Sonnet 5).
+# Canonical effort vocabulary is Claude's, ordered low -> high.
+# ``DEFAULT_EFFORT`` below is only the fallback for an unrecognised value;
+# the shipped config.yaml `agent_models` template routes each role at its
+# preset effort (high for researcher / worker / auditor / final_auditor /
+# manager, medium for reporter / final_reporter / curator).
 CANONICAL_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_EFFORT = "xhigh"
 

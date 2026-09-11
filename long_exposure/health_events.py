@@ -15,18 +15,35 @@ The log is intentionally not part of the control plane — it's pure
 observability. If the file is corrupt, missing, or unwritable, the run
 continues identically.
 
-Sites that should record events (each name is a stable `kind` string):
-  - `input_unavailable`         conductor input fallback ([UNAVAILABLE])
-  - `topic_extract_failed`      _extract_topic regex returned None
-  - `verdict_extract_failed`    _extract_verdict regex returned default
-  - `compaction_empty_summary`  model returned empty/whitespace summary
-  - `compaction_xml_invalid`    XML parse failed; about to retry
-  - `compaction_xml_unrecoverable`  all retries exhausted; stored as-is
-  - `file_gate_rescue`          report stage rescued from [OUTPUT] block
-  - `pdf_render_failed`         pandoc/tectonic returned non-zero
-  - `account_state_save_failed` OSError on _save_account_state
-  - `pool_slot_repair`          slot leak detected and reclaimed
-  - `fork_metadata_unparsed`    post-merge brief regex fell back to fid=unknown
+Kinds emitted today (each name is a stable `kind` string; keep this list
+in sync when adding a call site — it is the only index of what can appear
+in the log):
+
+  Agent turns and compaction
+  - `input_unavailable`             conductor input fallback ([UNAVAILABLE])
+  - `compaction_empty_summary`      model returned empty/whitespace summary
+  - `compaction_xml_invalid`        XML well-formedness check failed
+  - `compaction_xml_unrecoverable`  REPL retries exhausted; stored as-is
+  - `checkpoint_empty_summary`      REPL checkpoint produced nothing
+  - `checkpoint_xml_invalid`        REPL checkpoint XML malformed
+
+  End-of-run stages
+  - `file_gate_rescue`              stage rescued from the [OUTPUT] block
+  - `file_gate_rescue_failed`       rescue write itself failed
+  - `file_gate_rescue_refused`      rescue declined (too short / would shrink)
+  - `pdf_render_failed`             pandoc/tectonic returned non-zero
+
+  Accounts, pool and rotation
+  - `account_state_save_failed`     OSError on _save_account_state
+  - `account_mismatch_drop`         clone session dropped (account changed)
+  - `out_of_cycle_rotation`         rotation from an out-of-cycle agent
+  - `planned_rotation`              24h planned primary rotation fired
+  - `planned_rotation_skipped`      planned rotation skipped (too recent)
+  - `reporter_skipped_cooling`      reporter skipped; pinned account cooling
+  - `usage_recording_failed`        pool usage write failed
+  - `pool_clone_bootstrap_skipped`  clone slot bootstrap skipped
+  - `pool_clone_self_retag_missed`  clone slot retag did not apply
+  - `codex_clone_session_drop`      Codex thread id not inherited by a clone
 """
 
 from __future__ import annotations

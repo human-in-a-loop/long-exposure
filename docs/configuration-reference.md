@@ -527,12 +527,18 @@ agents:
     cli_timeout: 36000               # 10h; override config.yaml
     mcp: true                        # connect to MCP search server
     agent_teams: true                # enable agent-teams (gated by master switch)
-    disable_tools: false             # if true, claude -p --disallowedTools all
+    disable_tools: false             # if true, claude -p --tools "" (conductor path only)
     inputs: [directive, research_brief, live_guidance, plan_of_record, promise_ledger_summary]
     outputs: [work_output]
     role: |
       <role text — agent's prompt body>
 ```
+
+`disable_tools` is honoured by the **conductor** path
+(`python -m long_exposure.conductor`, which runs a score once) and maps to
+`claude -p --tools ""`, a read-only Codex sandbox, or Gemini
+`--approval-mode plan`. The cycle loop does not read it; to run a cycle
+agent without tools, give it an empty `allowed_tools` list instead.
 
 Custom philosophy / framework can be set per-agent:
 

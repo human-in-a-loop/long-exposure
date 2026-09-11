@@ -26,7 +26,7 @@ Regression: {regression_policy}
   one_step: May go back exactly one stage. Further regression requires
             passing back through each intermediate stage.
   any:      May regress to any prior stage directly, with justification.
-  none:     No backward movement. If blocked, ask the user for guidance.
+  none:     No backward movement. If blocked, stop and report the blocker.
 
 Skipping: {skip_policy}
 

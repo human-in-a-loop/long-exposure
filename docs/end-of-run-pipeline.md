@@ -173,9 +173,21 @@ record of the same content. Schema:
   ],
   "findings": {"CRITICAL": N, "MODERATE": N, "MINOR": N},
   "reconciliation_events_emitted": N,
-  "promise_check_status": "green|red"
+  "promise_check_status": "green|red|unknown",
+  "lessons_emitted": ["<slug>"],
+  "wall_cap_exceeded": true,
+  "figure_coverage": {
+    "figures_present": N, "figures_in_ledger": N,
+    "milestones_with_figures": N, "milestones_without_figures": N,
+    "missing_figures": ["<path>"], "orphan_figures": ["<path>"]
+  }
 }
 ```
+
+Note the key is `wall_cap_exceeded` (the *input* the harness passes to the
+agents is separately named `wall_cap_hit`). The harness synthesizes
+`figure_coverage` when the agent omits it; the agent's own richer
+assessment wins when present.
 
 ### Reconciliation events
 
@@ -200,8 +212,13 @@ failed to write the expected file:
 
 - For body stages (verify / test): appends content to a draft file
   if it exists, else writes anew.
-- For boundary stages (explore / document): overwrites the target
-  file.
+- For boundary stages (explore / document): **appends** to the target
+  file when one already exists, else writes anew. A re-run whose
+  document stage leaves the file untouched therefore grows
+  `final_audit_report.md` rather than replacing it. The rescue is also
+  refused outright when the extracted content is under 200 characters
+  or the file on disk is more than twice its size, so a stub never
+  overwrites a real report.
 - Sets `pending_rescue_warning` so the next stage is told to verify
   and re-write if needed.
 - Logs an off-nominal event (`file_gate_rescue` in
@@ -499,15 +516,22 @@ Hard cap per run: `max(1, ceil(total_cycles / 3))`. Hybrid enforcement
 — soft-guidance asks the agent to rank candidates and emit only top
 N, harness truncates if the agent emits more.
 
-### Cross-run merging
+### Cross-run merging (not implemented)
 
-When the final auditor's document stage emits a lesson, it first
-calls `_lookup_existing_lesson(slug)`. If the slug exists:
+Lessons are committed as new `record_type="lesson"` rows; there is no
+slug lookup or merge. A lesson whose slug already exists from an earlier
+run is stored alongside the old one, and `search_sessions` returns both.
+The intended design below is a future enhancement (`auditing.py` marks it
+as such), not current behaviour:
 
 - **New evidence agrees**: append `evidence_runs`, leave content.
 - **New evidence contradicts**: mark prior as superseded, write new.
 - **Slug collision** (different topic, same slug): disambiguate by
   appending domain.
+
+Deduplication that *does* happen today is within a single pass: the
+document stage drops duplicate slugs before committing, and the harness
+caps the number committed.
 
 ### MCP filter
 

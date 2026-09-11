@@ -53,7 +53,7 @@ citations: |
 
 loop:
   max_cycles: null               # null = unlimited (stop with Ctrl+C)
-  cycle_cooldown_seconds: 400    # pause between cycles (overridden per-tier by vm-startup.sh)
+  cycle_cooldown_seconds: 400    # pause between cycles (2x on failure streaks)
   report_interval: 3             # reporter generates a report every N cycles
   # Stage 3: wall-clock cadence for end-of-run agents (final auditor + final
   # reporter + curator) running mid-run in revise mode. 0 disables; 24h is

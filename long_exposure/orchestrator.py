@@ -32,9 +32,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import InMemoryHistory
-from prompt_toolkit.key_binding import KeyBindings
+
+# prompt_toolkit is imported lazily inside `run_loop` (the interactive REPL,
+# the only consumer). At module scope it cost every importer ~0.6 s and 115
+# submodules — the CLI (`status`, `stop`, `guide`), each cron manager poll,
+# and every fan-out clone spawn — none of which show a prompt. It stays a
+# declared dependency, so `uv sync` still gives a working REPL.
 
 from auto_compact.db import (
     count_sessions,
@@ -1771,6 +1774,80 @@ def build_stage_transition_block(user_gate_approval: bool) -> str:
     )
 
 
+_SESSION_COMPLETION_BLOCK = """== SESSION COMPLETION ==
+
+When you have finished the user's task:
+1. Tell the user the task is complete and summarize what was accomplished.
+2. Instruct the user to type /complete to save the session and exit.
+
+The /complete command triggers a session save (compaction) before exiting,
+ensuring all work is captured for future session continuity. The user may
+also type quit or exit, which will also save the session automatically.
+
+The /clear command saves the current session and resets to a blank context.
+Previous sessions remain in the database and are searchable via the
+search_sessions tool.
+
+Do NOT run /complete or /clear yourself — they are user-typed commands.
+
+"""
+
+_CONTEXT_GEMS_BLOCK = """== CONTEXT GEMS ==
+
+When resuming from a compaction, you may receive pre-ranked context gems —
+pointers to past sessions that scored highest for relevance to your current
+work. These are computed automatically from session catalog metadata.
+
+If gems are present in your system prompt:
+1. Glance through them before starting work. They are brief.
+2. If a gem is directly relevant, fetch the full session with
+   search_sessions_by_id(session_id) before proceeding.
+3. Do not spend more than one checkpoint of budget reviewing gems.
+
+At compaction time, you will produce a <catalog> section in your session
+summary with topic, subtopic, tools, and keywords. Be consistent with
+these tags across sessions to improve future gem accuracy.
+
+"""
+
+_WOLFRAM_BLOCK_TEMPLATE = """
+== WOLFRAM EXECUTION ==
+
+Wolfram kernel: {wolfram_path}
+
+Run individual .wls scripts via Bash:
+  {wolfram_path} -script <file.wls>
+
+<tool-guidance>
+<wolfram>Use for all scientifically complex computation: symbolic math, numerical simulation, differential equations, optimization, data analysis.</wolfram>
+<python>Use only for plotting/figure rendering (matplotlib), simple data checks, and non-scientific code. Use wolframclient to pass computed data from Wolfram to Python for visualization.</python>
+<critical>Wolfram Engine cannot render graphics — never call Export with Plot/Graphics objects. Compute data in Wolfram, export as CSV, then plot in Python.</critical>
+</tool-guidance>
+
+{test_runner_block}
+
+After writing or modifying any .wls library or test file, always run the
+relevant test to verify correctness before reporting completion.
+
+"""
+
+
+def _build_wolfram_block(config: dict) -> str:
+    """Wolfram guidance, only when a kernel is configured.
+
+    `wolfram_path: ""` means the deployment has no Wolfram; emitting the
+    section anyway spent tokens on every turn and invited agents to try a
+    binary that is not there.
+    """
+    wolfram_path = (config.get("wolfram_path") or "").strip()
+    if not wolfram_path:
+        return ""
+    return _WOLFRAM_BLOCK_TEMPLATE.format(
+        wolfram_path=wolfram_path,
+        test_runner_block=_build_test_runner_block(config),
+    )
+
+
 def _build_test_runner_block(config: dict) -> str:
     """Return the test runner instructions if configured."""
     test_runner = config.get("test_runner", "")
@@ -1804,7 +1881,8 @@ def build_anti_patterns_block(enabled: bool) -> str:
         '  Symptom: You regress from execute to plan, plan to explore, explore\n'
         '  produces a new plan, execute fails, regress again. Looping.\n'
         '  Fix: On your second regression in the same session, STOP. Emit a\n'
-        '  checkpoint stating what is fundamentally unclear. Ask the user.\n'
+        '  checkpoint stating what is fundamentally unclear, and report that\n'
+        '  blocker in your output rather than regressing again.\n'
         '\n'
         '"The Gold Plate"\n'
         '  Symptom: Solution works but you keep improving. You\'re in execute\n'
@@ -2074,8 +2152,15 @@ def assemble_system_prompt(
     session_summary: dict | None = None,
     role: str | None = None,
     gems_xml: str | None = None,
+    interactive_repl: bool = False,
 ) -> str:
-    """Build the full system prompt from templates and config."""
+    """Build the full system prompt from templates and config.
+
+    `interactive_repl=True` adds the guidance that only makes sense when a
+    human is typing at the prompt (the /complete and /clear commands, "ask
+    the user" for out-of-scope files). Conductor agent turns are headless
+    and leave it False.
+    """
     prompt_parts = []
 
     # --- Layer 1: Philosophy ---
@@ -2151,6 +2236,24 @@ def assemble_system_prompt(
         "wolfram_path": config.get("wolfram_path", ""),
         "working_directory": config.get("working_directory", ""),
         "test_runner_block": _build_test_runner_block(config),
+        # Interactive-only guidance. A headless conductor turn has no user
+        # to type /complete or /clear and no one to ask about a file, so
+        # this text is emitted for the interactive REPL only.
+        "session_completion_block": (
+            _SESSION_COMPLETION_BLOCK if interactive_repl else ""
+        ),
+        "missing_info_sentence": (
+            "If you need information from these paths to complete a task, "
+            "ask the user rather than reading the files directly."
+            if interactive_repl else
+            "If a task appears to need information from these paths, record "
+            "that limitation in your output and proceed without it — there "
+            "is no interactive user to ask."
+        ),
+        # Gems are injected on the REPL path only; without them the block
+        # describes a feature the agent will never see.
+        "context_gems_block": _CONTEXT_GEMS_BLOCK if gems_xml else "",
+        "wolfram_block": _build_wolfram_block(config),
     }
 
     prompt_parts.append(fill_simple_vars(protocol_template, protocol_vars))
@@ -4289,7 +4392,9 @@ def compact_with_conditioning(
     # Compute context gems for the new session
     gems_xml = _compute_gems(config, conn, current_catalog=catalog, exclude_id=session_id)
 
-    new_system_prompt = assemble_system_prompt(config, new_session, gems_xml=gems_xml)
+    new_system_prompt = assemble_system_prompt(
+        config, new_session, gems_xml=gems_xml, interactive_repl=True,
+    )
     new_conversation = []  # Fresh — all context is in the system prompt now
     new_parent_id = session_id
 
@@ -4420,6 +4525,20 @@ def run_loop(
     mcp_config_path: str | None,
 ) -> None:
     """Run the main conversation loop via Claude CLI."""
+    # Lazy import: this is the only consumer of prompt_toolkit, and a
+    # module-scope import made every headless entry point pay for it.
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.history import InMemoryHistory
+        from prompt_toolkit.key_binding import KeyBindings
+    except ImportError as e:  # pragma: no cover - install-time condition
+        raise SystemExit(
+            "The interactive session needs prompt_toolkit, which is a declared "
+            f"dependency but is not importable here ({e}). Run `uv sync` (or "
+            "`pip install prompt_toolkit`) and retry. Headless "
+            "`long-exposure` runs do not need it."
+        )
+
     conversation: list[dict] = []
     checkpoint_logged = False  # Reset after each compaction
     permission_flags = add_mcp_tool_flags(build_allowed_tools_flags(config))
@@ -4480,7 +4599,9 @@ def run_loop(
         # Handle /clear — save current work, then reset to fresh session
         if user_input.strip().lower() == "/clear":
             _save_session_on_exit(config, conn, conversation, depth, parent_id, reason="clear")
-            system_prompt = assemble_system_prompt(config, session_summary=None)
+            system_prompt = assemble_system_prompt(
+                config, session_summary=None, interactive_repl=True,
+            )
             conversation = []
             depth = 0
             parent_id = None
@@ -4630,11 +4751,15 @@ def main():
         }
         gems_xml = _compute_gems(config, conn, current_catalog=current_catalog,
                                  exclude_id=latest_session["id"])
-        system_prompt = assemble_system_prompt(config, latest_session, gems_xml=gems_xml)
+        system_prompt = assemble_system_prompt(
+            config, latest_session, gems_xml=gems_xml, interactive_repl=True,
+        )
         depth = latest_session["depth"] + 1
         parent_id = latest_session["id"]
     else:
-        system_prompt = assemble_system_prompt(config, session_summary=None)
+        system_prompt = assemble_system_prompt(
+            config, session_summary=None, interactive_repl=True,
+        )
         depth = 0
         parent_id = None
 

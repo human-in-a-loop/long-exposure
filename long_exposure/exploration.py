@@ -3891,7 +3891,11 @@ def run_exploration(
         f"post-merge, and clone cycles) | Ctrl+C to stop",
         flush=True,
     )
-    print(f"[long-exposure] Signals: touch {data_dir}/exploration.stop|clear", flush=True)
+    print(
+        f"[long-exposure] Signals: touch {data_dir}/long-exposure.stop|clear|guide"
+        " (legacy exploration.* names still accepted)",
+        flush=True,
+    )
     print("=" * 60, flush=True)
 
     # One-shot override: when set, skip the cycle loop entirely and go
