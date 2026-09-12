@@ -544,15 +544,17 @@ class FinalStageCountTests(unittest.TestCase):
         self.assertEqual(_final_auditor_stage_count(10**9), (5, 12))
 
     def test_reporter_stage_count_is_floored_and_uncapped(self):
-        from long_exposure.limits import FINAL_STAGE_TOKEN_THRESHOLD as T
+        """Exercises reporting.py itself — re-implementing the formula in
+        the test made this pass no matter what the reporter did, and the
+        auditor-caps/reporter-does-not asymmetry is the whole point."""
+        from long_exposure.reporting import _final_report_stage_count as body
 
-        def num_body(tokens):  # mirrors reporting.py:_run_final_reporter
-            return max(1, tokens // T)
-
-        self.assertEqual(num_body(0), 1)
-        self.assertEqual(num_body(99_999), 1)
-        self.assertEqual(num_body(1_000_000), 10)
-        self.assertEqual(num_body(10_000_000), 100)
+        self.assertEqual(body(0), (1, 3))
+        self.assertEqual(body(99_999), (1, 3))
+        self.assertEqual(body(100_000), (1, 3))
+        self.assertEqual(body(1_000_000), (10, 12))
+        # Uncapped, unlike the auditor's _N_MAX=5.
+        self.assertEqual(body(10_000_000), (100, 102))
 
 
 class HealthEventsRoutingTests(unittest.TestCase):
@@ -708,16 +710,33 @@ class StageIoSharedHelperTests(unittest.TestCase):
     """reporting.py and auditing.py must use one implementation."""
 
     def test_aliases_point_at_the_shared_module(self):
+        """Each module's private alias must BE the shared function, never a
+        re-implementation. Only aliases with live call sites are kept, so
+        this also fails if someone reintroduces a local copy."""
         from long_exposure import auditing, reporting, stage_io
-        for name, shared in (
-            ("_file_signature", stage_io.file_signature),
-            ("_atomic_write_text", stage_io.atomic_write_text),
-            ("_marker_metadata", stage_io.marker_metadata),
-            ("_committed_baseline", stage_io.committed_baseline),
-            ("_write_run_mode", stage_io.write_run_mode),
+        shared_by_name = {
+            "_file_signature": stage_io.file_signature,
+            "_atomic_write_text": stage_io.atomic_write_text,
+            "_committed_baseline": stage_io.committed_baseline,
+            "_write_run_mode": stage_io.write_run_mode,
+        }
+        for mod, names in (
+            (reporting, ("_file_signature", "_atomic_write_text",
+                         "_committed_baseline", "_write_run_mode")),
+            (auditing, ("_file_signature", "_committed_baseline",
+                        "_write_run_mode")),
         ):
-            self.assertIs(getattr(reporting, name), shared, name)
-            self.assertIs(getattr(auditing, name), shared, name)
+            for name in names:
+                self.assertIs(getattr(mod, name), shared_by_name[name],
+                              f"{mod.__name__}.{name}")
+        # Neither module may define its own copy of a stage_io primitive.
+        for mod in (reporting, auditing):
+            for name in ("file_signature", "atomic_write_text",
+                         "marker_metadata", "committed_baseline"):
+                local = getattr(mod, name, None)
+                if local is not None:
+                    self.assertIs(local, getattr(stage_io, name),
+                                  f"{mod.__name__}.{name}")
 
     def test_atomic_write_is_unique_per_process_and_cleans_up(self):
         from long_exposure import stage_io
@@ -727,9 +746,42 @@ class StageIoSharedHelperTests(unittest.TestCase):
             self.assertEqual(target.read_text(), "body")
             stage_io.atomic_write_text(target, "replaced")
             self.assertEqual(target.read_text(), "replaced")
-            # No temp residue, and the temp name would have ended in .tmp
-            # so the curator's suffix exclude catches a crashed write.
             self.assertEqual(list(Path(td).rglob("*.tmp")), [])
+
+    def test_crashed_write_leaves_a_temp_the_curator_excludes(self):
+        """The temp name must END in .tmp: the curator's hard-exclude keys
+        on `Path(name).suffix`, so the older `.<name>.tmp.<pid>.<ms>` shape
+        would have shipped a half-written artifact inside the package. An
+        assertion that no .tmp survives is satisfied by ANY naming scheme,
+        so pin the name itself."""
+        from long_exposure import stage_io
+        from long_exposure.curator import _is_package_hard_excluded
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "reports" / "final" / "final_report.md"
+            # Simulate a crash between write and rename: the temp survives.
+            with patch("long_exposure.stage_io.os.replace",
+                       side_effect=OSError("crash")):
+                with self.assertRaises(OSError):
+                    stage_io.atomic_write_text(target, "half-written")
+            # The failure path removes its own temp...
+            self.assertEqual(list(Path(td).rglob("*.tmp")), [])
+            # ...so capture the name it would use and check the curator
+            # would exclude a temp orphaned by a hard kill.
+            names = []
+            real_replace = os.replace
+
+            def capture(src, dst):
+                names.append(Path(src).name)
+                return real_replace(src, dst)
+
+            with patch("long_exposure.stage_io.os.replace", side_effect=capture):
+                stage_io.atomic_write_text(target, "body")
+            self.assertEqual(len(names), 1)
+            self.assertTrue(names[0].startswith(".final_report.md."), names[0])
+            self.assertEqual(Path(names[0]).suffix, ".tmp", names[0])
+            self.assertTrue(
+                _is_package_hard_excluded(f"reports/final/{names[0]}"), names[0]
+            )
 
     def test_concurrent_atomic_writes_never_publish_a_partial_file(self):
         """A shared temp name let one writer's os.replace publish another

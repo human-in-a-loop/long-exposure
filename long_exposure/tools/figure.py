@@ -66,6 +66,39 @@ _MIN_PLAUSIBLE_BYTES = {
 }
 _DEFAULT_MIN_BYTES = 120
 
+# SVG is text, so bytes alone cannot separate "a real small plot" from "a
+# white rectangle on a 640x480 canvas" — that stub is ~130 bytes, clears any
+# floor low enough to accept legitimate single-panel output, and is the most
+# likely product of a failed `Export`. So small SVGs get a content probe:
+# at least one mark-bearing element must be present. A blank canvas carries
+# exactly one background `<rect>` and nothing else, while even an axis-less
+# bar chart has several rects, and anything from matplotlib has `<path>`.
+_SVG_MARK_ELEMENTS = (
+    "<path", "<text", "<tspan", "<circle", "<ellipse",
+    "<polyline", "<polygon", "<line", "<image", "<use",
+)
+# Only probe files small enough to plausibly BE a blank canvas; a larger
+# file has content whatever its element mix, and this bounds the read.
+_SVG_PROBE_MAX_BYTES = 2048
+
+
+def _svg_lacks_marks(target: Path, size: int) -> bool:
+    """True when a small SVG has no drawable content (blank canvas).
+
+    Unreadable or undecodable files return False — the probe only ever adds
+    a failure it can positively justify.
+    """
+    if size > _SVG_PROBE_MAX_BYTES:
+        return False
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace").lower()
+    except OSError:
+        return False
+    if any(mark in text for mark in _SVG_MARK_ELEMENTS):
+        return False
+    # Two or more rects means real geometry (bar chart); one is the canvas.
+    return text.count("<rect") < 2
+
 
 def _cmd_check(args) -> int:
     """Quick post-render sanity check: file exists, non-trivial size,
@@ -76,12 +109,21 @@ def _cmd_check(args) -> int:
         print(f"[figure check] missing: {target}", file=sys.stderr)
         return 2
     size = target.stat().st_size
-    floor = _MIN_PLAUSIBLE_BYTES.get(target.suffix.lower(), _DEFAULT_MIN_BYTES)
+    suffix = target.suffix.lower()
+    floor = _MIN_PLAUSIBLE_BYTES.get(suffix, _DEFAULT_MIN_BYTES)
+    if suffix == ".svg" and size >= floor and _svg_lacks_marks(target, size):
+        print(
+            f"[figure check] WARNING {target} has no drawable content "
+            f"({size} bytes, no path/text/marker elements) — "
+            f"looks like a blank canvas",
+            file=sys.stderr,
+        )
+        return 1
     if size < floor:
         # Catches "blank canvas" outputs (mostly headers, no content).
         print(
             f"[figure check] WARNING {target} suspiciously small "
-            f"({size} bytes; expected at least {floor} for {target.suffix or 'this format'})",
+            f"({size} bytes; expected at least {floor} for {suffix or 'this format'})",
             file=sys.stderr,
         )
         return 1

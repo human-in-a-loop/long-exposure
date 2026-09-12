@@ -123,5 +123,56 @@ class LocalConfigThreadingTests(unittest.TestCase):
         self.assertIn("local_base_url", seen["config"])
 
 
+class CompactionAndCheckpointConfigTests(unittest.TestCase):
+    """The config= fix stopped short of the orchestrator's own summary calls.
+
+    `compact_with_conditioning` and `checkpoint_without_compaction` built
+    their `call_claude_pool_aware` kwargs without `config=`, so inside
+    `call_claude` those paths took the `load_config()` fallback and read the
+    PACKAGED config.yaml. A run started with `--config myrun.yaml` setting
+    `local_base_url` therefore had ordinary turns honour it while
+    compaction and checkpoint went to the packaged endpoint — summarizing
+    on a different model, or failing outright.
+    """
+
+    class _Sentinel(Exception):
+        pass
+
+    def _captured_kwargs(self, call):
+        seen = {}
+
+        def fake_pool_aware(**kwargs):
+            seen.update(kwargs)
+            raise self._Sentinel()
+
+        with patch("long_exposure.orchestrator.call_claude_pool_aware",
+                   fake_pool_aware):
+            with self.assertRaises(self._Sentinel):
+                call()
+        return seen
+
+    def _config(self):
+        config = load_config()
+        config["model"] = "test-model"
+        config["local_base_url"] = "http://run-specific:9000/v1"
+        return config
+
+    def test_compaction_passes_the_run_config(self):
+        from long_exposure.orchestrator import compact_with_conditioning
+        config = self._config()
+        seen = self._captured_kwargs(lambda: compact_with_conditioning(
+            config, None, [{"role": "user", "content": "hi"}], 0, None, 1000,
+        ))
+        self.assertIs(seen.get("config"), config)
+
+    def test_checkpoint_passes_the_run_config(self):
+        from long_exposure.orchestrator import checkpoint_without_compaction
+        config = self._config()
+        seen = self._captured_kwargs(lambda: checkpoint_without_compaction(
+            config, None, [{"role": "user", "content": "hi"}], 0, None, 1000,
+        ))
+        self.assertIs(seen.get("config"), config)
+
+
 if __name__ == "__main__":
     unittest.main()

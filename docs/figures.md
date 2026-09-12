@@ -81,7 +81,7 @@ plug-in additions.
 | `figure plot` | matplotlib (Python) | quantitative data plots (line / bar / scatter / hist / heatmap / contour / surface / time-series / Q-Q / ROC / faceted grids) |
 | `figure flow` | D2 (Go binary; ELK layout default; PNG default) | flowcharts, sequence, state machines, class diagrams, ERDs, structural / architecture diagrams |
 | `figure arch` | mingrammer/diagrams (Python over Graphviz) | cloud / system architecture with curated component icons (AWS / GCP / Kubernetes / OnPrem) |
-| `figure check` | local validator | post-render sanity check (size > 1 KB, file exists) |
+| `figure check` | local validator | post-render sanity check: file exists, and size above a per-format floor (1 KB for raster, a few hundred bytes for vector — a correct single-panel SVG is legitimately small). Small SVGs are additionally probed for drawable content, so a white-rectangle canvas is flagged even though it clears the floor. Exit 0 OK / 1 suspicious / 2 missing. |
 | `figure list` | — | discovery |
 
 **Tool selection rationale:** `D2` was chosen as the primary

@@ -13,9 +13,13 @@ verifies the run's claims against its evidence, emits reconciliation events
 See docs/end-of-run-pipeline.md for the design. Key invariants this module
 preserves:
 
-  * Single-N stage heuristic: same metric and same implementation as the
-    reporter, from the shared `limits.FINAL_STAGE_TOKEN_THRESHOLD`
-    (`min(max(1, tokens // threshold), _N_MAX)` → 2N+2 stages).
+  * Single-N stage heuristic: same metric and same threshold as the
+    reporter (`limits.FINAL_STAGE_TOKEN_THRESHOLD`), different ceiling.
+    The auditor is `min(max(1, tokens // threshold), _N_MAX)` → 2N+2
+    stages, because each unit of N costs it two passes (verify + test);
+    the reporter is `max(1, tokens // threshold)` with NO cap, because a
+    long report needs as many body stages as it has material. Do not
+    "restore" a shared formula — the asymmetry is deliberate.
   * Wall-clock cap shared with the reporter via `long_exposure.limits`.
   * File-gate rescue mirrors `reporting.py:_rescue_stage_file`.
   * Reconciliation events committed transactionally at the document stage.
@@ -197,10 +201,12 @@ def _estimate_audit_input_tokens(workspace: Path) -> int:
 def _final_auditor_stage_count(input_tokens: int) -> tuple[int, int]:
     """Returns (N, total_stages) where total = explore (1) + N verify + N test + document (1).
 
-    N scales with input volume (one pass per ~20k tokens of plan, ledger,
-    reports and closure docs) and is capped at `_N_MAX` so the pass stays
-    within 4..12 stages; the wall-cap (limits.WALL_CAP_SECONDS) bounds the
-    time spent inside that.
+    N scales with input volume — one pass per `_TOKEN_THRESHOLD`
+    (= limits.FINAL_STAGE_TOKEN_THRESHOLD) tokens of plan, ledger, reports
+    and closure docs — with a floor of 1 so a small workspace still gets a
+    verify and a test pass, and a ceiling of `_N_MAX` so total stays within
+    4..12. The wall-cap (limits.WALL_CAP_SECONDS) bounds the time spent
+    inside that.
     """
     n = min(max(1, input_tokens // _TOKEN_THRESHOLD), _N_MAX)
     return n, 1 + n + n + 1
@@ -232,8 +238,6 @@ def _expected_file_for_stage(stage: int, n: int, workspace: Path) -> Path:
 # Shared with reporting.py via stage_io; private aliases keep the call sites
 # in this module unchanged.
 _file_signature = stage_io.file_signature
-_atomic_write_text = stage_io.atomic_write_text
-_marker_metadata = stage_io.marker_metadata
 _committed_baseline = stage_io.committed_baseline
 _write_run_mode = stage_io.write_run_mode
 

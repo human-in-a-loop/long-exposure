@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """promise_check — validate plan_of_record.md + promise_ledger.jsonl coherence.
 
-Stdlib-only. Reviewable in one sitting. See docs/workspace-conventions.md
-for the spec; the artifact-tracking checks are documented there too.
+Stdlib plus one in-repo helper (`long_exposure.paths.canonical_rel_path`),
+so run it as a module, not as a loose file. Reviewable in one sitting. See
+docs/workspace-conventions.md for the spec; the artifact-tracking checks
+are documented there too.
 
 Exit codes:
   0  — green (no schema/cross-ref/lifecycle errors)
@@ -29,6 +31,12 @@ import re
 import sys
 import uuid
 from pathlib import Path
+
+# Module scope on purpose: a lazy import inside `_canon` meant a
+# misinvocation (a loose copy of this file rather than `-m`) failed only
+# after the schema and cross-ref checks had already printed, which reads
+# like a crash mid-analysis instead of "you ran it wrong".
+from long_exposure.paths import canonical_rel_path
 
 # ---------------------------------------------------------------------------
 # Vocabulary — the unified status taxonomy and confidence levels.
@@ -737,11 +745,10 @@ def _canon(path: str) -> str:
 
     Delegates to `paths.canonical_rel_path` (a prefix strip, not the
     character-set strip that `lstrip("./")` performs) so `.config/...` and
-    `../...` survive intact.
+    `../...` survive intact — the latter matters because callers reject
+    `..` segments by inspecting the result.
     """
-    from long_exposure import paths as _paths
-
-    return _paths.canonical_rel_path(path)
+    return canonical_rel_path(path)
 
 
 def _is_in_managed_folder(rel: str) -> bool:

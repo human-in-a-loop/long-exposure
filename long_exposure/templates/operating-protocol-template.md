@@ -183,10 +183,16 @@ means:
   - ~/.env                       (secrets)
   - ~/.bashrc ~/.bash_profile ~/.gitconfig  (shell/git configuration)
   - ~/.config/                   (application configuration)
-  - the harness installation you are running within
+  - {harness_root}
+        The harness running you. It is on your PYTHONPATH (that is how
+        `python3 -m long_exposure.tools...` resolves), so it is both
+        readable and writable from your Bash tool — never edit it. If a
+        harness tool looks wrong, report that in your output instead of
+        changing the tool.
 
 Where ~ is the home directory. {missing_info_sentence}
-{wolfram_block}== BASH WAIT LOOPS ==
+{wolfram_block}{test_runner_block}
+== BASH WAIT LOOPS ==
 
 <bash-wait-loops>
 Bash loops that wait for a background job to finish are a common source

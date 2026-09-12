@@ -1824,11 +1824,8 @@ Run individual .wls scripts via Bash:
 <critical>Wolfram Engine cannot render graphics — never call Export with Plot/Graphics objects. Compute data in Wolfram, export as CSV, then plot in Python.</critical>
 </tool-guidance>
 
-{test_runner_block}
-
 After writing or modifying any .wls library or test file, always run the
 relevant test to verify correctness before reporting completion.
-
 """
 
 
@@ -1842,24 +1839,34 @@ def _build_wolfram_block(config: dict) -> str:
     wolfram_path = (config.get("wolfram_path") or "").strip()
     if not wolfram_path:
         return ""
-    return _WOLFRAM_BLOCK_TEMPLATE.format(
-        wolfram_path=wolfram_path,
-        test_runner_block=_build_test_runner_block(config),
-    )
+    return _WOLFRAM_BLOCK_TEMPLATE.format(wolfram_path=wolfram_path)
 
 
 def _build_test_runner_block(config: dict) -> str:
-    """Return the test runner instructions if configured."""
-    test_runner = config.get("test_runner", "")
+    """Return the test-suite section if `test_runner` is configured.
+
+    Its own template placeholder, NOT nested inside the Wolfram block:
+    nesting it there meant a deployment with `wolfram_path: ""` never told
+    any agent its test suite existed, even with `test_runner` set. Whether
+    there is a suite to run and whether Wolfram is the thing that runs it
+    are separate questions, so the command line adapts and the section
+    ships either way.
+    """
+    test_runner = str(config.get("test_runner") or "").strip()
     if not test_runner:
         return ""
     wd = config.get("working_directory", "")
-    wolfram = config.get("wolfram_path", "wolfram")
-    return (
-        f"Test runner: {test_runner}\n\n"
-        f"Run the test suite via Bash:\n"
-        f"  cd {wd} && {wolfram} -script {test_runner}"
-    )
+    wolfram = (config.get("wolfram_path") or "").strip()
+    if wolfram:
+        how = f"Run the test suite via Bash:\n  cd {wd} && {wolfram} -script {test_runner}"
+    else:
+        # No kernel configured — naming a `wolfram -script` command here
+        # would send the agent at a binary the deployment does not have.
+        how = (
+            f"Run the test suite via Bash from the working directory "
+            f"({wd}) with the runner this project uses."
+        )
+    return f"\n== TEST SUITE ==\n\nTest runner: {test_runner}\n\n{how}\n"
 
 
 def build_anti_patterns_block(enabled: bool) -> str:
@@ -2242,6 +2249,12 @@ def assemble_system_prompt(
         "anti_patterns_block": build_anti_patterns_block(config["anti_patterns_enabled"]),
         "wolfram_path": config.get("wolfram_path", ""),
         "working_directory": config.get("working_directory", ""),
+        # DERIVED, not hard-coded: the same path _add_repo_to_pythonpath puts
+        # on every agent turn's PYTHONPATH. The off-limits list has to name it
+        # concretely — "the harness you are running within" fences nothing,
+        # and an agent told to run `python3 -m long_exposure.tools...` can
+        # find and edit the harness mid-run.
+        "harness_root": str(SCRIPT_DIR.parent),
         "test_runner_block": _build_test_runner_block(config),
         # Interactive-only guidance. A headless conductor turn has no user
         # to type /complete or /clear and no one to ask about a file, so
@@ -4277,6 +4290,11 @@ def compact_with_conditioning(
         disable_tools=True,
         idle_timeout=config.get("provider_idle_timeout_seconds"),
         idle_poll=config.get("provider_idle_poll_seconds"),
+        # The RUN's config, not the packaged default. Without it call_claude
+        # falls back to load_config() and compaction would read
+        # long_exposure/config.yaml — so a run started with --config would
+        # summarize against a different endpoint/model than its own turns.
+        config=config,
     )
 
     envelope = call_claude_pool_aware(**summary_call_kwargs)
@@ -4449,6 +4467,9 @@ def checkpoint_without_compaction(
         disable_tools=True,
         idle_timeout=config.get("provider_idle_timeout_seconds"),
         idle_poll=config.get("provider_idle_poll_seconds"),
+        # Same reason as compaction: use the run's config, not the packaged
+        # default that call_claude would otherwise load.
+        config=config,
     )
 
     # Checkpoint is best-effort observability; on empty/malformed payload we

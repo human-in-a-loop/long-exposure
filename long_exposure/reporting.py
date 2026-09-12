@@ -18,7 +18,6 @@ from __future__ import annotations
 import json as _json
 import re as _re
 import time as _time
-from datetime import datetime, timezone
 from pathlib import Path
 
 from long_exposure import paths
@@ -115,7 +114,6 @@ def _final_report_expected_file(
 # keep every call site in this module unchanged.
 _file_signature = stage_io.file_signature
 _atomic_write_text = stage_io.atomic_write_text
-_marker_metadata = stage_io.marker_metadata
 _committed_baseline = stage_io.committed_baseline
 _write_run_mode = stage_io.write_run_mode
 
@@ -429,6 +427,19 @@ def _render_final_pdf(working_dir: str) -> bool:
     return render_pdf(working_dir, "final_report")
 
 
+def _final_report_stage_count(budget_tokens: int) -> tuple[int, int]:
+    """Returns (body_stages, total_stages) = body + outline + finalize.
+
+    Floored at 1 so a thin workspace still gets one body stage, and
+    deliberately UNCAPPED: a long report needs as many body stages as it
+    has material. The final auditor uses the same threshold but caps at
+    `auditing._N_MAX`, because each unit of N costs it two passes. Named
+    so tests can exercise this instead of re-implementing the formula.
+    """
+    body = max(1, int(budget_tokens) // FINAL_STAGE_TOKEN_THRESHOLD)
+    return body, body + 2
+
+
 def _run_final_reporter(
     final_reporter_def: dict,
     task: str,
@@ -481,8 +492,7 @@ def _run_final_reporter(
 
     # Stage count scales with the relevant artifact set: whole workspace for
     # fresh runs, files newer than the prior committed baseline for deltas.
-    num_body_stages = max(1, budget_tokens // FINAL_STAGE_TOKEN_THRESHOLD)
-    total_stages = num_body_stages + 2  # outline + body stages + finalize
+    num_body_stages, total_stages = _final_report_stage_count(budget_tokens)
     outline_path = str(paths.final_report_outline_path(config))
     _write_run_mode(paths.final_report_run_mode_path(config), {
         "agent": "final_reporter",

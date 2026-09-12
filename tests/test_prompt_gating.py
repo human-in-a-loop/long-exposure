@@ -45,6 +45,15 @@ class HeadlessPromptTests(unittest.TestCase):
         for probe in ("~/.ssh/", "~/.env", "~/.claude/", "DIRECTORY BOUNDARIES"):
             self.assertIn(probe, self.headless, probe)
 
+    def test_off_limits_list_names_the_harness_root_it_derives(self):
+        """The fence must name a real path — "the harness installation you
+        are running within" fences nothing, and the repo root IS on every
+        agent turn's PYTHONPATH. Derived, so no literal path is asserted."""
+        from long_exposure.orchestrator import SCRIPT_DIR
+        harness_root = str(SCRIPT_DIR.parent)
+        self.assertIn(harness_root, self.headless)
+        self.assertIn("never edit it", self.headless)
+
     def test_role_and_protocol_still_present(self):
         self.assertIn("<agent-role>role text</agent-role>", self.headless)
         self.assertIn("BASH WAIT LOOPS", self.headless)
@@ -68,6 +77,51 @@ class WolframGatingTests(unittest.TestCase):
             self.assertNotIn("WOLFRAM EXECUTION", without)
             self.assertNotIn("-script", without)
             self.assertLess(len(without), len(with_kernel))
+
+
+class TestRunnerBlockTests(unittest.TestCase):
+    """The test suite must be announced independently of Wolfram: nesting
+    the block inside the Wolfram section meant a deployment with
+    `wolfram_path: ""` never told any agent its test suite existed."""
+
+    RUNNER = "tests/run_all.wls"
+
+    def test_announced_without_a_wolfram_kernel(self):
+        prompt = assemble_system_prompt(
+            _cfg(test_runner=self.RUNNER, wolfram_path=""), role="r"
+        )
+        self.assertIn("TEST SUITE", prompt)
+        self.assertIn(self.RUNNER, prompt)
+        # ...but no invented `wolfram -script` command for a kernel that
+        # is not installed.
+        self.assertNotIn("-script", prompt)
+
+    def test_wolfram_command_used_when_a_kernel_is_configured(self):
+        prompt = assemble_system_prompt(
+            _cfg(test_runner=self.RUNNER, wolfram_path="wolfram-batch"), role="r"
+        )
+        self.assertIn("TEST SUITE", prompt)
+        self.assertIn(f"wolfram-batch -script {self.RUNNER}", prompt)
+
+    def test_absent_when_no_runner_is_configured(self):
+        for wolfram in ("", "wolfram-batch"):
+            prompt = assemble_system_prompt(
+                _cfg(test_runner="", wolfram_path=wolfram), role="r"
+            )
+            self.assertNotIn("TEST SUITE", prompt)
+
+    def test_bash_heading_keeps_its_blank_line_in_every_combination(self):
+        for runner in ("", self.RUNNER):
+            for wolfram in ("", "wolfram-batch"):
+                prompt = assemble_system_prompt(
+                    _cfg(test_runner=runner, wolfram_path=wolfram), role="r"
+                )
+                idx = prompt.index("== BASH WAIT LOOPS ==")
+                self.assertEqual(
+                    prompt[idx - 2:idx], "\n\n",
+                    f"runner={runner!r} wolfram={wolfram!r}: "
+                    f"{prompt[max(0, idx - 60):idx]!r}",
+                )
 
 
 class InteractiveReplPromptTests(unittest.TestCase):
@@ -130,6 +184,47 @@ class FigureCheckFloorTests(unittest.TestCase):
 
     def test_blank_svg_still_flagged(self):
         self.assertEqual(self._check("blank.svg", b"<svg/>"), 1)
+
+    def test_white_rectangle_canvas_is_flagged_despite_clearing_the_floor(self):
+        """130 bytes clears any floor low enough to accept real single-panel
+        SVG, and a white rect is the likely product of a failed Export — so
+        size alone cannot decide it. The content probe must."""
+        svg = (
+            b'<svg xmlns="http://www.w3.org/2000/svg" version="1.1" '
+            b'width="640" height="480">'
+            b'<rect width="640" height="480" fill="white"/></svg>'
+        )
+        self.assertGreater(len(svg), 120)  # clears the .svg floor
+        self.assertEqual(self._check("blank_canvas.svg", svg), 1)
+
+    def test_rect_only_bar_chart_passes(self):
+        """Real geometry with no path/text at all: several rects, not one."""
+        bars = (
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">'
+            b'<rect x="10" y="40" width="20" height="50" fill="steelblue"/>'
+            b'<rect x="40" y="20" width="20" height="70" fill="steelblue"/>'
+            b'<rect x="70" y="60" width="20" height="30" fill="steelblue"/></svg>'
+        )
+        self.assertEqual(self._check("bars.svg", bars), 0)
+
+    def test_text_only_svg_passes(self):
+        label = (
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="220" height="40">'
+            b'<text x="10" y="25" font-family="DejaVu Sans" font-size="12">'
+            b'measured 4.2 +/- 0.3</text></svg>'
+        )
+        self.assertGreater(len(label), 120)  # past the floor: probe decides
+        self.assertEqual(self._check("label.svg", label), 0)
+
+    def test_large_svg_is_not_probed(self):
+        """Past the probe ceiling a file has content whatever its element
+        mix; probing it would also mean reading an arbitrarily large file."""
+        big = (
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480">'
+            + b"<!-- " + b"x" * 3000 + b" -->"
+            + b'<rect width="640" height="480" fill="white"/></svg>'
+        )
+        self.assertEqual(self._check("big.svg", big), 0)
 
     def test_small_png_still_flagged(self):
         self.assertEqual(self._check("fig.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 100), 1)

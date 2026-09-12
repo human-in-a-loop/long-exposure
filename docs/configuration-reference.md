@@ -278,6 +278,8 @@ working_directory: /path/to/your/project   # absolute; scopes file tools
 
 wolfram_path: "wolfram-batch"   # empty disables Wolfram guidance
 
+test_runner: ""                 # optional; path to the project's test suite
+
 allowed_tools:
   - Read
   - Write
@@ -291,6 +293,14 @@ allowed_tools:
 File tools (`Read`, `Write`, `Edit`, `Glob`, `Grep`) are automatically
 scoped to `working_directory`. Bash is unrestricted by default; you
 can pattern-restrict:
+
+`test_runner`, when set, adds a `TEST SUITE` section to every agent's
+operating protocol naming the suite and how to run it. It is independent
+of `wolfram_path`: with a kernel configured the section gives the
+`<wolfram_path> -script <test_runner>` command, and without one it names
+the suite and tells the agent to run it with the project's own runner
+rather than pointing at a binary the deployment does not have. Empty (the
+default) omits the section.
 
 `wolfram-batch` is a bundled console command compatible with
 `wolfram -script file.wls`. It runs scripts through the interactive
