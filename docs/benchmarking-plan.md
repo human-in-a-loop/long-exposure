@@ -263,19 +263,21 @@ Run on this container at commit `89b2e8f` (Python 3.11, `uv sync` clean):
 
 | Command | Result |
 |---|---|
-| `uv run pytest -q` | 37 collection errors (`ModuleNotFoundError: long_exposure`): `pytest` is not declared in `pyproject.toml`, so `uv run` falls through to the system pytest outside the venv |
-| `uv run --with pytest pytest -q` | **322 passed, 7 subtests passed** in 35 s |
-| `uv run python -m unittest discover -s tests` (the documented command, `docs/local-setup.md:176`) | 216 run, **2 import errors** (`test_agent_routing.py`, `test_interactive_transport.py` import `pytest`); it also silently skips ~108 pytest-style function tests, including all of `test_final_pipeline_gates.py`, `test_curator_recovery.py`, `test_output_block_recovery.py` and `test_clone_termination.py` |
+| `uv run pytest -q` | *Was* 37 collection errors (`ModuleNotFoundError: long_exposure`): `pytest` was not declared in `pyproject.toml`, so `uv run` fell through to the system pytest outside the venv. Now declared in `[dependency-groups] dev`, so this is the documented command: **413 passed, 7 subtests passed** in 35 s |
+| `uv run python -m unittest discover -s tests` | 292 run, OK — but it silently skips every pytest-style *function* test (module-level `def test_...`), so it is no longer the documented command. Prefer `pytest` |
 
 The suite is entirely offline: every test patches `_invoke_claude`,
 `_call_agent_with_rotation` or `render_pdf`. Nothing exercises a real
 provider CLI, pandoc, tectonic, D2, graphviz or Wolfram; `figure.py`, the
 three figure renderers, `wolfram_batch.py`, the curator agent path,
-`_commit_reconciliation_events`, the auditor wall-cap path and
-`run_final_reporter.py` have no tests. The one-cycle loop, resume, fan-out
-parser, curator packaging, output-block recovery and provider envelope
-parsing are well covered. Fix before benchmarking: declare `pytest` as a dev
-dependency and change the documented command.
+`_commit_reconciliation_events` and the auditor wall-cap path have no
+tests. The one-cycle loop, resume, fan-out parser, curator packaging,
+output-block recovery and provider envelope parsing are well covered.
+`figure check` and `run_final_reporter.py` were on this list and now have
+tests (`test_prompt_gating.py`, `test_final_entrypoint.py`), as do the
+bench-mode additions (`test_run_switches.py`, `test_usage_ledger.py`,
+`test_provider_config_threading.py`). The `pytest` dev dependency is
+declared and the documented command changed.
 
 Tooling on this container: `claude` is present; `pandoc`, `tectonic`, `d2`,
 `dot` and `wolfram` are absent. `long-exposure launch` would refuse to start
