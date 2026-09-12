@@ -1,14 +1,13 @@
 # ResearchClawBench: execution plan for the bench-mode branch
 
-Scope: one venue, one model, one harness configuration. This is the
-runnable plan for `claude/long-exposure-benchmarking-pikxm2` after the
-bench-mode work landed (fan-out switch, end-of-run switches, usage ledger,
-budget gates). The wider survey and the rejected venues stay in
-`docs/benchmarking-plan.md`; this document supersedes its §5.2.
+Scope: one venue, one model, one harness configuration, at the harness's
+own default operating point. This is the runnable plan for
+`claude/long-exposure-benchmarking-pikxm2`. The wider survey and the
+rejected venues stay in `docs/benchmarking-plan.md`; this document
+supersedes its §5.2.
 
 Status: **pre-registration.** Nothing here has been run. Peer numbers are
-from the published paper and repository, not from our runs. The four
-operator decisions in §12 are settled and reflected throughout.
+from the published paper and repository, not from our runs.
 
 ---
 
@@ -25,15 +24,9 @@ a 100-point scale where **50 = reference-level evidence (the target paper
 re-discovered)** and >50 implies discovery beyond it.
 
 It is the only venue on the shortlist that satisfies every selection
-criterion at once:
-
-| Criterion | ResearchClawBench |
-|---|---|
-| Unit of comparison is the *harness* | Yes — the published table is harness × model, seven autonomous agents under one protocol |
-| Task shape matches a long-exposure directive | Yes — open-ended objective, supplied corpus, hours of work, report + code + figures graded by rubric |
-| Public tasks, public grader, documented integration | Yes — `evaluation/agents.json` + judge configured by env |
-| Contamination controllable | Partly — target papers are hidden but published; controls in §7 |
-| Affordable | Yes — CPU only, no GPU, no training runs |
+criterion at once: the published unit of comparison is the harness, the
+task shape is a long-exposure directive, the grader is public, and it
+needs no GPU.
 
 ### The peer table
 
@@ -51,13 +44,11 @@ From the paper (280 runs = seven agents × 40 tasks, one run each):
 | Nanobot | GPT-5.4 | 12.8 |
 | *ResearchHarness* (thin baseline) | Claude-Opus-4.7 | 20.7 |
 
-Every system is far below 50. The headroom is the point: this is a
-benchmark where a harness can still matter, unlike the saturated coding
-boards.
-
-Two facts from that table shape the protocol. The best published harness
-entry is **Claude Code on Opus 4.6**, and the paper's protocol is **one
-run per task**, so the published numbers carry no variance estimate.
+Everything is far below 50. The headroom is the point: a harness can
+still matter here, unlike the saturated coding boards. Two facts from the
+table shape the protocol — the best published harness entry is Claude Code
+on Opus 4.6, and one run per task means the published numbers carry no
+variance estimate.
 
 ---
 
@@ -65,83 +56,79 @@ run per task**, so the published numbers carry no variance estimate.
 
 > Long-exposure's deterministic researcher → worker → auditor cycle, with
 > fan-out and its durable plan/ledger surface, produces higher-rubric-score
-> research artifacts than a single-agent harness given the same model and
-> the same wall budget.
+> research artifacts than a single-agent harness on the same model.
 
-Two arms, and they are not a feature matrix:
+Note what that claim does **not** say: it does not say "at equal token
+spend". Long-exposure at its default operating point runs until the topic
+is exhausted and will spend one to two orders of magnitude more tokens
+than one `claude -p` call. That is the harness working as designed, and
+the honest way to handle it is to measure the spend, report it in the
+headline, and add a control that lets the baseline use comparable compute
+(§8). It is not honest to quietly compare an all-night run against a
+single call and report only the score difference.
 
-- **B — long-exposure**, one configuration, everything on except the final
-  auditor and final reporter (§6). All 40 tasks.
-- **A — Claude Code**, RCB's own preset, same model, same tasks, same wall
-  budget.
+Arms:
 
-There is no ablation grid. The cost of that choice, stated plainly: if B
-beats A we will know the harness as a whole wins, but not which of
-cycles / auditor gate / fan-out earned it. The switches remain in the
-code, so ablations stay available as a follow-up on whichever subset looks
-most informative after the first pass.
+| Arm | What it is | Tasks |
+|---|---|---|
+| **B** | Long-exposure, one configuration, everything on except the final auditor and final reporter (§6) | 40 |
+| **A** | Claude Code via RCB's own preset, same model | 40 |
+| **A+** | Claude Code, k sequential self-continuation rounds, k set from B's measured spend (§8.1) | 10 |
+
+There is no feature-ablation grid. If B beats A we will know the harness
+as a whole wins, not which of cycles / auditor gate / fan-out earned it.
+The switches stay in the code, so ablations remain available as follow-up
+on whichever subset looks most informative.
 
 ---
 
 ## 3. Model: `claude-fable-5-1`
 
-Pinned for **both** arms, every role, at `high` effort.
-
-```
-claude -p --model claude-fable-5-1 --effort high ...
-```
+Pinned for **every** arm and every role, at `high` effort, through
+`claude -p --model claude-fable-5-1 --effort high`. Max plan, subscription
+billing, nothing through the API.
 
 ### What this buys and what it costs
 
 Fable 5.1 is Anthropic's most capable widely released model — the right
 choice if the question is "what is the best research this harness can
-produce". The consequences are real and are accepted deliberately:
+produce". Four consequences, accepted deliberately:
 
 1. **No board tie-back.** Every published peer runs Opus 4.6/4.7 or
    GPT-5.4. A Fable 5.1 number cannot be placed next to 21.5 and called a
    comparison. **This makes arm A load-bearing rather than optional** — it
-   is the only same-model reference point the campaign will have. Without
-   it there is no harness result, just a score.
-2. **2× the token price.** $10/$50 per MTok against Opus-tier $5/$25.
-   Combined with fan-out this roughly quadruples the per-task figure used
-   in §9's budget model.
+   is the only same-model reference point the campaign has.
+2. **2× the token price** ($10/$50 per MTok vs Opus-tier $5/$25) in the
+   notional accounting of §9. No cash effect: see §7.
 3. **Different model behaviour, in a direction that matters here.**
-   Thinking is always on and cannot be disabled; effort spans `low`–`max`.
-   More important for this harness: prompts written for earlier models are
-   often *too prescriptive* for Fable 5.1 and reduce output quality.
-   Long-exposure's four-layer system prompt is exactly that — philosophy +
-   framework + operating protocol + role, with checkpoint-block rules and
-   a named anti-pattern list on every call. The smoke test (§5 item 4)
-   therefore includes a prompt-fit check, and a prescriptiveness trim is
-   the first thing to try if output quality looks low.
-4. **Longer single turns.** Hard tasks can run many minutes per request.
-   Two timeouts must be raised from their defaults or runs will be killed
-   mid-turn: `cli_timeout` (default `0` = unlimited, but we set a real
-   value) and `provider_idle_timeout_seconds` (default 1800). The idle
-   watchdog checks process-tree CPU as well as file progress
-   (`orchestrator.py:3163-3182`), so a streaming turn is not spuriously
-   killed — but the hard per-call timeout is the binding limit. §6 sets
-   both.
-5. **Data retention.** Fable 5.1 is unavailable to zero-data-retention
-   organisations unless expressly authorised. A ZDR account gets a 400 on
-   every call, which item 0 of §5 will catch immediately.
+   Thinking is always on and cannot be disabled. More important: prompts
+   written for earlier models are often *too prescriptive* for Fable 5.1
+   and reduce output quality. Long-exposure's four-layer system prompt is
+   exactly that shape — philosophy + framework + operating protocol +
+   role, with checkpoint-block rules and a named anti-pattern list on
+   every call. §5 item 4 is a one-time, pre-scored prompt-fit check for
+   this; §8.2 explains why it must happen before any scored run and never
+   after.
+4. **Longer single turns.** Main's defaults are `cli_timeout: 0` (no
+   per-call ceiling) and `provider_idle_timeout_seconds: 1800`. That pair
+   turns out to be the right combination for this model: the idle watchdog
+   checks process-tree CPU as well as file progress
+   (`orchestrator.py:3163-3182`), so a turn that thinks for 40 minutes
+   survives while a genuinely wedged process is still killed. Both stay at
+   main's values (§6).
 
-### Constraints this creates
+### Constraints
 
 - **The model string is passed verbatim** to the CLI
-  (`orchestrator.py:3750`), and `claude --model` accepts full names as well
-  as aliases (`fable` is a documented alias). Pinning is a config edit.
-- **Use the exact ID, never the alias.** `model_tier: opus` and the
-  `model: opus` entries in `agent_models` must all become
-  `claude-fable-5-1`. An alias resolves to whatever is current that week,
-  which would make the run unreproducible — this is the single most
-  important line in the bench config.
-- **Cost is notional.** The run bills against the Max plan through
-  `claude -p`, so marginal dollars are zero and the envelope's
-  `total_cost_usd` is an API-equivalent figure. We report it labelled
-  "API-equivalent cost (subscription-billed run)". Peers' costs are
-  API-priced, so the figure is comparable; calling it cash spend would not
-  be. Wall-clock parity is the budget control that actually binds.
+  (`orchestrator.py:3750`); `claude --model` accepts full names. Pinning is
+  a config edit.
+- **Use the exact ID, never the `fable` alias.** `model_tier: opus` and
+  every `model: opus` in `agent_models` becomes `claude-fable-5-1`. An
+  alias resolves to whatever is current that week, which would make the
+  run unreproducible. This is the single most important line in the bench
+  config.
+- Fable 5.1 is unavailable to zero-data-retention organisations unless
+  expressly authorised; §5 item 0 catches that in one call.
 
 ---
 
@@ -151,245 +138,363 @@ The published entry is Claude Code invoked by RCB's own preset — one
 `claude -p` call per task with the unified persona prompt from
 `evaluation/instructions_tmpl.py`, the CLI's own tools, no external
 scaffolding. Arm A reruns *that*, on Fable 5.1, from RCB's own
-`agents.json` entry. We do not write our own baseline: using the
-benchmark's preset is what makes A honest.
+`agents.json` entry, unmodified. We do not write our own baseline: using
+the benchmark's preset is what makes arm A checkable rather than a
+strawman we tuned down.
 
 Arm B gets the **same prompt text** — the adapter passes `<PROMPT>`
-through as the score directive verbatim — and the same tool surface. Any
-difference beyond the harness is a confound to remove, not a design
-choice.
+through as the score directive verbatim — and the same task files.
 
 ---
 
 ## 5. What must be built first
 
 Already done on this branch: fan-out switch, end-of-run switches, usage
-ledger with tool counts and dollar capture, budget gates, headless prompt
-hygiene, run-config threading. What remains is the adapter surface and
-per-task isolation.
+ledger with tool counts and cost capture, budget gates (unused here — see
+§6), headless prompt hygiene, run-config threading. What remains:
 
 **0. Model-availability and retention probe** (~20 lines, half a day).
 One `claude -p --model claude-fable-5-1 --effort high` call with a trivial
-prompt. Record: success, the served model in the envelope, latency, and
-that no retention error comes back. Run this first — it can invalidate the
-whole model plan in one call.
+prompt. Record success, the served model from the envelope, latency, and
+that no retention error comes back. Run this first — one call can
+invalidate the model plan.
 
 **1. Per-task `sessions.db` isolation** (config-only, one day).
 `compact_db` resolves relative to the config file
 (`orchestrator.py:1662-1666`) and the MCP `search_sessions` tool is global
 with no run scoping. Forty tasks against one DB would leak task A's
 outputs, lemmas and lessons into task B's prompts — a contamination bug
-that would invalidate every number, and one that matters *more* with
-fan-out on, since clones share the parent's DB by design. Fix without a
+that would invalidate every number, and one that matters more with fan-out
+on, since clones share the parent's instance dir by design. Fix without a
 code change: the adapter writes a per-task config carrying an **absolute**
-`compact_db` under that task's instance dir. Verify by asserting the DB
-path in `result.json` is unique per run, and that `search_sessions` in
-task B returns nothing from task A.
+`compact_db` under that task's instance dir. Verify per task: the DB path
+in `result.json` is unique, and `search_sessions` in task B returns
+nothing from task A.
 
 **2. `long-exposure bench` subcommand** (~150 lines, three days). Inputs:
-`--prompt-file`, `--workspace`, `--out-dir`, `--wall-budget`,
-`--cost-budget`, `--max-cycles`, `--no-web`. Behaviour:
+`--prompt-file`, `--workspace`, `--out-dir`, `--wall-stop`, `--no-web`.
+Behaviour:
 
 - generate the per-task config and score (directive = prompt file
   contents, verbatim);
 - run the loop as a subprocess — importing the module installs signal
   handlers and is one-run-per-process (`exploration.py:94-128`);
-- at `wall_budget − reserve`, write `long-exposure.stop` into the instance
+- at `wall_stop − reserve`, write `long-exposure.stop` into the instance
   dir. A stop is a *graceful* end: the current agent finishes, a periodic
   report flushes, and the enabled end-of-run stages run
   (`_should_run_final_synthesis`, `exploration.py:946-965`). Reserve
-  45 min, which must cover one periodic-reporter call on Fable 5.1 plus
-  the curator;
+  45 min;
 - copy the deliverable to `<workspace>/report/report.md` — RCB's expected
-  path. **With the final reporter off, the newest
-  `reports/report_cycles_*.md` IS the deliverable** (see §6);
-- write `result.json`: report path and provenance (which file it came
-  from), artifact list, tokens, notional dollars, tool calls, turns, wall
-  time, cycles run, fan-out branches spawned, termination reason, the
-  model actually served, and the commit SHA.
+  path — from the newest `reports/report_cycles_*.md` (see §6);
+- write `result.json`: report path *and which file it came from*, artifact
+  list, tokens, notional cost, tool calls, turns, wall time, cooldown
+  seconds, cycles run, fan-out branches spawned, rate-limit events,
+  termination reason, served model, and the commit SHA.
 
-Two footguns to encode rather than rediscover: `report_interval: 0` means
-*every cycle*, not *never* (`exploration.py:4980` tests `>=`); and
-`cli_timeout: 0` is the default, meaning no per-call ceiling at all.
+Encode two footguns rather than rediscover them: `report_interval: 0`
+means *every cycle*, not *never* (`exploration.py:4980` tests `>=`); and
+`cli_timeout: 0` means no per-call ceiling at all.
 
 **3. RCB adapter** (~40 lines, one day). `bench/rcb_agent.sh` plus the
-`evaluation/agents.json` entries in §11. Thin by design: RCB owns the task
-loop, we own one task.
+`agents.json` entries in §11.
 
 **4. Smoke test and prompt-fit check** (one day). One validation task, the
-real arm-B config but `max_cycles: 2`, `cycle_cooldown_seconds: 0`.
-Asserts:
+real arm-B config, stopped after three cycles. Asserts: `report/report.md`
+exists, is non-empty, and `result.json` records its source file;
+`result.json` has non-zero cost, tool calls and turns; the `compact_db`
+path is task-local; the served model is `claude-fable-5-1`; no call hit
+the idle watchdog. Then the **prompt-fit check**: read the transcripts and
+judge whether the operating protocol's scaffolding is crowding out the
+work (short outputs, checkpoint ceremony dominating, the model arguing
+with the protocol). One trim is allowed here, decided from transcripts and
+never from scores (§8.2), then frozen.
 
-- `report/report.md` exists, is non-empty, and `result.json` records which
-  file it came from — this is the mechanism most likely to break, because
-  the final reporter is off;
-- `result.json` has non-zero cost, tool calls and turns;
-- the `compact_db` path is task-local;
-- the served model is `claude-fable-5-1`;
-- no call hit the per-call timeout or the idle watchdog;
-- **prompt fit**: read the two agent transcripts and judge whether the
-  operating protocol's prescriptive scaffolding is crowding out the work
-  (short outputs, checkpoint ceremony dominating, the model arguing with
-  the protocol). If so, trim prescriptiveness before spending anything —
-  on this model that is a quality lever, not a style preference.
-
-This is the gate for spending anything. Estimate: **about one working
-week** before the first scored run.
+Estimate: **about one working week** before the first scored run.
 
 ---
 
-## 6. The one configuration
+## 6. The configuration
 
-### Feature switches
+### Budget: main's defaults, unchanged
 
-Everything on except the two stages you flipped off.
+Every ceiling, timer and concurrency cap is whatever `main` ships. The
+code is this branch (for the bug fixes and the two switches); the budget
+is stock. That combination is deliberate and must be disclosed as such,
+because it is not a released configuration.
 
-| Feature | Setting | Note |
+| Knob | Value | Source |
 |---|---|---|
-| In-cycle auditor | **on** | `flow: [researcher, worker, auditor]` — the gate is the harness's central mechanism |
-| Whole-cycle fan-out | **on**, cap 3 | Single account, shared workspace; the pool stays out (`benchmarking-plan.md` §3.4) |
-| Periodic reporter | **on** | Now load-bearing — see below |
-| Final auditor | **off** | `end_of_run.final_auditor: false` |
-| Final reporter | **off** | `end_of_run.final_reporter: false` |
-| Curator | **on** | One call; produces an ungraded ZIP. Kept because "everything else on"; the cheapest thing to drop if per-task cost runs hot |
-| Auto-compaction | on (default) | At 0.90 × 1M context |
-| Multi-account pool | **off** | Held out deliberately |
+| `loop.max_cycles` | **`null` (unlimited)** | main's score |
+| `loop.cycle_cooldown_seconds` | **400** | main's score |
+| `loop.report_interval` | **3** | main's score |
+| `loop.daily_sync_interval_hours` | **24** | main's score |
+| `loop.min_clone_cycles_before_preempt` | 1 | main's score |
+| `loop.barrier_preempt_timeout_seconds` | 3600 | main's score |
+| `loop.max_cost_usd` | **absent → unlimited** | main has no such key |
+| `loop.max_tool_calls` | **absent → unlimited** | main has no such key |
+| `cli_timeout` | **0 (no per-call ceiling)** | main's config |
+| `provider_idle_timeout_seconds` | **1800** | main's config |
+| `provider_idle_poll_seconds` | 10 | main's config |
+| `context_window` / `compact_threshold` | 1,000,000 / 0.90 | main's config |
+| Fan-out branch cap | **3** (`FANOUT_MAX_BRANCHES`) | code constant, identical on both branches |
+| End-of-run stage wall cap | 36,000 s (10 h) | `limits.WALL_CAP_SECONDS`, identical on both branches |
 
-**The periodic reporter is the deliverable.** With the final reporter off,
-nothing else writes a report for the grader. So `report_interval` is not a
-convenience knob here — it is the thing that produces the graded artifact.
-Set it to `max_cycles` so exactly one report flushes at the end, and rely
-on the graceful-stop flush if the wall budget fires first. If both paths
-somehow fail the run produces no gradeable output and scores zero, which
-is why the smoke test asserts on report provenance specifically.
+An earlier draft of this plan invented tighter values (`max_cycles: 12`,
+`cli_timeout: 5400`, `max_cost_usd: 60`, `report_interval` forced to the
+cycle cap). Those are withdrawn. They would have measured a
+budget-constrained variant of the harness that nobody runs.
 
-### Budgets, per task
+**`max_cycles: null` means the run ends when the work does.** Termination
+comes from the exhaustion detector — two consecutive cycles below 5 % of
+peak observed output, floor 500 tokens
+(`LOW_OUTPUT_FRACTION`/`LOW_OUTPUT_ABS_FLOOR`/`LOW_OUTPUT_CLOSURE_COUNT`,
+`exploration.py:3907-3909`) — or from the auditor emitting
+`[[BRANCH_COMPLETE]]`. This is the harness's actual operating point and
+the thing worth benchmarking.
 
-| Control | Value | Why |
-|---|---|---|
-| `max_cycles` | 12 | Generous; the wall budget is meant to bind first, so the harness ends on exhaustion or wall rather than an arbitrary cycle count. A long-horizon harness should be allowed to run long |
-| Wall budget | 6 h | The binding budget control; both arms get the same |
-| `cli_timeout` | 5400 s | Raised for Fable 5.1's longer turns (default is `0` = no ceiling) |
-| `provider_idle_timeout_seconds` | 3600 | Raised from 1800; belt-and-braces behind the CPU-activity check |
-| `loop.max_cost_usd` | $60 | A backstop, not the intended stop. Raised from the Opus-tier $25 for 2× token price × fan-out |
-| `loop.max_tool_calls` | unset | Wall and cycles bind first |
-| `cycle_cooldown_seconds` | 0 | Cooldown is operator comfort, not a benchmark condition |
+**Budget is tracked, not enforced.** With both caps absent,
+`budget_exceeded()` never fires (it only triggers on a cap that parses as
+a number > 0), so the usage ledger is pure observation: per-agent tokens,
+cache reads/writes, tool calls, turns, wall time and notional cost, live
+in `long-exposure status` and `long-exposure usage`, persisted in
+`usage_summary.json`, merged from fan-out clones at collapse. That is
+exactly the intended arrangement: measure everything, constrain nothing.
 
-Arm A gets the same 6 h. A single `claude -p` call will not use it; that
-asymmetry is a finding to report, not to hide.
+### The four deliberate deviations from stock
+
+Each one is a benchmark necessity, not a tuning choice:
+
+| Deviation | Why |
+|---|---|
+| `model` / `agent_models` → `claude-fable-5-1` | The experiment's variable |
+| `end_of_run.final_auditor: false`, `final_reporter: false` | Operator decision; see the deliverable note below |
+| `compact_db` → absolute, per task | Cross-task contamination (§5 item 1) |
+| `working_directory` → the RCB task workspace | Required by the adapter contract |
+
+Everything else — including `curator: true`, since "everything else on" —
+stays as shipped.
+
+### One outer bound, imposed outside the harness
+
+An unlimited-cycle run needs some bound or a single wedged task blocks the
+pass forever. Rather than cap the harness internally (which would change
+what is being measured), the adapter imposes **a 12 h per-task wall stop,
+identical for every task and every arm, via the graceful stop signal.**
+
+It is set high on purpose: most runs should exhaust naturally well inside
+it, and **the exhaustion-vs-wall-stop split is a reported result, not a
+footnote.** If a large share of tasks hit the wall, the headline becomes
+"long-exposure's score after 12 h" rather than "after natural
+exhaustion", and the write-up must say so.
+
+### The deliverable
+
+With the final reporter off, nothing else writes a report for the grader,
+so the **periodic reporter is the graded artifact**. Main's
+`report_interval: 3` handles this without special casing: a report flushes
+every third cycle, and the graceful stop flushes one too. The smoke test
+asserts report provenance because this is the most likely mechanical
+failure in this configuration — no report means a zero, not a low score.
 
 ### Runs
 
 | Pass | Runs | Purpose |
 |---|---|---|
 | Smoke | 1 | §5 item 4 gate |
-| **Main** | 40 tasks × 1 run, arm B | The full-scope result |
-| **Baseline** | 40 tasks × 1 run, arm A | The same-model comparison |
-| No-web subset | 10 tasks × 1 run, arm B | Contamination bound (§7) |
-| Variance probe | 10 tasks × 3 runs, arm B | *Recommended.* See below |
+| **Main (arm B)** | 40 × 1 | The full-scope result |
+| **Baseline (arm A)** | 40 × 1 | Same-model reference |
+| Compute control (arm A+) | 10 × 1 | §8.1 |
+| No-web subset (arm B) | 10 × 1 | §8.3 |
+| Memorisation probe | 40 × 1 call | §8.3 |
+| Variance probe (arm B) | 10 × 3 | §8.4 — recommended |
 
-One run per task matches the paper's own protocol, so the main pass is
-directly shaped like the published table. But a single run per task gives
-no error bars, and rubric variance on open-ended research tasks is
-substantial — so a bare B-vs-A difference from the main pass is an
-observation, not a measurement. The variance probe (30 extra runs on 10
-tasks) is the cheapest thing that turns it into one: it estimates
-within-task spread, which is what any claim about the difference needs. It
-is listed separately so it can be dropped, and dropping it means reporting
-the main-pass difference descriptively, without a significance claim.
-
-### Analysis
-
-- Per-task rubric score from RCB's `_score.json`; mean per arm.
-- Per-task difference B − A, reported as a distribution, not just a mean.
-  A harness that wins big on 8 tasks and loses on 30 is a different
-  finding from one that gains 2 points everywhere.
-- With the variance probe: paired bootstrap over per-task differences
-  (10,000 resamples, task as the resampling unit), using the probe's
-  within-task spread to say whether the main-pass difference is
-  distinguishable from run-to-run noise.
+One run per task matches the paper's protocol. It gives no error bars,
+which is what §8.4 is about.
 
 ---
 
-## 7. Contamination controls
+## 7. Cost accounting: notional, and labelled as such
 
-Target papers are hidden by the benchmark but are real published papers,
-and peers ran with web search enabled — so disabling it would break
-parity, while enabling it risks an agent simply retrieving the answer.
+The run bills against the Max plan through `claude -p`. **Nothing is
+billed through the API, and no API key is used for agent calls.** Marginal
+cash cost is zero; the subscription is the outlay.
 
-1. **Log every search and fetch.** Telemetry already records tool calls;
-   the adapter additionally captures query strings and fetched URLs from
-   the session transcript.
-2. **Report the retrieval rate.** Per task, whether a URL or title
-   matching the hidden target paper appeared in any run. This number goes
-   in the results table next to the score. A result that only holds on
-   tasks where the target was retrieved is not a result.
-3. **No-web subset**: 10 tasks, arm B, WebSearch and WebFetch removed from
-   `allowed_tools`, to bound the effect size.
-4. **Scored-run freeze.** Pin the commit SHA, the RCB task-set revision,
-   the judge model and the model ID before the main pass; record all of
-   them in every `result.json`. No config edits mid-pass.
+The envelope's `total_cost_usd`, which the ledger records per call, is
+therefore an **API-equivalent figure** — what these tokens would have cost
+at list price. Every table reports it as "API-equivalent cost
+(subscription-billed run)". It is the right number for comparison, because
+peers' published costs are API-priced, and the wrong number to call spend.
+
+Two consequences to report rather than hide:
+
+- **No cost ceiling is in force.** With `max_cost_usd` absent, an
+  expensive task runs to completion. Monitoring is `long-exposure usage`;
+  the response to an outlier is to report it, not to kill it, since a
+  kill would be an undisclosed cap.
+- **Max-plan rate limits are part of the experiment.** Long-exposure makes
+  many calls where arm A makes one, so throttling lands asymmetrically.
+  Rate-limit events and adaptive-cooldown time are already recorded in
+  health events; both go in `result.json` and in the results table.
 
 ---
 
-## 8. Metrics
+## 8. What makes this honest
 
-Primary: rubric score per task per arm, and the B − A distribution.
+The model is the most capable available and the harness runs at its own
+default operating point. That combination is the most flattering setup
+long-exposure will ever get, which is precisely why the controls below are
+not optional garnish — they are what separates a benchmark from a demo.
+Each is cheap relative to the main pass.
 
-Cost and efficiency: score per notional dollar; score per wall-clock hour;
-tokens in/out, cache read/write, tool calls, turns, cycles — all already
-in `usage_summary.json` per agent, with clone usage merged at fan-out
-collapse.
+### 8.1 Compute disclosure, and a control that uses the compute
 
-Harness diagnostics — these are why the ledger exists, and with no
-ablation grid they are the main source of *mechanism* evidence:
+Arm B will spend perhaps 20–50× arm A's tokens. The first objection any
+reader will raise is "you just spent more". Two answers, both required:
 
-- Auditor decision distribution per cycle, and score conditional on how
-  many cycles the auditor gated.
-- Fan-out: branches spawned per task, and score on tasks where fan-out
-  fired vs where it did not. This is observational rather than a
-  controlled contrast, and must be reported as such — but it is free.
-- Termination reasons: exhaustion vs cycle cap vs wall stop vs budget gate
-  vs failure.
-- Cycles completed per task against wall time, which is the closest thing
-  the main pass has to a dose-response curve.
-- `promise_check` green rate — does ledger discipline correlate with
-  rubric score, or is it overhead?
+- **Report spend in the headline table**, not an appendix: tokens in/out,
+  calls, cycles, wall time (raw *and* net of the 400 s/cycle cooldown,
+  which is dead time, not compute), and notional cost, per arm per task.
+  Score-per-notional-dollar and score-per-net-hour sit next to the raw
+  score.
+- **Arm A+, the compute-aware baseline.** Claude Code run k times
+  sequentially on the same task, each round fed its own previous report
+  with "continue improving this", with k chosen so total token spend
+  approximates arm B's measured median. This is the dumbest reasonable way
+  to spend the same compute without any of long-exposure's structure, so
+  B − A+ isolates **structure** from **spend** in a way B − A cannot. Ten
+  tasks is enough to see whether the gap survives. If B beats A but not
+  A+, the honest headline is "the tokens did the work, not the
+  architecture" — and that result is worth publishing.
 
-Judge configuration must match the paper: `JUDGE_MODEL_NAME=gpt-5.1` with
-the repo's default rubric-mode selection. This needs an OpenAI-compatible
-key and is a hard prerequisite — a different judge produces numbers that
-cannot sit beside the published ones.
+### 8.2 Judge integrity
+
+The judge is GPT-5.1 per the paper (`JUDGE_MODEL_NAME`), cross-family from
+the agent, which avoids self-preference. Four controls:
+
+- **Blinding.** Long-exposure reports carry harness fingerprints — "Cycle
+  7", plan-of-record and ledger references, `STRUCTURE.md`, checkpoint
+  residue — that tell the judge which system wrote them and cue "thorough
+  process". Apply one deterministic, published neutralisation pass to
+  **both** arms' reports equally, and **judge both the raw and the
+  neutralised report.** Report both scores. Silently judging either one
+  alone is a choice a reader cannot check; judging both turns a confound
+  into a measurement.
+- **Verbosity.** LLM rubric judges reward length. Record report length,
+  figure count and artifact count per run, and report score against length
+  so a reader can see whether the advantage is substance or volume.
+- **No tuning against the judge.** The §5 prompt-fit trim happens once,
+  before any scored run, decided from transcripts. After the first scored
+  run, no prompt, config or flow change without restarting the pass and
+  saying so. Hill-climbing on rubric scores would convert this from a
+  benchmark into an overfit.
+- **Drift.** Re-score a held-out sample of 10 runs at the end of the pass
+  with the same judge config. Report the delta; if it exceeds noise,
+  re-score everything.
+
+### 8.3 Contamination, in three layers
+
+- **Web retrieval.** Keep WebSearch on for parity with peers, log every
+  query and fetched URL, and report the **retrieval rate**: per task,
+  whether a URL or title matching the hidden target paper appeared. A
+  result that only holds where the target was retrieved is not a result.
+  Bound the effect with the 10-task no-web subset.
+- **Memorisation.** The target papers are real and published; a
+  frontier model may simply know them. One closed-book probe per task —
+  ask Fable 5.1 for the key finding with no data and no tools, 40 calls,
+  a few dollars — tells us which tasks are memorised regardless of web
+  access. Stratify every headline by that split. This is the layer that
+  a web-only control misses entirely, and on a "re-discovery" benchmark
+  it is the most serious threat to the whole exercise.
+- **Cross-run leakage.** Per-task `compact_db` (§5 item 1), a fresh
+  workspace per task, and a verification assertion per run. Fan-out clones
+  share the parent's instance dir by design, so the isolation boundary is
+  the task, not the clone — confirm that is what the assertion checks.
+
+### 8.4 Statistics that match what we ran
+
+One run per task cannot support a significance claim. The variance probe —
+10 tasks × 3 runs of arm B, 30 runs — estimates within-task spread, which
+is the denominator any claim about B − A needs. With it: paired bootstrap
+over per-task differences (10,000 resamples, task as the unit), plus a
+sign test over the 40 paired tasks. Without it: report the B − A
+distribution descriptively and **make no significance claim** — a
+difference of unknown noise is an observation.
+
+Pre-register the primary metric (mean rubric score, raw reports) before
+the pass so there is no metric-shopping afterwards. Freeze this document's
+commit SHA and publish it alongside results.
+
+### 8.5 Full accounting of what ran
+
+- **Every task reported, including failures.** A crashed or report-less run
+  scores whatever the judge gives it — usually zero. No quiet exclusions.
+  If a task is excluded it is pre-registered with a reason before the pass.
+- **Retry policy, pre-registered:** infrastructure failures only (container
+  death, network loss), at most one retry, every retry logged in
+  `result.json` and counted in the write-up. Never retry a bad score.
+- **Tool-surface difference, disclosed.** Long-exposure adds the MCP
+  session-search server, `figure`, `promise_check` and the workspace
+  validators; arm A has the CLI's built-in tools only. This matters more
+  than it looks because the rubric is multimodal — figures are graded. Say
+  so plainly, and report figure counts per arm.
+- **Prompt difference vs main, disclosed.** This branch materially
+  shortens the headless system prompt: interactive-only text (`/complete`,
+  `/clear`, "ask the user") removed, Wolfram guidance gated off when no
+  kernel is configured, MCP tools advertised only when actually launched,
+  one operator's hard-coded paths replaced by the derived harness root. A
+  run on this branch does not see the prompt main would send, and that is
+  a behavioural difference, not just a bug fix.
+- **Which branch deltas can touch this run.** The only other behavioural
+  change between main and this branch that the graded configuration could
+  reach is the final-stage token threshold (20k → 100k) and the restored
+  `_N_MAX` cap — and both are inert here, because the final auditor and
+  reporter are off. Everything else is bug fixes, the two switches, and
+  observability. State this, with the diff published, so a reader does not
+  have to take it on trust.
+
+### 8.6 Separating better research from better report-writing
+
+Long-exposure's reporter is an LLM summarising work it did not do; arm A's
+report is written by the agent that did the work. So part of any advantage
+could be report craft rather than research quality. RCB's rubrics
+decompose into weighted criteria, so **report the sub-scores separately.**
+If B wins only on presentation-flavoured items and not on
+implementation, measurement or analysis, that is the finding — and it is a
+much weaker claim than the headline mean would suggest.
 
 ---
 
 ## 9. Cost and calendar
 
-Per-task notional cost for arm B is the big unknown: Fable 5.1 at $10/$50
-with fan-out up to 3 branches and up to 12 cycles. Modelling it as 2× the
-Opus-tier estimate for price and up to 2× again for fan-out gives
-**$20–$60 per task**, with the $60 gate as the backstop.
+Per-task notional cost for arm B is the largest unknown in the plan:
+Fable 5.1 at $10/$50, unlimited cycles to natural exhaustion, fan-out up
+to 3 branches, no cost ceiling. Modelling 6–15 cycles at 3–4 calls each,
+with a fan-out multiplier on the cycles where it fires, gives roughly
+**$20–$150 per task** with an unbounded tail.
 
-| Pass | Runs | Agent spend (notional) | Judge | Calendar |
+| Pass | Runs | Agent spend (notional) | Judge | Notes |
 |---|---|---|---|---|
 | Build (§5) | — | <$50 | — | 1 week |
-| Smoke | 1 | <$60 | <$5 | 1 day |
-| Main (arm B) | 40 | $800–$2,400 | $150–$400 | see below |
-| Baseline (arm A) | 40 | $150–$300 | $150–$400 | parallel |
-| No-web subset | 10 | $200–$600 | $40–$100 | parallel |
-| Variance probe | 30 | $600–$1,800 | $120–$300 | optional |
+| Smoke | 1 | <$50 | <$5 | Gate |
+| Main (arm B) | 40 | $800–$6,000 | $150–$400 | Wide by construction |
+| Baseline (arm A) | 40 | $150–$400 | $150–$400 | Parallel |
+| Compute control (A+) | 10 | $200–$1,500 | $40–$100 | Matched to B's median |
+| No-web subset | 10 | $200–$1,500 | $40–$100 | |
+| Memorisation probe | 40 calls | <$10 | — | |
+| Variance probe | 30 | $600–$4,500 | $120–$300 | Optional |
 
-Total notional agent spend **$1.8k–$5.2k**, judge $0.5k–$1.2k. Actual cash
-outlay against the Max plan is the subscription; these are the
-comparability figures.
+Notional agent total **$2k–$15k**; judge $0.5k–$1.3k. The judge is the
+only line item that is real cash, and it needs an OpenAI-compatible key.
 
-**Wall clock is the real constraint, not money.** 40 arm-B tasks at up to
-6 h each is up to 240 hours serial — ten days of continuous running before
-the baseline, subset or probe. Running tasks in parallel containers is
-what makes this a two-week pass instead of a six-week one, and per-task DB
-isolation (§5 item 1) is the prerequisite for that. Decide the parallelism
-factor before the main pass; it also determines whether Max-plan rate
-limits become the binding constraint, which the smoke test cannot reveal.
+**Wall clock is the binding constraint, not money.** With a 12 h per-task
+stop, arm B alone is up to 480 hours serial — three weeks of continuous
+running. Parallel containers are what make this a few days instead, and
+per-task DB isolation (§5 item 1) is the prerequisite. Decide the
+parallelism factor before the main pass: it also determines whether
+Max-plan rate limits become the binding constraint, which the smoke test
+cannot reveal. Note that main's 400 s cooldown adds roughly 7 minutes of
+dead time per cycle — real wall clock, zero compute — which is why §8.1
+reports hours both raw and net.
 
 ---
 
@@ -397,21 +502,21 @@ limits become the binding constraint, which the smoke test cannot reveal.
 
 | Risk | Detection | Response |
 |---|---|---|
-| Fable 5.1 unavailable on this account (retention, plan) | §5 item 0, one call | Re-decide the model before anything else |
-| No gradeable report, because the final reporter is off | Smoke test asserts report provenance | Fix the fallback chain; this is the highest-probability mechanical failure in this configuration |
-| Prescriptive prompt suppresses Fable 5.1 quality | §5 item 4 prompt-fit check | Trim the operating protocol's ceremony before the main pass |
-| Long turns hit a timeout mid-work | `result.json` termination reasons; no call should hit the ceiling | Raise `cli_timeout`; already raised once for this model |
-| Arm A is a strawman | Compare arm A's behaviour to the published Claude Code entry qualitatively (different model, so scores will differ) | Use RCB's own preset unmodified; do not hand-tune it |
-| Rubric variance swamps the difference | Variance probe | Report the main-pass difference descriptively, without a significance claim |
-| Target-paper retrieval drives scores | §7 retrieval rate, no-web subset | Report conditional results |
-| B wins only by spending far more | Equal-wall and equal-notional-dollar views | Report both; a win that exists only at 10× cost is reported as such |
-| Max-plan rate limits throttle a parallel pass | Runs-per-day tracking from the first parallel batch | Lower parallelism; the harness's adaptive cooldown handles the rest |
-| Fan-out clones cross-contaminate through a shared DB | §5 item 1 verification, per task | Fan-out shares the parent instance dir by design — confirm the isolation boundary is the task, not the clone |
+| Fable 5.1 unavailable on this account | §5 item 0, one call | Re-decide the model first |
+| No gradeable report (final reporter off) | Smoke test asserts provenance | Fix the fallback chain — highest-probability mechanical failure here |
+| Prescriptive prompt suppresses Fable 5.1 quality | §5 item 4, from transcripts | One pre-scored trim, then frozen (§8.2) |
+| Target papers memorised | §8.3 probe | Stratify every headline; a fully memorised task set would invalidate the venue for this model |
+| B wins on spend, not structure | Arm A+ | Report "the tokens did the work" if that is what the data says |
+| Judge rewards length | §8.2 length reporting, dual raw/neutralised scoring | Report both; no silent choice |
+| Rubric variance swamps the difference | Variance probe | Descriptive reporting, no significance claim |
+| Unlimited cycles blow up wall clock | Exhaustion-vs-wall-stop split per task | Report the split; if most tasks hit 12 h, re-frame the headline |
+| Max-plan rate limits throttle a parallel pass | Rate-limit events in `result.json` | Lower parallelism; report cooldown time |
+| Fan-out clones cross-contaminate | §5 item 1 assertion per task | Isolation boundary is the task, not the clone |
+| Arm A is a strawman | Use RCB's preset unmodified | Never hand-tune the baseline |
 
 Kill criterion: **if the smoke test cannot produce a gradeable
 `report/report.md` from the periodic reporter, the main pass does not
-start.** That is a mechanical failure, not a result, and it would score 40
-zeros.
+start.** That is a mechanical failure worth 40 zeros, not a result.
 
 ---
 
@@ -436,47 +541,55 @@ zeros.
 
 ### Per-task bench config (generated by the adapter)
 
+Only the model IDs and the two per-task paths differ from stock. Every
+timer, ceiling and cap is main's.
+
 ```yaml
-# EXACT model ID everywhere, never the `fable` alias — an alias resolves to
-# whatever is current that week, which makes the run unreproducible.
+# EXACT model ID everywhere, never the `fable` alias.
 model_tier: claude-fable-5-1
 model: claude-fable-5-1
 agent_models:
   researcher:     { provider: claude, model: claude-fable-5-1, effort: high }
   worker:         { provider: claude, model: claude-fable-5-1, effort: high }
   auditor:        { provider: claude, model: claude-fable-5-1, effort: high }
-  reporter:       { provider: claude, model: claude-fable-5-1, effort: high }
+  reporter:       { provider: claude, model: claude-fable-5-1, effort: medium }
   curator:        { provider: claude, model: claude-fable-5-1, effort: medium }
 
-working_directory: <WORKSPACE>
-compact_db: <INSTANCE_DIR>/sessions.db   # absolute; per-task isolation
-cli_timeout: 5400                        # Fable 5.1 turns run long
-provider_idle_timeout_seconds: 3600      # raised from 1800
+working_directory: <WORKSPACE>           # per task
+compact_db: <INSTANCE_DIR>/sessions.db   # absolute, per task — isolation
+
+# --- everything below is main's default, reproduced for the record ---
+cli_timeout: 0
+provider_idle_timeout_seconds: 1800
+provider_idle_poll_seconds: 10
 context_window: 1000000
 compact_threshold: 0.90
-wolfram_path: ""                         # no kernel in the container
-test_runner: ""
+wolfram_path: ""                         # stock; no kernel in the container
 ```
 
-The reporter is at `high`, not the usual `medium`: with the final reporter
-off it writes the graded deliverable.
+The reporter stays at main's `medium` effort. It writes the graded
+deliverable here, which is an argument for raising it — and exactly the
+kind of tuning that would stop this being a stock-budget run, so it is
+left alone and noted instead.
 
-### Score `loop` block
+### Score `loop` block (main's values verbatim)
 
 ```yaml
 loop:
-  max_cycles: 12
-  cycle_cooldown_seconds: 0
-  report_interval: 12        # one flush at the end (0 would mean EVERY cycle)
-  daily_sync_interval_hours: 0
-  fanout_enabled: true
-  end_of_run:
+  max_cycles: null               # unlimited — run to exhaustion
+  cycle_cooldown_seconds: 400
+  report_interval: 3             # flushes the graded report
+  daily_sync_interval_hours: 24
+  min_clone_cycles_before_preempt: 1
+  barrier_preempt_timeout_seconds: 3600
+  # No max_cost_usd / max_tool_calls: main has no such keys, so the ledger
+  # tracks and never gates.
+  fanout_enabled: true           # branch-only key; true == main's behaviour
+  end_of_run:                    # branch-only key
     enabled: true
-    final_auditor: false
-    final_reporter: false
+    final_auditor: false         # operator decision
+    final_reporter: false        # operator decision
     curator: true
-  max_cost_usd: 60
-  max_tool_calls: null
 
 flow: [researcher, worker, auditor]
 ```
@@ -484,14 +597,12 @@ flow: [researcher, worker, auditor]
 ### Environment
 
 ```bash
-# Judge — must match the paper for comparability
+# Judge only — the one real-cash API key in the campaign
 JUDGE_MODEL_NAME=gpt-5.1
 JUDGE_API_BASE=https://api.openai.com/v1
 JUDGE_API_KEY=...
 
-# One-launch overrides, for sanity checks without editing a score
-LONG_EXPOSURE_FANOUT=0
-LONG_EXPOSURE_END_OF_RUN=0
+# Agent calls use the Max plan via `claude -p`. No ANTHROPIC_API_KEY.
 ```
 
 ### Deliverable paths
@@ -499,10 +610,11 @@ LONG_EXPOSURE_END_OF_RUN=0
 | Artifact | Path |
 |---|---|
 | Graded report | `<WORKSPACE>/report/report.md` (RCB's contract) |
-| Source of that report | newest `<WORKSPACE>/reports/report_cycles_*.md` |
-| Our run record | `<OUT_DIR>/result.json` |
+| Its source | newest `<WORKSPACE>/reports/report_cycles_*.md` |
+| Run record | `<OUT_DIR>/result.json` |
 | Usage ledger | `<INSTANCE_DIR>/output/usage_summary.json` |
 | Telemetry | `<INSTANCE_DIR>/telemetry/events.jsonl` |
+| Health events | `<INSTANCE_DIR>/health_events.jsonl` |
 | Judge output | `<WORKSPACE>/_score.json` |
 
 ---
@@ -511,18 +623,20 @@ LONG_EXPOSURE_END_OF_RUN=0
 
 | Decision | Choice | Consequence carried in this plan |
 |---|---|---|
-| Model | `claude-fable-5-1`, both arms, `high` effort | No board tie-back, so arm A is load-bearing; 2× token price; timeouts raised; prompt-fit check added to the smoke test |
-| Staging | Smoke test, then the full pass | One gate, and it is mechanical: no gradeable report means no main pass |
-| Configuration | One config, all features on except the final auditor and final reporter; full 40-task scope | No ablation grid — mechanism evidence comes from observational diagnostics (§8); the periodic reporter becomes the deliverable |
-| Web access | On and logged, plus a 10-task no-web subset | Peer parity kept, retrieval rate reported, effect size bounded |
+| Model | `claude-fable-5-1`, every arm, `high` effort | No board tie-back, so arm A is load-bearing; 2× notional price; prompt-fit check added |
+| Billing | Max plan via `claude -p`; no API key for agent calls | Cost is notional/API-equivalent and labelled as such (§7); the judge key is the only cash line |
+| Budget | Every ceiling, timer and cap as `main` ships them | Unlimited cycles and no cost cap: the harness runs to exhaustion, the ledger tracks without gating, and a 12 h per-task wall stop is imposed *outside* the harness and reported |
+| Configuration | One config, all features on except the final auditor and final reporter, full 40-task scope | No ablation grid; mechanism evidence is observational (§8.6); the periodic reporter is the deliverable |
+| Web access | On and logged, plus a 10-task no-web subset | Peer parity kept; retrieval rate reported; memorisation probe added (§8.3) |
 
-Two things were decided by implication rather than explicitly, and are
-easy to change:
+Decided by implication, and easy to reverse:
 
 - **Arm A is included.** "One run with all features enabled" was read as
   one long-exposure *configuration* — no feature matrix — not as dropping
-  the baseline. On Fable 5.1 the baseline is the only same-model reference
-  the campaign has; without it there is a score but no harness comparison.
-- **The variance probe is proposed, not assumed.** 30 extra runs to get
-  error bars on the headline difference. Drop it and the main-pass
-  difference is reported descriptively.
+  the baseline. On Fable 5.1 it is the only same-model reference the
+  campaign has.
+- **Arm A+ and the variance probe are proposed, not assumed.** Together
+  they are what make the result defensible rather than suggestive: A+
+  answers "was it just more tokens", the probe answers "is the difference
+  bigger than noise". Dropping either is survivable if the corresponding
+  claim is dropped with it.
