@@ -61,7 +61,7 @@ long-exposure does, see the project [README](../README.md).
 | [`gaps.md`](gaps.md) | Known gaps: resolved incidents (with root-cause notes) and deliberately deferred items with justifications | Before filing/fixing a bug |
 | [`gaps_interactive_mode.md`](gaps_interactive_mode.md) | Opt-in interactive Claude transport: design, configuration, verification, and its own gaps table | Considering `claude_transport: interactive` |
 | [`benchmarking-plan.md`](benchmarking-plan.md) | Sept 2026 evaluation of the harness (verified code-vs-docs findings), survey of harness-labelled public benchmarks, and a phased plan to benchmark long-exposure against peer harnesses | Planning or reading a benchmark campaign |
-| [`rcb-benchmark-plan.md`](rcb-benchmark-plan.md) | Runnable pre-registration for the single primary venue (ResearchClawBench): pinned model, arms, staging gates, budgets, contamination controls, and the exact bench config | Actually executing the benchmark |
+| [`rcb-benchmark-plan.md`](rcb-benchmark-plan.md) | Runnable pre-registration for the single primary venue (ResearchClawBench): one arm on Fable 5.1 at main's stock budget, 40 tasks, one shot each, plus contamination controls, judge controls, and the exact bench config | Actually executing the benchmark |
 
 ---
 
