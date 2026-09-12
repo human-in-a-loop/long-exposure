@@ -209,6 +209,50 @@ def _record_usage(
         pass
     return result
 
+
+# Per-provider model keys, mirroring conductor.py's resolution: a call that
+# ran under codex/gemini/local used config["<provider>_model"], not the
+# claude-shaped config["model"].
+_PROVIDER_MODEL_KEYS = {
+    _provider.CODEX: "codex_model",
+    _provider.GEMINI: "gemini_model",
+    _provider.LOCAL: "local_model",
+}
+
+
+def _served_attribution(
+    agent_def: dict | None, config: dict | None
+) -> tuple[str, str | None]:
+    """The provider and model that actually served the call that just returned.
+
+    Two regimes, and the difference matters for pricing:
+
+    - Per-agent-pinned runs swap the process provider only for the duration
+      of one call, so by ledger time the env may already be unwound —
+      resolve from the agent definition. Such runs never rotate providers
+      (pooling is deferred), so the definition stays accurate.
+    - Every other run resolves from the live env. A unified-pool rotation
+      (mid-retry in `_call_agent_with_rotation`, or at the cycle boundary)
+      repins the process through LONG_EXPOSURE_LLM_PROVIDER and leaves
+      `config["llm_provider"]` at its pre-rotation value, so reading config
+      would price a call against the provider it rotated away from — and
+      with that provider's model name, which misses the price table
+      entirely and silently falls back to a default rate.
+
+    Model resolution mirrors conductor.build_agent_config: an explicit
+    ``agent_def["model"]`` wins, else the provider's own model key.
+    """
+    if (config or {}).get("_per_agent_pinned"):
+        prov = agent_routing.agent_provider(agent_def, config)
+    else:
+        prov = _provider.current_provider()
+    model = (agent_def or {}).get("model")
+    if not model:
+        key = _PROVIDER_MODEL_KEYS.get(prov)
+        model = ((config or {}).get(key) if key else None) or (config or {}).get("model")
+    return prov, model
+
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
@@ -1767,23 +1811,20 @@ def _call_agent_with_rotation(
         # so this is a single attempt under the agent's pinned provider (no
         # cross-account / cross-provider rotation).
         with agent_routing.agent_provider_context(agent_def, _cfg):
+            _pinned_result = _call_exploration_agent(
+                agent_name=agent_name,
+                agent_def=agent_def,
+                agent_sessions=sessions_dict,
+                **kwargs,
+            )
+            _prov, _model = _served_attribution(agent_def, _cfg)
             return _record_usage(
-                agent_name,
-                _call_exploration_agent(
-                    agent_name=agent_name,
-                    agent_def=agent_def,
-                    agent_sessions=sessions_dict,
-                    **kwargs,
-                ),
-                config=_cfg,
-                model=agent_def.get("model") or _cfg.get("model"),
-                provider=agent_routing.agent_provider(agent_def, _cfg),
+                agent_name, _pinned_result,
+                config=_cfg, model=_model, provider=_prov,
             )
 
     accounts = _parse_accounts()
     is_forced, _ = _resolve_force_account(accounts)
-    _model = agent_def.get("model") or _cfg.get("model")
-    _prov = agent_routing.agent_provider(agent_def, _cfg)
 
     if is_forced and (_is_clone() or not (pool.is_active() or unified_pool.is_unified_active())):
         # Pinned clone or manually pinned non-pool run. Single attempt:
@@ -1791,17 +1832,15 @@ def _call_agent_with_rotation(
         # silently rotate away from the operator's chosen account. Root pool
         # pins are different: the pool itself uses FORCE env vars to route
         # calls, so they must remain eligible for pool-aware rotation.
+        _single = _call_exploration_agent(
+            agent_name=agent_name,
+            agent_def=agent_def,
+            agent_sessions=sessions_dict,
+            **kwargs,
+        )
+        _prov, _model = _served_attribution(agent_def, _cfg)
         return _record_usage(
-            agent_name,
-            _call_exploration_agent(
-                agent_name=agent_name,
-                agent_def=agent_def,
-                agent_sessions=sessions_dict,
-                **kwargs,
-            ),
-            config=_cfg,
-            model=_model,
-            provider=_prov,
+            agent_name, _single, config=_cfg, model=_model, provider=_prov,
         )
 
     pool_active = _pool.is_active() or unified_pool.is_unified_active()
@@ -1828,6 +1867,9 @@ def _call_agent_with_rotation(
             **kwargs,
         )
         if result["status"] != "rate_limit":
+            # Resolve attribution here, not before the loop: this attempt may
+            # have run on a provider/account a previous iteration rotated to.
+            _prov, _model = _served_attribution(agent_def, _cfg)
             return _record_usage(
                 agent_name, result, config=_cfg, model=_model, provider=_prov,
             )
@@ -2050,7 +2092,7 @@ def _compact_agent_session_impl(
         },
         config=config,
         model=agent_config.get("model"),
-        provider=agent_routing.agent_provider(agent_def, config),
+        provider=_served_attribution(agent_def, config)[0],
     )
 
     # Strip ``` fences and check for non-empty payload. Empty already means
@@ -4216,19 +4258,24 @@ def run_exploration(
                         agent_sessions=agent_sessions,
                         agent_summaries=agent_summaries,
                     )
+                # Resolved after the call: a cycle-boundary unified-pool
+                # rotation repins the provider in the env without touching
+                # config["llm_provider"], so reading config here would price
+                # every later cycle against the rotated-away provider.
+                _served_prov, _served_model = _served_attribution(agent_def, config)
                 _record_usage(
                     agent_name,
                     result,
                     config=config,
-                    model=agent_def.get("model") or config.get("model"),
-                    provider=agent_routing.agent_provider(agent_def, config),
+                    model=_served_model,
+                    provider=_served_prov,
                 )
                 telemetry.emit_agent_result(
                     agent_name,
                     result,
                     cycle=cycle,
-                    provider=agent_routing.agent_provider(agent_def, config),
-                    model=agent_def.get("model") or config.get("model"),
+                    provider=_served_prov,
+                    model=_served_model,
                     context_window=context_window,
                 )
 

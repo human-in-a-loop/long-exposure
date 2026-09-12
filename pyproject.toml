@@ -54,7 +54,10 @@ build-backend = "hatchling.build"
 packages = ["long_exposure", "auto_compact"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"long_exposure/templates" = "long_exposure/templates"
-"long_exposure/config.yaml" = "long_exposure/config.yaml"
-"long_exposure/exploration-score.yaml" = "long_exposure/exploration-score.yaml"
+# Only paths OUTSIDE the two packages belong here. `long_exposure/templates`,
+# `config.yaml` and `exploration-score.yaml` live inside the package and are
+# already carried by `packages` above; force-including them made hatchling
+# add the same archive member twice and fail the build outright
+# ("A second file is being added to the wheel archive at the same path"),
+# so `uv build --wheel` could not produce a wheel at all.
 "run_final_reporter.py" = "run_final_reporter.py"

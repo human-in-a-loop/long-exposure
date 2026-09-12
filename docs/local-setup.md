@@ -262,9 +262,12 @@ want to re-render against updated sources):
 python run_final_reporter.py --state long_exposure/data/exploration_state.json
 ```
 
-Loads saved state, runs `_run_final_reporter` then `_run_curator`,
-re-saves state with the outputs. Also accepts `--score`, `--config`,
-`--instance-dir`.
+Loads saved state, runs the final auditor, then `_run_final_reporter`,
+then `_run_curator` — the same order and the same `loop.end_of_run`
+switches as the main loop — re-saving state after each. Also accepts
+`--score`, `--config`, `--instance-dir`, and `--skip-auditor` (reuse the
+existing `final_audit_summary.json` instead of re-auditing). See
+docs/usage-guide.md for the full description.
 
 ---
 

@@ -24,10 +24,11 @@ best-effort and degrades to "no data".
 from __future__ import annotations
 
 import json
-import os
 import threading
 from pathlib import Path
 from typing import Any
+
+from long_exposure.stage_io import atomic_write_text
 
 COUNTER_FIELDS: tuple[str, ...] = (
     "calls",
@@ -421,13 +422,17 @@ class UsageLedger:
         return "\n".join(lines) + "\n"
 
     def write_summary(self, output_dir: Path, *, loop_cfg: dict | None = None) -> None:
-        """Atomically write output/usage_summary.json. Best-effort."""
+        """Atomically write output/usage_summary.json. Best-effort.
+
+        Uses the shared primitive so the temp name is unique per
+        process/thread: a fixed `.tmp` sibling let a manager-thread write
+        and a loop write publish each other's half-flushed file.
+        """
         try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            target = output_dir / "usage_summary.json"
-            tmp = target.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self.summary_dict(loop_cfg=loop_cfg), indent=2, sort_keys=True))
-            os.replace(tmp, target)
+            atomic_write_text(
+                Path(output_dir) / "usage_summary.json",
+                json.dumps(self.summary_dict(loop_cfg=loop_cfg), indent=2, sort_keys=True),
+            )
         except OSError:
             return
 

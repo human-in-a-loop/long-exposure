@@ -17,9 +17,10 @@ as they do for `python -m long_exposure.exploration`.
 """
 
 import argparse
+import os
 from pathlib import Path
 
-from long_exposure import paths
+from long_exposure import agent_routing, health_events, paths, provider, telemetry
 from long_exposure import exploration as _exploration
 from long_exposure.auditing import _run_final_auditor
 from long_exposure.exploration import (
@@ -35,6 +36,7 @@ from long_exposure.exploration import (
     update_status_file,
 )
 from long_exposure.orchestrator import load_config, resolve_instance_dir
+from long_exposure.workspace_bootstrap import derive_run_id
 from long_exposure.reporting import _pdf_needs_render
 from auto_compact.db import init_db
 
@@ -111,6 +113,21 @@ def main():
     if "allowed_tools" in score:
         config["allowed_tools"] = score["allowed_tools"]
 
+    # Same per-agent routing the loop sets up. Without this a heterogeneous
+    # score's final agents all ran on the global provider here (the pinning
+    # context manager is a no-op unless the flag is set), and the usage
+    # ledger attributed their spend to that provider's price table.
+    agent_routing.apply_agent_models(config, score)
+    config["_per_agent_pinned"] = agent_routing.per_agent_pinned(config, score)
+    if config["_per_agent_pinned"]:
+        os.environ["LONG_EXPOSURE_PER_AGENT_PINNED"] = "1"
+    else:
+        # Clear it as the loop does: a stale value inherited from a parent
+        # process would make sibling machinery treat a homogeneous run as
+        # pinned.
+        os.environ.pop("LONG_EXPOSURE_PER_AGENT_PINNED", None)
+    provider.configure_provider(config)
+
     # Inject shared citations
     shared_citations = score.get("citations", "")
     if shared_citations:
@@ -126,10 +143,52 @@ def main():
 
     conn = init_db(Path(config["compact_db"]))
 
+    # Same run identity as the loop would use. The final auditor keys its
+    # ledger cycle count and reconciliation event uuid5s on run_id, so a
+    # synthesized-per-invocation id would stick the lessons cap at 1 and
+    # break idempotency across passes. Prefer state, then the one the loop
+    # persisted inside results, and only then synthesize.
+    run_id = state.get("run_id") or results.get("run_id") or derive_run_id()
+    results["run_id"] = run_id
+
+    # Observability sinks. run_exploration configures both; this entrypoint
+    # bypasses it, so without these the whole standalone pipeline emitted no
+    # telemetry (usage_recorded included) and dropped every health event
+    # (file-gate rescues, PDF render failures) on the floor.
+    telemetry.configure(config, data_dir, run_id)
+    health_events.configure(data_dir)
+
     print(f"[run_final] Loaded state: cycle {cycle}")
     print(f"[run_final] Working dir: {config.get('working_directory')}")
 
     loop_cfg = score.get("loop", {}) or {}
+    # The status renderer and usage_summary.json read this module global for
+    # the budget figures; only run_exploration sets it, so without this the
+    # standalone pipeline wrote a status file with no budget line.
+    _exploration._current_loop_cfg = loop_cfg
+
+    def _save():
+        """Persist state, carrying forward every field this entrypoint does
+        not own. save_state writes the full document, so omitting these
+        silently erased run identity, daily-sync bookkeeping and the
+        exhaustion-detector calibration from the state file — a later
+        `--resume` would then re-fire the daily sync on cycle 1 and start
+        the low-output streak over."""
+        save_state(
+            state_path, cycle, results, consecutive_failures,
+            last_session_id, agent_sessions, agent_summaries,
+            post_merge_pending=bool(state.get("post_merge_pending")),
+            task=task,
+            run_id=run_id,
+            last_daily_sync_at=state.get("last_daily_sync_at"),
+            daily_sync_count=state.get("daily_sync_count", 0) or 0,
+            daily_sync_in_progress=bool(state.get("_daily_sync_in_progress")),
+            reanchor_emitted=state.get("_reanchor_emitted") or {},
+            agent_context_tokens=state.get("agent_context_tokens") or {},
+            peak_cycle_output=state.get("peak_cycle_output", 0) or 0,
+            low_output_streak=state.get("low_output_streak", 0) or 0,
+            usage_basis=state.get("usage_basis"),
+        )
 
     # --- Final Auditor ---
     # Runs BEFORE the reporter, matching the main pipeline: the reporter
@@ -151,14 +210,13 @@ def main():
                 data_dir=data_dir,
                 agent_sessions=agent_sessions,
                 agent_summaries=agent_summaries,
+                run_id=run_id,
             )
         except Exception as e:
             # Same isolation as the main pipeline: the reporter still runs
             # with whatever audit artifacts exist.
             print(f"[run_final] Final auditor failed (non-fatal): {e!r}")
-        save_state(state_path, cycle, results, consecutive_failures,
-                   last_session_id, agent_sessions, agent_summaries,
-                   task=task)
+        _save()
     else:
         print("[run_final] No final_auditor defined in score. Skipping.")
 
@@ -180,9 +238,7 @@ def main():
             agent_sessions=agent_sessions,
             agent_summaries=agent_summaries,
         )
-        save_state(state_path, cycle, results, consecutive_failures,
-                   last_session_id, agent_sessions, agent_summaries,
-                   task=task)
+        _save()
 
         # Ensure PDF was rendered (the exploration loop handles this, but
         # run_final_reporter.py bypasses the loop so we check here too)
@@ -213,9 +269,7 @@ def main():
             agent_sessions=agent_sessions,
             agent_summaries=agent_summaries,
         )
-        save_state(state_path, cycle, results, consecutive_failures,
-                   last_session_id, agent_sessions, agent_summaries,
-                   task=task)
+        _save()
     else:
         print("[run_final] No curator defined in score. Skipping.")
 

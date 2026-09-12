@@ -15,9 +15,10 @@ Stdlib only, and deliberately free of long-exposure imports beyond
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
-import time
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -38,19 +39,38 @@ def file_signature(path: Path) -> tuple[int, int] | None:
         return None
 
 
+_write_seq = itertools.count()
+
+
 def atomic_write_text(path: Path, text: str) -> None:
     """Write text via a unique sibling temp file + os.replace.
 
-    The temp name carries pid and millisecond so two processes (concurrent
-    fan-out clones, a run plus a standalone re-render) never collide on one
-    `.tmp` path, and still ends in `.tmp` so the curator's hard-exclude
-    suffixes catch any file left behind by a crash mid-write.
+    The temp name carries pid, thread id and a process-local counter, so
+    neither two processes (concurrent fan-out clones, a run plus a
+    standalone re-render) nor two threads (`launch --manager` polls while
+    the loop runs) can collide on one `.tmp` path. A shared temp name is
+    not merely untidy: writer A's `os.replace` would publish whatever
+    writer B had flushed so far, i.e. a truncated artifact under the real
+    filename. The name still ends in `.tmp` so the curator's hard-exclude
+    suffixes catch anything left behind by a crash mid-write.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{int(time.time() * 1000)}.tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    tmp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}"
+        f".{next(_write_seq)}.tmp"
+    )
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except BaseException:
+        # Never leave a stray temp behind on failure (including
+        # KeyboardInterrupt mid-write, which the run-control path can raise).
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def marker_metadata(marker_path: Path) -> dict | None:

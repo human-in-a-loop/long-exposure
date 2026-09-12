@@ -731,6 +731,35 @@ class StageIoSharedHelperTests(unittest.TestCase):
             # so the curator's suffix exclude catches a crashed write.
             self.assertEqual(list(Path(td).rglob("*.tmp")), [])
 
+    def test_concurrent_atomic_writes_never_publish_a_partial_file(self):
+        """A shared temp name let one writer's os.replace publish another
+        writer's half-flushed bytes. Every observed value must be whole."""
+        import threading as _threading
+        from long_exposure import stage_io
+        bodies = [f"payload-{i}-" + str(i) * 20000 for i in range(8)]
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "out" / "usage_summary.json"
+            seen, errors = [], []
+
+            def writer(body):
+                try:
+                    for _ in range(12):
+                        stage_io.atomic_write_text(target, body)
+                        seen.append(target.read_text())
+                except Exception as exc:  # pragma: no cover - failure path
+                    errors.append(exc)
+
+            threads = [_threading.Thread(target=writer, args=(b,)) for b in bodies]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [])
+            self.assertTrue(seen)
+            for text in seen:
+                self.assertIn(text, bodies)
+            self.assertEqual(list(Path(td).rglob("*.tmp")), [])
+
     def test_commit_marker_and_baseline_round_trip(self):
         from long_exposure import stage_io
         with tempfile.TemporaryDirectory() as td:
