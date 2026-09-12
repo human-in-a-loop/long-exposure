@@ -6,11 +6,11 @@ survey and the rejected venues stay in `docs/benchmarking-plan.md`; this
 document supersedes its §5.2.
 
 Status: **pre-registration.** Nothing here has been run. Peer numbers are
-from the published paper and repository, not from our runs.
+from the published paper, not from our runs.
 
 ---
 
-## 1. The venue
+## 1. The venue, and the two rows we can stand next to
 
 **ResearchClawBench** (InternScience, arXiv 2606.07591, MIT licence;
 [repo](https://github.com/InternScience/ResearchClawBench),
@@ -22,17 +22,15 @@ figures. An expert-curated multimodal rubric is scored by an LLM judge on
 a 100-point scale where **50 = reference-level evidence (the target paper
 re-discovered)** and >50 implies discovery beyond it.
 
-It was chosen because the published unit of comparison is the harness, the
-task shape is a long-exposure directive, the grader is public, and it
-needs no GPU.
+Chosen because the published unit of comparison is the harness, the task
+shape is a long-exposure directive, the grader is public, and it needs no
+GPU.
 
-### The published table
-
-From the paper (280 runs = seven agents × 40 tasks, one run each):
+### Autonomous agent harnesses (paper: 280 runs, 7 agents × 40 tasks, one run each)
 
 | Agent (harness) | Model | Avg score |
 |---|---|---|
-| **Claude Code** | Claude-Opus-4.6 | **21.5** |
+| **Claude Code** | **Claude-Opus-4.6** | **21.5** |
 | EvoScientist v0.1.1 | GPT-5.4 | 18.8 |
 | Codex CLI | GPT-5.4 | 18.4 |
 | OpenClaw | GPT-5.4 | 16.6 |
@@ -40,112 +38,161 @@ From the paper (280 runs = seven agents × 40 tasks, one run each):
 | EvoScientist v0.0.4 | GPT-5.4 | 15.5 |
 | ARIS Codex | Codex/GPT-5.4 | 13.6 |
 | Nanobot | GPT-5.4 | 12.8 |
-| *ResearchHarness* (thin baseline) | Claude-Opus-4.7 | 20.7 |
 
-Everything is far below 50 — there is real headroom. But read the top two
-rows together, because they set the interpretive frame for a single-arm
-run: **a thin harness on Opus 4.7 scored 20.7 and the best agent harness
-on Opus 4.6 scored 21.5.** On this venue, moving from almost no scaffold
-to the best-performing agent harness bought under one point on comparable
-models. Whatever we score, that gap is the scale on which harness effects
-have so far been observed here.
+No agent ran on more than one model.
+
+### ResearchHarness thin baseline, 17 native LLMs (paper Table 5, top of list)
+
+| Model | Avg score |
+|---|---|
+| Claude-Opus-4.7 | 20.7 |
+| **Claude-Opus-4.6** | **19.9** |
+| Qwen3.7-Max | 18.7 |
+| GLM-5.1 | 18.2 |
+| … (13 more, down to Grok-4.3 at 12.4) | |
+
+### Why this settles the model choice
+
+The two tables intersect at exactly one model.
+
+| Candidate | Same-model published harnesses | What they are |
+|---|---|---|
+| **Claude-Opus-4.6** | **2** | Claude Code **21.5** (the best published *agent* harness) and ResearchHarness **19.9** (a thin scaffold) |
+| Claude-Opus-4.7 | 1 | ResearchHarness **20.7** only — no agent harness ran on 4.7 |
+
+Opus 4.6 gives twice the comparability, and the extra row is the one that
+matters most: the strongest published agent harness, the direct
+competitor. It also produces something a single-arm run normally cannot
+have — **a bracket measured on our exact model**:
+
+> On Claude-Opus-4.6, a thin scaffold scores **19.9** and the best agent
+> harness scores **21.5**. That 1.6-point band is the observed harness
+> effect on this venue, on this model.
+
+That band is the number long-exposure has to beat to be interesting, and
+it is measured under the same model we will run. Nothing about Fable 5.1
+could have given us that: no published row runs that tier, so model and
+harness would have moved together.
+
+**Decision: `claude-opus-4-6`.** Fallback order and its cost is in §3.
 
 ---
 
 ## 2. What this run is, and what it is not
 
 **One arm.** Long-exposure, one configuration, everything on except the
-final auditor and final reporter (§6), on `claude-fable-5-1`, across all
-40 tasks, one attempt each. No baseline arm, no ablation grid. 41 runs
+final auditor and final reporter (§5), on `claude-opus-4-6`, across all 40
+tasks, one attempt each. No baseline arm, no ablation grid. 41 runs
 including the smoke test.
 
 ### What it measures
 
-- **A leaderboard row**: the rubric score of *this harness on this model*
-  on a public benchmark with a public grader. Every entry on that board is
-  a harness × model pair; ours would be a new one, honestly labelled.
-- **Whether the pair crosses the benchmark's own threshold.** Fifty means
-  the hidden target paper was re-discovered. No published system is close.
-  "Does the most capable model inside a long-horizon harness get nearer to
-  50, and on which domains" is a real question this run answers.
+- **A harness comparison on a shared model.** Our score sits next to
+  21.5 and 19.9, both produced on Claude-Opus-4.6. The model is held
+  fixed, so a difference is attributable to harness and conditions rather
+  than to model generation. This is the whole reason for choosing 4.6.
+- **A leaderboard row**: this harness on this model, honestly labelled.
+- **Whether the pair approaches the benchmark's own threshold.** Fifty
+  means the hidden target paper was re-discovered; nothing published is
+  close.
 - **How the harness behaves on 40 real research tasks at its default
   operating point** — cycles to exhaustion, auditor verdict patterns,
-  fan-out incidence, spend, failure modes. This is engineering evidence
-  that does not need a comparison to be worth having, and it is what the
-  §8 diagnostics are for.
+  fan-out incidence, spend, failure modes (§7.6). Engineering evidence
+  that stands on its own.
 
-### What it cannot establish
+### What it still cannot establish
 
-**It cannot attribute any difference from a published row to the
-harness.** Every peer row runs a different, older model (Opus 4.6/4.7 or
-GPT-5.4). Our row changes the model *and* the harness at once, so the two
-are fully confounded. Given §1's observation — under one point between a
-thin harness and the best agent harness on comparable models — the
-prior should be that **most of any headline gain over 21.5 is the model,
-not long-exposure.** A single-arm design cannot separate them, and no
-analysis after the fact can rescue that.
+The model is controlled; the *conditions* are not. Four gaps, all of which
+must travel with the number:
 
-Three sentences must therefore appear in the conclusions, not buried in a
-limitations paragraph. Pre-registering them here is what keeps them from
-being dropped when the numbers arrive:
+1. **Different judge invocation.** Same judge model name (`gpt-5.1`), but
+   the paper's grading run happened earlier, possibly on a different
+   snapshot. Judge drift between their run and ours is uncontrolled.
+2. **Different harness vintage on their side.** Their Claude Code row used
+   whatever version was current then; the CLI has moved since.
+3. **One run per task on both sides.** Neither our number nor theirs
+   carries a variance estimate, so a small gap is not distinguishable from
+   run-to-run noise.
+4. **No compute-matched control.** Long-exposure at its default operating
+   point spends one to two orders of magnitude more tokens than Claude
+   Code's single call. A win is a win *at the harness's own operating
+   point*, not at equal spend.
 
-1. This run had no same-model baseline, so it makes **no causal claim**
-   about long-exposure's contribution.
-2. The comparison to published peers is **confounded by model
-   generation**, and the published table's own spread suggests the model
-   dominates.
-3. There was no compute-matched control, so any advantage is also
-   confounded with **spending one to two orders of magnitude more tokens**
-   than a single-call harness.
+Three sentences are therefore pre-registered for the conclusions, so they
+cannot be dropped when the numbers arrive:
 
-A same-model baseline (RCB's own Claude Code preset on `claude-fable-5-1`,
-40 runs, roughly $150–$400 notional) is what would convert this from a
-characterisation into a comparison. It is out of scope by decision, and
-the decision is recorded in §12 so a reader knows it was a choice rather
-than an oversight.
+1. The comparison to 21.5 and 19.9 is **same-model but not
+   same-conditions**: different judge invocation, different harness
+   vintage, one run per task on both sides.
+2. There was **no in-house baseline** run under our own conditions, so the
+   conditions gap above is unquantified.
+3. There was **no compute-matched control**, so any advantage is
+   confounded with spending far more tokens.
+
+An in-house baseline — RCB's Claude Code preset on `claude-opus-4-6`, 40
+runs, roughly $80–$200 notional — is what would close gap 1 and 2 and turn
+the published rows into a cross-check rather than the primary reference.
+It is out of scope by decision, recorded in §11.
 
 ---
 
-## 3. Model: `claude-fable-5-1`
+## 3. Model: `claude-opus-4-6`
 
 Pinned for every role at `high` effort, through
-`claude -p --model claude-fable-5-1 --effort high`. Max plan, subscription
+`claude -p --model claude-opus-4-6 --effort high`. Max plan, subscription
 billing, nothing through the API.
 
-Fable 5.1 is Anthropic's most capable widely released model — the right
-choice if the question is "what is the best research this harness can
-produce". Four consequences, accepted deliberately:
+### Why this is the easier model to run, as well as the comparable one
 
-1. **It is the confound.** No published peer runs this tier, so the model
-   difference is doing unknown work in any comparison (§2).
-2. **2× the token price** ($10/$50 per MTok vs Opus-tier $5/$25) in the
-   notional accounting of §9. No cash effect: see §7.
-3. **Different model behaviour, in a direction that matters here.**
-   Thinking is always on and cannot be disabled. More important: prompts
-   written for earlier models are often *too prescriptive* for Fable 5.1
-   and reduce output quality. Long-exposure's four-layer system prompt is
-   exactly that shape — philosophy + framework + operating protocol +
-   role, with checkpoint-block rules and a named anti-pattern list on
-   every call. §5 item 4 is a one-time, pre-scored prompt-fit check.
-4. **Longer single turns.** Main's defaults are `cli_timeout: 0` (no
-   per-call ceiling) and `provider_idle_timeout_seconds: 1800`. That pair
-   turns out to be right for this model: the idle watchdog checks
-   process-tree CPU as well as file progress
-   (`orchestrator.py:3163-3182`), so a turn that thinks for 40 minutes
-   survives while a genuinely wedged process is still killed. Both stay at
-   main's values.
+Reverting from Fable 5.1 to Opus 4.6 removes four complications, not just
+the confound:
+
+1. **Half the notional price.** $5/$25 per MTok against Fable's $10/$50,
+   which halves every figure in §8.
+2. **The prompt-fit worry largely goes away.** Fable 5.1 is the model that
+   penalises over-prescriptive prompts, and long-exposure's four-layer
+   system prompt — philosophy + framework + operating protocol + role,
+   with checkpoint rules and a named anti-pattern list on every call — is
+   exactly that shape. It was also developed against Opus-generation
+   models, so 4.6 is the model it was tuned for. §4 item 4 keeps the
+   prompt-fit read because it is nearly free, but it drops from a risk to
+   a sanity check.
+3. **Turn lengths are ordinary again.** Main's `cli_timeout: 0` and
+   `provider_idle_timeout_seconds: 1800` need no special justification on
+   this model.
+4. **An earlier training cutoff is a benchmark virtue here.** Fewer of the
+   hidden target papers are likely to be in weights than with a
+   current-generation model, which narrows (without closing) the
+   memorisation caveat in §7.3.
+
+Effort note: Opus 4.6 supports `low`/`medium`/`high`/`max` — `xhigh`
+arrived with Opus 4.7 — so `high` is valid and is what both the config and
+the published rows' generation would use.
+
+### Availability is the real risk, and the fallback is pre-decided
+
+Opus 4.6 is two generations old. Whether Max-plan `claude -p` still serves
+it is an empirical question, which §4 item 0 answers in one call. The
+fallback is decided now rather than under time pressure:
+
+| Situation | Action | Comparability cost |
+|---|---|---|
+| `claude-opus-4-6` serves | Run it | None — 2 same-model rows |
+| 4.6 gone, `claude-opus-4-7` serves | Run 4.7 | Lose the Claude Code row (21.5); keep ResearchHarness (20.7). Down to one thin-baseline comparison, and the §1 bracket collapses |
+| Neither serves | Stop and re-decide with the operator | — |
+
+Falling back to 4.7 is a materially weaker experiment, so it is worth
+confirming availability before any build work, not after.
 
 ### Constraints
 
 - **The model string is passed verbatim** to the CLI
   (`orchestrator.py:3750`); `claude --model` accepts full names.
-- **Use the exact ID, never the `fable` alias.** `model_tier: opus` and
-  every `model: opus` in `agent_models` becomes `claude-fable-5-1`. An
-  alias resolves to whatever is current that week, which would make the
-  run unreproducible. This is the single most important line in the bench
-  config.
-- Fable 5.1 is unavailable to zero-data-retention organisations unless
-  expressly authorised; §5 item 0 catches that in one call.
+- **Use the exact ID, never the `opus` alias.** `model_tier: opus` and
+  every `model: opus` in `agent_models` becomes `claude-opus-4-6`. The
+  alias resolves to the *current* Opus, which on this branch would silently
+  run a different model and destroy the entire comparability argument of
+  §1. This is the single most important line in the bench config.
 
 ---
 
@@ -155,11 +202,11 @@ Already done on this branch: fan-out switch, end-of-run switches, usage
 ledger with tool counts and cost capture, budget gates (unused here — see
 §5), headless prompt hygiene, run-config threading. What remains:
 
-**0. Model-availability and retention probe** (~20 lines, half a day).
-One `claude -p --model claude-fable-5-1 --effort high` call with a trivial
-prompt. Record success, the served model from the envelope, latency, and
-that no retention error comes back. Run this first — one call can
-invalidate the model plan.
+**0. Model-availability probe** (~20 lines, half a day). One
+`claude -p --model claude-opus-4-6 --effort high` call with a trivial
+prompt; then the same for `claude-opus-4-7`. Record success, the served
+model reported in the envelope, and latency. Run this **first** — it
+decides which experiment we are running (§3).
 
 **1. Per-task `sessions.db` isolation** (config-only, one day).
 `compact_db` resolves relative to the config file
@@ -203,21 +250,21 @@ means *every cycle*, not *never* (`exploration.py:4980` tests `>=`); and
 `agents.json` entry in §10. It also carries the retrieval denylist and
 egress policy from §7.3.
 
-**4. Smoke test and two judgement checks** (one day). One validation task,
-the real config, stopped after three cycles. Asserts: `report/report.md`
-exists, is non-empty, and `result.json` records its source file;
-`result.json` has non-zero cost, tool calls and turns; the `compact_db`
-path is task-local; the served model is `claude-fable-5-1`; no call hit
-the idle watchdog; the retrieval log is being captured.
+**4. Smoke test and two reads** (one day). One validation task, the real
+config, stopped after three cycles. Asserts: `report/report.md` exists, is
+non-empty, and `result.json` records its source file; `result.json` has
+non-zero cost, tool calls and turns; the `compact_db` path is task-local;
+the served model is `claude-opus-4-6`; no call hit the idle watchdog; the
+retrieval log is being captured.
 
 Then, read by a human from the artifacts:
 
 - **Report shape.** The deliverable must read as clear, concise
   synthesized findings, not a process log. The periodic reporter is
   cumulative by design, so this is the check most likely to fail.
-- **Prompt fit.** Are the operating protocol's scaffolding and checkpoint
-  ceremony crowding out the work? One trim is allowed here, decided from
-  transcripts and never from scores (§7.2), then frozen.
+- **Prompt fit** (sanity check, not a risk on this model — see §3). One
+  trim is allowed here, decided from transcripts and never from scores
+  (§7.2), then frozen.
 
 Estimate: **about one working week** before the first scored run.
 
@@ -287,9 +334,9 @@ nothing, so with `max_cycles: null` the root loop ends only on exhaustion,
 are off here, neither existing 10 h cap can bound a root run either.
 
 So the adapter applies **the harness's own 10 h** at the root, through the
-existing stop path, identical for every task. This is not a new budget or
-a new policy — it is the number the harness already uses for a clone and
-for a synthesis pass, applied at the one place the code leaves open. **The
+existing stop path, identical for every task. Not a new budget or a new
+policy — the number the harness already uses for a clone and for a
+synthesis pass, applied at the one place the code leaves open. **The
 exhaustion-vs-10 h split is a reported result, not a footnote:** if a
 large share of tasks hit the cap, the headline is "score after 10 h"
 rather than "score at natural exhaustion", and the write-up must say so.
@@ -298,7 +345,7 @@ rather than "score at natural exhaustion", and the write-up must say so.
 
 | Deviation | Why |
 |---|---|
-| `model` / `agent_models` → `claude-fable-5-1` | The run's subject |
+| `model` / `agent_models` → `claude-opus-4-6` | The run's subject, and §1's comparability |
 | `end_of_run.final_auditor: false`, `final_reporter: false` | Operator decision; see the deliverable note |
 | `compact_db` → absolute, per task | Cross-task contamination (§4 item 1) |
 | `working_directory` → the RCB task workspace | Required by the adapter contract |
@@ -311,7 +358,7 @@ stays as shipped.
 **One attempt per task.** A single pass to present clear, concise
 synthesized findings to the judge, then on to the next task. No repeat
 runs, no second attempts, no re-rolls on a bad score. This matches the
-paper's own protocol.
+protocol behind both published rows we compare to.
 
 With the final reporter off, nothing else writes a report for the grader,
 so the **periodic reporter is the graded artifact**. Main's
@@ -364,23 +411,23 @@ Two consequences to report rather than hide:
 
 ## 7. What makes this honest
 
-With one arm, the honesty burden shifts. There is no comparison to keep
-fair, so the whole job is making sure the number means what it says and
-that its limits travel with it.
+One arm and a shared model: the comparison is real, so the job is keeping
+the number and its four condition gaps (§2) attached to each other.
 
-### 7.1 Compute and confound disclosure
+### 7.1 Compute and condition disclosure
 
 Report spend in the headline table, not an appendix: tokens in/out, calls,
 cycles, wall time (raw *and* net of the 400 s/cycle cooldown, which is
 dead time rather than compute), and notional cost, per task.
 Score-per-notional-dollar and score-per-net-hour sit next to the raw
-score, because a reader comparing to a single-call peer needs to see the
-scale of what was spent to get it.
+score — a reader comparing us to Claude Code's single call needs to see
+what was spent to get there.
 
-The three pre-registered limitation sentences in §2 are part of this
-control, not decoration. §1's 20.7-vs-21.5 observation goes in the results
-section too: a reader deserves the benchmark's own evidence about how
-little harness choice has moved this number so far.
+§1's bracket goes in the results section, not just the plan: **19.9 thin →
+21.5 best agent harness, on this exact model.** A reader is entitled to
+see how narrow the observed harness effect on this venue has been before
+reading ours. The three pre-registered sentences from §2 go in the
+conclusions.
 
 ### 7.2 Judge integrity
 
@@ -391,30 +438,32 @@ the agent, which avoids self-preference. Four controls:
   7", plan-of-record and ledger references, `STRUCTURE.md`, checkpoint
   residue — which cue a rubric judge toward "thorough process". Apply one
   deterministic, published neutralisation pass and **judge both the raw
-  and the neutralised report**, reporting both scores. With one arm this
-  is no longer about cross-arm fairness; it measures how much of our own
-  score depends on process fingerprints rather than findings. Re-judging
-  40 reports is cheap, and a large raw-vs-neutralised gap would be one of
-  the more interesting things this run could find.
+  and the neutralised report**, reporting both scores. It measures how much
+  of our score depends on process fingerprints rather than findings.
+  Re-judging 40 reports is cheap, and a large gap would be one of the more
+  interesting things this run could find — especially since the rows we
+  compare to were single-call reports with no such fingerprints.
 - **Verbosity.** LLM rubric judges reward length. Record report length,
   figure count and artifact count per task, and report score against
-  length — necessary context when the peers being compared to produced
-  one-call reports.
+  length. Necessary context when the comparison rows produced one-call
+  reports.
 - **No tuning against the judge.** The §4 prompt-fit trim happens once,
   before any scored run, decided from transcripts. After the first scored
   run: no prompt, config or flow change without restarting the pass and
-  saying so. Hill-climbing on rubric scores would make this an overfit.
-  With one arm and no baseline, this is the control doing the most work —
-  it is the only thing preventing the number from being tuned upward.
+  saying so. Hill-climbing on rubric scores would make this an overfit,
+  and with a 1.6-point band to beat, even mild overfitting would manufacture
+  the entire result.
 - **Drift.** Re-score a held-out sample of 10 runs at the end of the pass
-  with the same judge config. Report the delta; if it exceeds noise,
-  re-score everything.
+  with the same judge config, and report the delta. This is also the only
+  handle we have on §2's gap 1 — judge drift between the paper's grading
+  run and ours — so it is doing double duty and is not optional.
 
 ### 7.3 Contamination: block the target, then own what remains
 
 **Policy: no web retrieval of the target papers or their results.** Web
-search and fetch stay enabled — peers had them — but the specific leak is
-closed rather than merely measured. Implementation, in the adapter:
+search and fetch stay enabled — the comparison rows had them — but the
+specific leak is closed rather than merely measured. Implementation, in
+the adapter:
 
 1. **Build a per-task denylist** from the benchmark's own hidden target
    metadata: DOI, arXiv ID, exact title, and identifying venue/author
@@ -433,58 +482,64 @@ closed rather than merely measured. Implementation, in the adapter:
 5. **Report the counts**: hits blocked at egress, hits detected post hoc,
    tasks re-run.
 
-**Memorisation is not probed** — and with one arm that costs more than it
-did with two, so the reasoning is worth stating precisely rather than
-inheriting.
+**Memorisation is not probed.** The target papers are real and published,
+so some may sit in the model's weights. With one arm there is no paired
+difference for prior knowledge to cancel against, so it inflates the
+absolute score directly and this design cannot detect it. Two things make
+that more tolerable here than it was under Fable 5.1:
 
-The target papers are real and published, so Fable 5.1 may already know
-some of them. In a two-arm design prior knowledge would largely cancel in
-the paired difference, because both arms share the model. **With one arm
-there is nothing for it to cancel against: memorisation inflates the
-absolute score directly, and this design cannot detect it.** The position
-being taken is the second one — for a re-discovery benchmark, a frontier
-model holding the target literature in weights is the venue's limitation
-for models of this class, not the harness's, and it bounds how much any
-absolute number here (ours *and* the board's) should be trusted for a
-model of this generation.
+- **The comparison rows share the exposure.** Claude Code at 21.5 and
+  ResearchHarness at 19.9 ran on the *same model weights*, so whatever
+  prior knowledge Opus 4.6 has was equally available to them. For the
+  comparison — which is the point of choosing 4.6 — memorisation is
+  largely common-mode and cancels. It does not cancel for the absolute
+  score.
+- **An older model has an earlier cutoff**, so fewer of the hidden targets
+  are likely to be in weights than with a current-generation model.
 
-That is defensible, but it must be said in the results, not implied:
-**every absolute score in this run is an upper bound on
-re-discovery-from-evidence, because prior knowledge of the target
-literature was neither blocked nor measured.** One closed-book call per
-task (40 calls, a few dollars) is what would turn that caveat into a
-measured split, and it remains the cheapest available upgrade to this
-plan.
+Still to be said in the results rather than implied: **absolute scores are
+an upper bound on re-discovery-from-evidence, because prior knowledge of
+the target literature was neither blocked nor measured.** One closed-book
+call per task (40 calls, a few dollars) would turn that caveat into a
+measured split and remains the cheapest available upgrade.
 
 ### 7.4 Statistics that match one arm, one shot
 
-With a single arm and one run per task there is no comparison to test and
-no variance to estimate, so the analysis is **descriptive, and says so**:
+Our 40 task scores are a real sample over tasks, so task-level variation
+is estimable. Run-to-run variation is not, and neither is the published
+rows'. What that permits:
 
-- Mean, median and full distribution of the 40 task scores; count of tasks
-  above 50 (the benchmark's re-discovery line) and above 21.5 (the best
-  published row, with §2's confound attached wherever that number is
-  quoted).
-- Per-domain breakdown across the 10 domains.
-- Rubric sub-scores (§7.5).
-- **No significance test.** There is no second arm to pair against, and a
-  paired comparison to published per-task peer scores is not available:
-  the leaderboard publishes aggregates only, with no per-task breakdown or
-  downloadable results (checked). Any test against 21.5 would be a
-  one-sample test against a number produced by a different model, a
-  different judge invocation, and a single run per task — arithmetic
-  dressed as inference.
+- **Report our mean ± SEM across the 40 tasks**, with the full
+  distribution, and **21.5 and 19.9 as reference lines**. Count of tasks
+  above 50 (the re-discovery line) and above 21.5.
+- **Per-domain breakdown** across the 10 domains.
+- **Rubric sub-scores** (§7.6).
+- A one-sample Wilcoxon of our 40 scores against each constant is
+  defensible **with the caveat stated next to it**: 21.5 and 19.9 are
+  themselves single-run-per-task means carrying unmeasured noise, so
+  treating them as exact constants understates the true uncertainty. The
+  test is a directional aid, not a verdict.
+- **No paired test against peers.** The leaderboard publishes aggregates
+  only — no per-task breakdown, no downloadable results (checked) — so
+  pairing on task difficulty is not available even though it would be the
+  better analysis.
 - Pre-register the primary metric (mean rubric score on raw reports)
   before the pass so there is no metric-shopping afterwards. Freeze this
   document's commit SHA and publish it with the results.
+
+A final calibration point worth writing down before the run: **the band we
+are trying to clear is 1.6 points wide on a 100-point scale, from one run
+per task.** Any conclusion that rests on a gap of that size is fragile
+regardless of how the arithmetic is presented, and the write-up should say
+so plainly rather than leaning on a p-value.
 
 ### 7.5 Report every run, and every difference from stock
 
 - **Every task reported, including failures.** A crashed or report-less run
   scores whatever the judge gives it — usually zero. No quiet exclusions.
   Any excluded task is pre-registered with a reason before the pass. With
-  40 tasks and one arm, a single silently dropped zero moves the mean by
-  half a point, which is most of the entire observed harness effect in §1.
+  40 tasks, a single silently dropped zero moves the mean by roughly half
+  a point — a third of the entire band in §1.
 - **Retry policy, pre-registered:** two sanctioned reasons only —
   infrastructure failure (container death, network loss) and a §7.3
   contamination disqualification. At most one retry, always logged in
@@ -509,21 +564,23 @@ no variance to estimate, so the analysis is **descriptive, and says so**:
   observability. State this, with the diff published, so a reader need not
   take it on trust.
 
-### 7.6 Harness diagnostics: the evidence a single arm can actually carry
+### 7.6 Harness diagnostics
 
-No comparison means the descriptive record *is* the result, so collect it
-properly. All of it is already instrumented:
+With one arm the descriptive record carries much of the weight, so collect
+it properly. All of it is already instrumented:
 
 - Cycles to termination per task, and the exhaustion-vs-10 h-cap split.
 - Auditor verdict distribution per cycle, and score against how many
   cycles the auditor gated.
 - Fan-out incidence: branches spawned per task, and score on tasks where
-  fan-out fired against tasks where it did not. Observational, and must be
+  fan-out fired against tasks where it did not. Observational, and
   labelled so — the researcher chose when to fan out.
 - Rubric sub-scores separately. Long-exposure's reporter is an LLM
   summarising work it did not do, so if the scores concentrate in
   presentation-flavoured items rather than implementation, measurement and
-  analysis, that is a finding about what the harness is actually adding.
+  analysis, that is a finding about what the harness is actually adding —
+  and directly relevant against a 21.5 row whose report was written by the
+  agent that did the work.
 - Termination reasons, rate-limit events, cooldown time, compaction count.
 - `promise_check` green rate against score — does ledger discipline track
   research quality, or is it overhead?
@@ -532,20 +589,20 @@ properly. All of it is already instrumented:
 
 ## 8. Cost and calendar
 
-Per-task notional cost is the largest unknown: Fable 5.1 at $10/$50,
-unlimited cycles to natural exhaustion, fan-out up to 3 branches, no cost
-ceiling, 10 h outer bound. Modelling 6–15 cycles at 3–4 calls each, with a
-fan-out multiplier on the cycles where it fires, gives roughly **$20–$150
-per task** with a tail bounded only by the 10 h stop.
+Per-task notional cost: Opus 4.6 at $5/$25, unlimited cycles to natural
+exhaustion, fan-out up to 3 branches, no cost ceiling, 10 h outer bound.
+Modelling 6–15 cycles at 3–4 calls each, with a fan-out multiplier on the
+cycles where it fires, gives roughly **$10–$75 per task** with a tail
+bounded only by the 10 h stop — half the Fable estimate.
 
 | Pass | Runs | Agent spend (notional) | Judge | Notes |
 |---|---|---|---|---|
-| Build (§4) | — | <$50 | — | ~1 week |
-| Smoke | 1 | <$50 | <$5 | Gate |
-| Main | 40 | $800–$6,000 | $150–$400 | Wide by construction |
+| Build (§4) | — | <$30 | — | ~1 week |
+| Smoke | 1 | <$30 | <$5 | Gate |
+| Main | 40 | $400–$3,000 | $150–$400 | |
 | Re-judge (neutralised + drift) | — | — | $150–$400 | §7.2 |
 
-Notional agent total **$850–$6,100**; judge $300–$800. The judge is the
+Notional agent total **$430–$3,060**; judge $300–$800. The judge is the
 only real-cash line and needs an OpenAI-compatible key.
 
 **Wall clock is the binding constraint, not money.** With the 10 h
@@ -564,21 +621,27 @@ net.
 
 | Risk | Detection | Response |
 |---|---|---|
-| Fable 5.1 unavailable on this account | §4 item 0, one call | Re-decide the model first |
+| `claude-opus-4-6` no longer served | §4 item 0, one call | Pre-decided fallback ladder in §3; 4.7 is a weaker experiment, so decide before building |
+| The `opus` alias left anywhere in the config | Smoke test asserts the served model | Exact IDs only — the alias would silently run a current model and void §1 |
 | No gradeable report (final reporter off) | Smoke test asserts provenance | Fix the fallback chain — highest-probability mechanical failure here |
-| Report reads as a process log, not findings | §4 item 4 report-shape check | Report it as a property of this configuration; do not tune mid-campaign |
-| Prescriptive prompt suppresses Fable 5.1 quality | §4 item 4, from transcripts | One pre-scored trim, then frozen (§7.2) |
+| Report reads as a process log, not findings | §4 item 4 report-shape read | Report it as a property of this configuration; do not tune mid-campaign |
 | Target paper retrieved despite the denylist | §7.3 egress block + post-hoc detection | Disqualify and re-run once; report the count |
-| Target papers already in weights | **Not detectable in this design** | §7.3's upper-bound caveat in the results |
-| Score read as a harness result | — | §2's three pre-registered sentences in the conclusions |
+| Target papers already in weights | Not detectable in this design | §7.3's upper-bound caveat; largely common-mode for the comparison |
+| Judge drift between the paper's grading run and ours | §7.2 drift re-score | Report the delta; it is the only handle on §2's gap 1 |
 | Judge rewards length or process fingerprints | §7.2 dual raw/neutralised scoring, length reporting | Report both scores; a large gap is itself a finding |
+| A 1.6-point band decided by run noise | Acknowledged by design (§7.4) | Say plainly that a gap of that size from one run per task is fragile |
 | Unlimited cycles hit the 10 h stop often | Exhaustion-vs-cap split per task | Re-frame the headline as "score after 10 h" |
 | Max-plan rate limits throttle a parallel pass | Rate-limit events in `result.json` | Lower parallelism; report cooldown time |
 | Fan-out clones cross-contaminate | §4 item 1 assertion per task | Isolation boundary is the task, not the clone |
 
-Kill criterion: **if the smoke test cannot produce a gradeable
-`report/report.md` from the periodic reporter, the main pass does not
-start.** That is a mechanical failure worth 40 zeros, not a result.
+Kill criteria:
+
+- **If the smoke test cannot produce a gradeable `report/report.md` from
+  the periodic reporter, the main pass does not start.** A mechanical
+  failure worth 40 zeros, not a result.
+- **If neither Opus 4.6 nor 4.7 is served, stop and re-decide** rather
+  than substituting a current model, which would silently convert this
+  back into the uncomparable experiment §1 exists to avoid.
 
 ---
 
@@ -602,15 +665,16 @@ Only the model IDs and the two per-task paths differ from stock. Every
 timer, ceiling and cap is main's.
 
 ```yaml
-# EXACT model ID everywhere, never the `fable` alias.
-model_tier: claude-fable-5-1
-model: claude-fable-5-1
+# EXACT model ID everywhere. The `opus` alias resolves to the CURRENT Opus
+# and would void the same-model comparison in §1.
+model_tier: claude-opus-4-6
+model: claude-opus-4-6
 agent_models:
-  researcher:     { provider: claude, model: claude-fable-5-1, effort: high }
-  worker:         { provider: claude, model: claude-fable-5-1, effort: high }
-  auditor:        { provider: claude, model: claude-fable-5-1, effort: high }
-  reporter:       { provider: claude, model: claude-fable-5-1, effort: medium }
-  curator:        { provider: claude, model: claude-fable-5-1, effort: medium }
+  researcher:     { provider: claude, model: claude-opus-4-6, effort: high }
+  worker:         { provider: claude, model: claude-opus-4-6, effort: high }
+  auditor:        { provider: claude, model: claude-opus-4-6, effort: high }
+  reporter:       { provider: claude, model: claude-opus-4-6, effort: medium }
+  curator:        { provider: claude, model: claude-opus-4-6, effort: medium }
 
 working_directory: <WORKSPACE>           # per task
 compact_db: <INSTANCE_DIR>/sessions.db   # absolute, per task — isolation
@@ -685,22 +749,22 @@ JUDGE_API_KEY=...
 
 | Decision | Choice | Consequence carried in this plan |
 |---|---|---|
-| Arms | **One.** Long-exposure only; no baseline, no ablation grid | The run is a characterisation and a leaderboard row, not a comparison. No causal harness claim; §2's three sentences are pre-registered for the conclusions |
-| Model | `claude-fable-5-1`, `high` effort | It is also the confound: no peer runs this tier, so model and harness differ together |
+| Model | **`claude-opus-4-6`**, `high` effort | Chosen for comparability: it is the only model with **two** published same-model harness rows — Claude Code 21.5 and ResearchHarness 19.9 — which brackets the observed harness effect at 1.6 points on our exact model. Opus 4.7 would give one thin-baseline row only. Fallback ladder in §3 |
+| Arms | **One.** Long-exposure only; no baseline, no ablation grid | Model is controlled, conditions are not: §2's four gaps and three pre-registered sentences |
 | Billing | Max plan via `claude -p`; no API key for agent calls | Cost is notional/API-equivalent and labelled as such (§6); the judge key is the only cash line |
 | Budget | Every ceiling, timer and cap as `main` ships them | Unlimited cycles, no cost cap; the ledger tracks without gating |
 | Outer bound | The harness's own 10 h, applied at the root | No new number invented; the root loop is the one place main leaves uncapped, and the exhaustion-vs-cap split is reported |
 | Configuration | All features on except the final auditor and final reporter; full 40-task scope | The periodic reporter is the deliverable; mechanism evidence is the §7.6 diagnostics |
-| Attempts | One shot per task, then move on | Descriptive statistics only; no significance test (§7.4) |
+| Attempts | One shot per task, then move on | Mean ± SEM over tasks with reference lines; no paired peer test (§7.4) |
 | Web access | Enabled, but no retrieval of the target papers or their results | Per-task denylist, egress block, post-hoc detection, disqualify-and-re-run |
-| Memorisation | Not probed | With one arm it no longer cancels, so every absolute score is reported as an **upper bound** on re-discovery-from-evidence (§7.3) |
+| Memorisation | Not probed | Largely common-mode for the comparison since the peer rows share the weights; absolute scores still reported as an upper bound (§7.3) |
 | Compute-matched control | Not run | Folded into §2's limitation sentences |
 
-The two cheapest upgrades, if the scope ever reopens, in order of what
-they buy per dollar:
+The two cheapest upgrades, if scope reopens, ranked by what they buy:
 
-1. **A same-model baseline** — RCB's Claude Code preset on
-   `claude-fable-5-1`, 40 runs, ~$150–$400 notional. Converts the whole
-   exercise from a characterisation into a harness comparison.
+1. **An in-house baseline** — RCB's Claude Code preset on
+   `claude-opus-4-6`, 40 runs, ~$80–$200 notional. Closes §2's condition
+   gaps (same judge invocation, same CLI vintage, same task revision) and
+   demotes the published rows to a cross-check.
 2. **A closed-book memorisation probe** — 40 single calls, a few dollars.
-   Turns the §7.3 upper-bound caveat into a measured split.
+   Turns §7.3's upper-bound caveat into a measured split.
