@@ -1,8 +1,8 @@
 # ResearchClawBench: execution plan for the bench-mode branch
 
 Scope: one venue, one model, one harness configuration, at the harness's
-own default operating point. This is the runnable plan for
-`claude/long-exposure-benchmarking-pikxm2`. The wider survey and the
+own default operating point, one shot per task. This is the runnable plan
+for `claude/long-exposure-benchmarking-pikxm2`. The wider survey and the
 rejected venues stay in `docs/benchmarking-plan.md`; this document
 supersedes its §5.2.
 
@@ -61,19 +61,17 @@ variance estimate.
 Note what that claim does **not** say: it does not say "at equal token
 spend". Long-exposure at its default operating point runs until the topic
 is exhausted and will spend one to two orders of magnitude more tokens
-than one `claude -p` call. That is the harness working as designed, and
-the honest way to handle it is to measure the spend, report it in the
-headline, and add a control that lets the baseline use comparable compute
-(§8). It is not honest to quietly compare an all-night run against a
-single call and report only the score difference.
+than one `claude -p` call. That is the harness working as designed. The
+honest handling is to measure the spend and report it in the headline
+table (§8.1), and to be explicit that this design cannot separate "the
+architecture helped" from "more tokens helped" (§8.1's stated limitation).
 
-Arms:
+Two arms, one run each:
 
 | Arm | What it is | Tasks |
 |---|---|---|
 | **B** | Long-exposure, one configuration, everything on except the final auditor and final reporter (§6) | 40 |
 | **A** | Claude Code via RCB's own preset, same model | 40 |
-| **A+** | Claude Code, k sequential self-continuation rounds, k set from B's measured spend (§8.1) | 10 |
 
 There is no feature-ablation grid. If B beats A we will know the harness
 as a whole wins, not which of cycles / auditor gate / fan-out earned it.
@@ -84,7 +82,7 @@ on whichever subset looks most informative.
 
 ## 3. Model: `claude-fable-5-1`
 
-Pinned for **every** arm and every role, at `high` effort, through
+Pinned for **both** arms and every role, at `high` effort, through
 `claude -p --model claude-fable-5-1 --effort high`. Max plan, subscription
 billing, nothing through the API.
 
@@ -111,11 +109,11 @@ produce". Four consequences, accepted deliberately:
    after.
 4. **Longer single turns.** Main's defaults are `cli_timeout: 0` (no
    per-call ceiling) and `provider_idle_timeout_seconds: 1800`. That pair
-   turns out to be the right combination for this model: the idle watchdog
-   checks process-tree CPU as well as file progress
+   turns out to be right for this model: the idle watchdog checks
+   process-tree CPU as well as file progress
    (`orchestrator.py:3163-3182`), so a turn that thinks for 40 minutes
    survives while a genuinely wedged process is still killed. Both stay at
-   main's values (§6).
+   main's values.
 
 ### Constraints
 
@@ -172,20 +170,22 @@ in `result.json` is unique, and `search_sessions` in task B returns
 nothing from task A.
 
 **2. `long-exposure bench` subcommand** (~150 lines, three days). Inputs:
-`--prompt-file`, `--workspace`, `--out-dir`, `--wall-stop`, `--no-web`.
-Behaviour:
+`--prompt-file`, `--workspace`, `--out-dir`. Behaviour:
 
 - generate the per-task config and score (directive = prompt file
   contents, verbatim);
 - run the loop as a subprocess — importing the module installs signal
   handlers and is one-run-per-process (`exploration.py:94-128`);
-- at `wall_stop − reserve`, write `long-exposure.stop` into the instance
-  dir. A stop is a *graceful* end: the current agent finishes, a periodic
-  report flushes, and the enabled end-of-run stages run
-  (`_should_run_final_synthesis`, `exploration.py:946-965`). Reserve
-  45 min;
+- apply the harness's own 10 h stance at the root (§6) by writing
+  `long-exposure.stop` into the instance dir. `long-exposure.stop` is the
+  right signal, not `long-exposure.graceful-stop`: the plain stop sets
+  `_stop_requested`, which finishes the current agent, flushes a periodic
+  report, and runs the enabled end-of-run stages
+  (`_should_run_final_synthesis`, `exploration.py:946-965`), whereas
+  graceful-stop exits at the cycle boundary for resume and does **not**
+  trigger the final pipeline;
 - copy the deliverable to `<workspace>/report/report.md` — RCB's expected
-  path — from the newest `reports/report_cycles_*.md` (see §6);
+  path — from the newest `reports/report_cycles_*.md` (§6);
 - write `result.json`: report path *and which file it came from*, artifact
   list, tokens, notional cost, tool calls, turns, wall time, cooldown
   seconds, cycles run, fan-out branches spawned, rate-limit events,
@@ -196,18 +196,24 @@ means *every cycle*, not *never* (`exploration.py:4980` tests `>=`); and
 `cli_timeout: 0` means no per-call ceiling at all.
 
 **3. RCB adapter** (~40 lines, one day). `bench/rcb_agent.sh` plus the
-`agents.json` entries in §11.
+`agents.json` entries in §11. It also carries the retrieval denylist and
+egress policy from §8.3.
 
 **4. Smoke test and prompt-fit check** (one day). One validation task, the
 real arm-B config, stopped after three cycles. Asserts: `report/report.md`
 exists, is non-empty, and `result.json` records its source file;
 `result.json` has non-zero cost, tool calls and turns; the `compact_db`
 path is task-local; the served model is `claude-fable-5-1`; no call hit
-the idle watchdog. Then the **prompt-fit check**: read the transcripts and
-judge whether the operating protocol's scaffolding is crowding out the
-work (short outputs, checkpoint ceremony dominating, the model arguing
-with the protocol). One trim is allowed here, decided from transcripts and
-never from scores (§8.2), then frozen.
+the idle watchdog; the retrieval log is being captured.
+
+Then two judgement checks, both read by a human from the artifacts:
+
+- **Report shape.** The deliverable must read as clear, concise
+  synthesized findings, not a process log. The periodic reporter is
+  cumulative by design, so this is the check most likely to fail.
+- **Prompt fit.** Are the operating protocol's scaffolding and checkpoint
+  ceremony crowding out the work? One trim is allowed here, decided from
+  transcripts and never from scores (§8.2), then frozen.
 
 Estimate: **about one working week** before the first scored run.
 
@@ -219,8 +225,8 @@ Estimate: **about one working week** before the first scored run.
 
 Every ceiling, timer and concurrency cap is whatever `main` ships. The
 code is this branch (for the bug fixes and the two switches); the budget
-is stock. That combination is deliberate and must be disclosed as such,
-because it is not a released configuration.
+is stock. That combination is deliberate and is disclosed as such, because
+it is not a released configuration.
 
 | Knob | Value | Source |
 |---|---|---|
@@ -237,19 +243,20 @@ because it is not a released configuration.
 | `provider_idle_poll_seconds` | 10 | main's config |
 | `context_window` / `compact_threshold` | 1,000,000 / 0.90 | main's config |
 | Fan-out branch cap | **3** (`FANOUT_MAX_BRANCHES`) | code constant, identical on both branches |
-| End-of-run stage wall cap | 36,000 s (10 h) | `limits.WALL_CAP_SECONDS`, identical on both branches |
+| Fan-out per-clone wall cap | **10 h** (`FANOUT_CAP_SECONDS`) | `fanout.py:98`, identical on both branches |
+| End-of-run stage wall cap | **10 h** (`WALL_CAP_SECONDS` = 36,000 s) | `limits.py:11`, identical on both branches |
 
-An earlier draft of this plan invented tighter values (`max_cycles: 12`,
+An earlier draft invented tighter values (`max_cycles: 12`,
 `cli_timeout: 5400`, `max_cost_usd: 60`, `report_interval` forced to the
-cycle cap). Those are withdrawn. They would have measured a
-budget-constrained variant of the harness that nobody runs.
+cycle cap). Withdrawn — they would have measured a budget-constrained
+variant nobody runs.
 
 **`max_cycles: null` means the run ends when the work does.** Termination
 comes from the exhaustion detector — two consecutive cycles below 5 % of
 peak observed output, floor 500 tokens
 (`LOW_OUTPUT_FRACTION`/`LOW_OUTPUT_ABS_FLOOR`/`LOW_OUTPUT_CLOSURE_COUNT`,
 `exploration.py:3907-3909`) — or from the auditor emitting
-`[[BRANCH_COMPLETE]]`. This is the harness's actual operating point and
+`[[BRANCH_COMPLETE]]`. That is the harness's actual operating point and
 the thing worth benchmarking.
 
 **Budget is tracked, not enforced.** With both caps absent,
@@ -257,44 +264,70 @@ the thing worth benchmarking.
 a number > 0), so the usage ledger is pure observation: per-agent tokens,
 cache reads/writes, tool calls, turns, wall time and notional cost, live
 in `long-exposure status` and `long-exposure usage`, persisted in
-`usage_summary.json`, merged from fan-out clones at collapse. That is
-exactly the intended arrangement: measure everything, constrain nothing.
+`usage_summary.json`, merged from fan-out clones at collapse. Measure
+everything, constrain nothing.
+
+### The 10 h stance, inherited rather than invented
+
+The harness already takes a position on how long one unit of work may
+run: **10 hours.** It appears twice — `limits.WALL_CAP_SECONDS = 36_000`
+caps an entire end-of-run synthesis pass (`auditing.py:814`,
+`reporting.py:642`), and `fanout.FANOUT_CAP_SECONDS = 10*60*60` caps each
+fan-out clone (`fanout.py:1729-1772`, which writes a "10h cap" merge
+report and cleans up the clone's subprocess tree).
+
+What the harness does **not** have is a wall cap on the *root cycle loop*:
+grepping main's `exploration.py` for a run-level elapsed budget returns
+nothing, so with `max_cycles: null` the root loop ends only on exhaustion,
+`[[BRANCH_COMPLETE]]`, or an operator stop. Since both end-of-run stages
+are off in this run, neither existing 10 h cap can bound a root run
+either.
+
+So the adapter applies **the harness's own 10 h** at the root, through the
+existing graceful-stop path, identical for every task and both arms. This
+is not a new budget or a new policy — it is the number the harness already
+uses for a clone and for a synthesis pass, applied at the one place the
+code leaves open. **The exhaustion-vs-10 h split is a reported result, not
+a footnote:** if a large share of tasks hit the cap, the headline is
+"long-exposure's score after 10 h" rather than "after natural exhaustion",
+and the write-up must say so.
 
 ### The four deliberate deviations from stock
 
-Each one is a benchmark necessity, not a tuning choice:
+Each is a benchmark necessity, not a tuning choice:
 
 | Deviation | Why |
 |---|---|
 | `model` / `agent_models` → `claude-fable-5-1` | The experiment's variable |
-| `end_of_run.final_auditor: false`, `final_reporter: false` | Operator decision; see the deliverable note below |
+| `end_of_run.final_auditor: false`, `final_reporter: false` | Operator decision; see the deliverable note |
 | `compact_db` → absolute, per task | Cross-task contamination (§5 item 1) |
 | `working_directory` → the RCB task workspace | Required by the adapter contract |
 
 Everything else — including `curator: true`, since "everything else on" —
 stays as shipped.
 
-### One outer bound, imposed outside the harness
+### The deliverable, and one shot at it
 
-An unlimited-cycle run needs some bound or a single wedged task blocks the
-pass forever. Rather than cap the harness internally (which would change
-what is being measured), the adapter imposes **a 12 h per-task wall stop,
-identical for every task and every arm, via the graceful stop signal.**
-
-It is set high on purpose: most runs should exhaust naturally well inside
-it, and **the exhaustion-vs-wall-stop split is a reported result, not a
-footnote.** If a large share of tasks hit the wall, the headline becomes
-"long-exposure's score after 12 h" rather than "after natural
-exhaustion", and the write-up must say so.
-
-### The deliverable
+**One attempt per task.** The run gets a single pass to present clear,
+concise synthesized findings to the judge, then moves to the next task.
+No repeat runs, no second attempts, no re-rolls on a bad score. This
+matches the paper's own protocol and is what §8.4's statistics are built
+around.
 
 With the final reporter off, nothing else writes a report for the grader,
 so the **periodic reporter is the graded artifact**. Main's
 `report_interval: 3` handles this without special casing: a report flushes
-every third cycle, and the graceful stop flushes one too. The smoke test
-asserts report provenance because this is the most likely mechanical
-failure in this configuration — no report means a zero, not a low score.
+every third cycle, and the stop signal flushes one too. Two consequences
+worth stating plainly:
+
+- The periodic reporter is *cumulative and process-oriented* by design,
+  which is in tension with "clear and concise synthesized findings". §5
+  item 4 checks the shape on a real task before anything is scored. If it
+  reads as a process log, that is a reported property of running with the
+  final reporter off — not something to tune away mid-campaign.
+- No report means a zero, not a low score. The smoke test asserts report
+  provenance because this is the most likely mechanical failure in this
+  configuration.
 
 ### Runs
 
@@ -303,13 +336,8 @@ failure in this configuration — no report means a zero, not a low score.
 | Smoke | 1 | §5 item 4 gate |
 | **Main (arm B)** | 40 × 1 | The full-scope result |
 | **Baseline (arm A)** | 40 × 1 | Same-model reference |
-| Compute control (arm A+) | 10 × 1 | §8.1 |
-| No-web subset (arm B) | 10 × 1 | §8.3 |
-| Memorisation probe | 40 × 1 call | §8.3 |
-| Variance probe (arm B) | 10 × 3 | §8.4 — recommended |
 
-One run per task matches the paper's protocol. It gives no error bars,
-which is what §8.4 is about.
+That is the whole campaign: 81 runs.
 
 ---
 
@@ -328,9 +356,9 @@ peers' published costs are API-priced, and the wrong number to call spend.
 Two consequences to report rather than hide:
 
 - **No cost ceiling is in force.** With `max_cost_usd` absent, an
-  expensive task runs to completion. Monitoring is `long-exposure usage`;
-  the response to an outlier is to report it, not to kill it, since a
-  kill would be an undisclosed cap.
+  expensive task runs to its own end. Monitoring is `long-exposure usage`;
+  the response to an outlier is to report it, not to kill it, since a kill
+  would be an undisclosed cap.
 - **Max-plan rate limits are part of the experiment.** Long-exposure makes
   many calls where arm A makes one, so throttling lands asymmetrically.
   Rate-limit events and adaptive-cooldown time are already recorded in
@@ -341,30 +369,27 @@ Two consequences to report rather than hide:
 ## 8. What makes this honest
 
 The model is the most capable available and the harness runs at its own
-default operating point. That combination is the most flattering setup
-long-exposure will ever get, which is precisely why the controls below are
-not optional garnish — they are what separates a benchmark from a demo.
-Each is cheap relative to the main pass.
+default operating point. That is the most flattering setup long-exposure
+will ever get, which is why the controls below are not optional garnish.
 
-### 8.1 Compute disclosure, and a control that uses the compute
+### 8.1 Compute disclosure
 
-Arm B will spend perhaps 20–50× arm A's tokens. The first objection any
-reader will raise is "you just spent more". Two answers, both required:
+Arm B will spend perhaps 20–50× arm A's tokens. **Report spend in the
+headline table**, not an appendix: tokens in/out, calls, cycles, wall time
+(raw *and* net of the 400 s/cycle cooldown, which is dead time rather than
+compute), and notional cost, per arm per task. Score-per-notional-dollar
+and score-per-net-hour sit next to the raw score.
 
-- **Report spend in the headline table**, not an appendix: tokens in/out,
-  calls, cycles, wall time (raw *and* net of the 400 s/cycle cooldown,
-  which is dead time, not compute), and notional cost, per arm per task.
-  Score-per-notional-dollar and score-per-net-hour sit next to the raw
-  score.
-- **Arm A+, the compute-aware baseline.** Claude Code run k times
-  sequentially on the same task, each round fed its own previous report
-  with "continue improving this", with k chosen so total token spend
-  approximates arm B's measured median. This is the dumbest reasonable way
-  to spend the same compute without any of long-exposure's structure, so
-  B − A+ isolates **structure** from **spend** in a way B − A cannot. Ten
-  tasks is enough to see whether the gap survives. If B beats A but not
-  A+, the honest headline is "the tokens did the work, not the
-  architecture" — and that result is worth publishing.
+**Stated limitation.** A compute-matched control — the baseline given
+comparable token spend in some unstructured way — is not being run. So
+this design cannot distinguish "long-exposure's structure helped" from
+"more tokens helped". The write-up must say exactly that, in the
+conclusions and not only in a limitations paragraph: any reported
+advantage is *an advantage of the harness at its default operating point
+against a single call*, which is the practical question an operator faces,
+and not a claim that the architecture beats an equal-compute alternative.
+Pre-registering this sentence is what keeps it from being quietly dropped
+when the numbers arrive.
 
 ### 8.2 Judge integrity
 
@@ -376,51 +401,89 @@ the agent, which avoids self-preference. Four controls:
   residue — that tell the judge which system wrote them and cue "thorough
   process". Apply one deterministic, published neutralisation pass to
   **both** arms' reports equally, and **judge both the raw and the
-  neutralised report.** Report both scores. Silently judging either one
+  neutralised report**, reporting both scores. Silently judging either one
   alone is a choice a reader cannot check; judging both turns a confound
   into a measurement.
 - **Verbosity.** LLM rubric judges reward length. Record report length,
   figure count and artifact count per run, and report score against length
-  so a reader can see whether the advantage is substance or volume.
+  so a reader can see whether an advantage is substance or volume.
 - **No tuning against the judge.** The §5 prompt-fit trim happens once,
   before any scored run, decided from transcripts. After the first scored
-  run, no prompt, config or flow change without restarting the pass and
+  run: no prompt, config or flow change without restarting the pass and
   saying so. Hill-climbing on rubric scores would convert this from a
   benchmark into an overfit.
 - **Drift.** Re-score a held-out sample of 10 runs at the end of the pass
   with the same judge config. Report the delta; if it exceeds noise,
   re-score everything.
 
-### 8.3 Contamination, in three layers
+### 8.3 Contamination: block the target, then own what remains
 
-- **Web retrieval.** Keep WebSearch on for parity with peers, log every
-  query and fetched URL, and report the **retrieval rate**: per task,
-  whether a URL or title matching the hidden target paper appeared. A
-  result that only holds where the target was retrieved is not a result.
-  Bound the effect with the 10-task no-web subset.
-- **Memorisation.** The target papers are real and published; a
-  frontier model may simply know them. One closed-book probe per task —
-  ask Fable 5.1 for the key finding with no data and no tools, 40 calls,
-  a few dollars — tells us which tasks are memorised regardless of web
-  access. Stratify every headline by that split. This is the layer that
-  a web-only control misses entirely, and on a "re-discovery" benchmark
-  it is the most serious threat to the whole exercise.
-- **Cross-run leakage.** Per-task `compact_db` (§5 item 1), a fresh
-  workspace per task, and a verification assertion per run. Fan-out clones
-  share the parent's instance dir by design, so the isolation boundary is
-  the task, not the clone — confirm that is what the assertion checks.
+**Policy: no web retrieval of the target papers or their results.** Web
+search and fetch stay enabled for both arms — peers had them, and general
+web access is symmetric across arms so it is not a confound for B − A —
+but the specific leak is closed rather than merely measured.
 
-### 8.4 Statistics that match what we ran
+Implementation, in the adapter:
 
-One run per task cannot support a significance claim. The variance probe —
-10 tasks × 3 runs of arm B, 30 runs — estimates within-task spread, which
-is the denominator any claim about B − A needs. With it: paired bootstrap
-over per-task differences (10,000 resamples, task as the unit), plus a
-sign test over the 40 paired tasks. Without it: report the B − A
-distribution descriptively and **make no significance claim** — a
-difference of unknown noise is an observation.
+1. **Build a per-task denylist** from the benchmark's own hidden target
+   metadata: DOI, arXiv ID, exact title, and the venue/author strings that
+   identify it. Confirming that this metadata is readable from the task
+   files is a §5 build item; if it is not, the fallback is title/DOI
+   matching against the rubric text.
+2. **Block at egress** where the fetch is client-side, via the container's
+   HTTP proxy.
+3. **Detect post hoc** for anything that arrives through a server-side
+   search path the proxy cannot see: log every query and every retrieved
+   URL and title, and match against the denylist.
+4. **Disqualify and re-run once** any task where a denylisted identifier
+   appears, logging both the disqualification and the replacement run.
+   This is the one sanctioned exception to "one shot per task" (§6), and
+   it is a contamination remedy, never a response to a low score.
+5. **Report the counts**: denylist hits blocked at egress, hits detected
+   post hoc, and tasks re-run.
 
-Pre-register the primary metric (mean rubric score, raw reports) before
+The 10-task no-web subset from an earlier draft is dropped. It existed to
+*bound* a leak that this policy *blocks*, and general web access is
+symmetric across arms.
+
+**Memorisation is not probed, deliberately.** The target papers are real
+and published, so Fable 5.1 may already know some of them. No closed-book
+probe is being run, for two reasons that should be stated in the write-up
+rather than left implicit:
+
+- **It is a confound for the absolute score, not for the comparison.**
+  Both arms run the same model, so prior knowledge is available equally to
+  both and largely cancels in the paired difference B − A, which is the
+  quantity the campaign claims.
+- **For a re-discovery benchmark, that is the benchmark's problem.** If a
+  frontier model has the target literature in weights, the venue's
+  "re-discovery" framing has stopped measuring re-discovery for models of
+  this class. That is a fact about ResearchClawBench applied to Fable 5.1,
+  not about the harness — and worth saying out loud, because it also bounds
+  how much any absolute number here (ours or the board's) should be
+  trusted for a model of this generation.
+
+So: absolute scores are reported as indicative only, and the load-bearing
+number is the paired difference.
+
+### 8.4 Statistics that match one shot per task
+
+One run per task means **within-task run-to-run variance is never
+observed.** What that permits and forbids:
+
+- **Permitted.** The 40 tasks are a paired sample, so a sign test (and
+  Wilcoxon signed-rank) over the 40 per-task differences B − A is a
+  legitimate test against the null "the harness makes no difference across
+  tasks". Report the full difference distribution, not just the mean: a
+  harness that wins big on 8 tasks and loses on 30 is a different finding
+  from one that gains two points everywhere.
+- **Forbidden.** No claim that any *individual* task's difference is real,
+  and no confidence interval that pretends to account for run noise. The
+  paired test is valid only under the assumption that within-task variance
+  is small relative to the between-arm difference — and that assumption is
+  **untested by this design**. Say so next to the p-value.
+
+Pre-register the primary metric (mean rubric score on raw reports) before
 the pass so there is no metric-shopping afterwards. Freeze this document's
 commit SHA and publish it alongside results.
 
@@ -428,9 +491,10 @@ commit SHA and publish it alongside results.
 
 - **Every task reported, including failures.** A crashed or report-less run
   scores whatever the judge gives it — usually zero. No quiet exclusions.
-  If a task is excluded it is pre-registered with a reason before the pass.
-- **Retry policy, pre-registered:** infrastructure failures only (container
-  death, network loss), at most one retry, every retry logged in
+  Any excluded task is pre-registered with a reason before the pass.
+- **Retry policy, pre-registered:** two sanctioned reasons only —
+  infrastructure failure (container death, network loss) and a §8.3
+  contamination disqualification. At most one retry, always logged in
   `result.json` and counted in the write-up. Never retry a bad score.
 - **Tool-surface difference, disclosed.** Long-exposure adds the MCP
   session-search server, `figure`, `promise_check` and the workspace
@@ -442,15 +506,15 @@ commit SHA and publish it alongside results.
   `/clear`, "ask the user") removed, Wolfram guidance gated off when no
   kernel is configured, MCP tools advertised only when actually launched,
   one operator's hard-coded paths replaced by the derived harness root. A
-  run on this branch does not see the prompt main would send, and that is
-  a behavioural difference, not just a bug fix.
+  run on this branch does not see the prompt main would send — a
+  behavioural difference, not just a bug fix.
 - **Which branch deltas can touch this run.** The only other behavioural
   change between main and this branch that the graded configuration could
   reach is the final-stage token threshold (20k → 100k) and the restored
-  `_N_MAX` cap — and both are inert here, because the final auditor and
-  reporter are off. Everything else is bug fixes, the two switches, and
-  observability. State this, with the diff published, so a reader does not
-  have to take it on trust.
+  `_N_MAX` cap — both inert here, because the final auditor and reporter
+  are off. Everything else is bug fixes, the two switches, and
+  observability. State this, with the diff published, so a reader need not
+  take it on trust.
 
 ### 8.6 Separating better research from better report-writing
 
@@ -458,43 +522,39 @@ Long-exposure's reporter is an LLM summarising work it did not do; arm A's
 report is written by the agent that did the work. So part of any advantage
 could be report craft rather than research quality. RCB's rubrics
 decompose into weighted criteria, so **report the sub-scores separately.**
-If B wins only on presentation-flavoured items and not on
-implementation, measurement or analysis, that is the finding — and it is a
-much weaker claim than the headline mean would suggest.
+If B wins only on presentation-flavoured items and not on implementation,
+measurement or analysis, that is the finding — and a much weaker claim
+than the headline mean suggests.
 
 ---
 
 ## 9. Cost and calendar
 
-Per-task notional cost for arm B is the largest unknown in the plan:
-Fable 5.1 at $10/$50, unlimited cycles to natural exhaustion, fan-out up
-to 3 branches, no cost ceiling. Modelling 6–15 cycles at 3–4 calls each,
-with a fan-out multiplier on the cycles where it fires, gives roughly
-**$20–$150 per task** with an unbounded tail.
+Per-task notional cost for arm B is the largest unknown: Fable 5.1 at
+$10/$50, unlimited cycles to natural exhaustion, fan-out up to 3 branches,
+no cost ceiling, 10 h outer bound. Modelling 6–15 cycles at 3–4 calls
+each, with a fan-out multiplier on the cycles where it fires, gives
+roughly **$20–$150 per task** with a tail bounded only by the 10 h stop.
 
 | Pass | Runs | Agent spend (notional) | Judge | Notes |
 |---|---|---|---|---|
-| Build (§5) | — | <$50 | — | 1 week |
+| Build (§5) | — | <$50 | — | ~1 week |
 | Smoke | 1 | <$50 | <$5 | Gate |
 | Main (arm B) | 40 | $800–$6,000 | $150–$400 | Wide by construction |
-| Baseline (arm A) | 40 | $150–$400 | $150–$400 | Parallel |
-| Compute control (A+) | 10 | $200–$1,500 | $40–$100 | Matched to B's median |
-| No-web subset | 10 | $200–$1,500 | $40–$100 | |
-| Memorisation probe | 40 calls | <$10 | — | |
-| Variance probe | 30 | $600–$4,500 | $120–$300 | Optional |
+| Baseline (arm A) | 40 | $150–$400 | $150–$400 | Runs in parallel |
 
-Notional agent total **$2k–$15k**; judge $0.5k–$1.3k. The judge is the
-only line item that is real cash, and it needs an OpenAI-compatible key.
+Notional agent total **$1k–$6.5k**; judge $300–$800. The judge is the only
+real-cash line and needs an OpenAI-compatible key.
 
-**Wall clock is the binding constraint, not money.** With a 12 h per-task
-stop, arm B alone is up to 480 hours serial — three weeks of continuous
-running. Parallel containers are what make this a few days instead, and
+**Wall clock is the binding constraint, not money.** With the 10 h
+per-task stop, arm B alone is up to 400 hours serial — over two weeks
+continuous. Parallel containers are what make this a few days instead, and
 per-task DB isolation (§5 item 1) is the prerequisite. Decide the
 parallelism factor before the main pass: it also determines whether
 Max-plan rate limits become the binding constraint, which the smoke test
-cannot reveal. Note that main's 400 s cooldown adds roughly 7 minutes of
-dead time per cycle — real wall clock, zero compute — which is why §8.1
-reports hours both raw and net.
+cannot reveal. Main's 400 s cooldown adds roughly 7 minutes of dead time
+per cycle — real wall clock, zero compute — which is why §8.1 reports
+hours both raw and net.
 
 ---
 
@@ -504,12 +564,13 @@ reports hours both raw and net.
 |---|---|---|
 | Fable 5.1 unavailable on this account | §5 item 0, one call | Re-decide the model first |
 | No gradeable report (final reporter off) | Smoke test asserts provenance | Fix the fallback chain — highest-probability mechanical failure here |
+| Report reads as a process log, not findings | §5 item 4 report-shape check | Report it as a property of this configuration; do not tune mid-campaign |
 | Prescriptive prompt suppresses Fable 5.1 quality | §5 item 4, from transcripts | One pre-scored trim, then frozen (§8.2) |
-| Target papers memorised | §8.3 probe | Stratify every headline; a fully memorised task set would invalidate the venue for this model |
-| B wins on spend, not structure | Arm A+ | Report "the tokens did the work" if that is what the data says |
+| Target paper retrieved despite the denylist | §8.3 egress block + post-hoc detection | Disqualify and re-run once; report the count |
+| Advantage is spend, not structure | Not resolvable in this design | Pre-registered limitation sentence in the conclusions (§8.1) |
 | Judge rewards length | §8.2 length reporting, dual raw/neutralised scoring | Report both; no silent choice |
-| Rubric variance swamps the difference | Variance probe | Descriptive reporting, no significance claim |
-| Unlimited cycles blow up wall clock | Exhaustion-vs-wall-stop split per task | Report the split; if most tasks hit 12 h, re-frame the headline |
+| One shot per task hides run variance | Acknowledged by design | Paired sign test only, with the untested assumption stated (§8.4) |
+| Unlimited cycles hit the 10 h stop often | Exhaustion-vs-cap split per task | Re-frame the headline as "score after 10 h" |
 | Max-plan rate limits throttle a parallel pass | Rate-limit events in `result.json` | Lower parallelism; report cooldown time |
 | Fan-out clones cross-contaminate | §5 item 1 assertion per task | Isolation boundary is the task, not the clone |
 | Arm A is a strawman | Use RCB's preset unmodified | Never hand-tune the baseline |
@@ -594,6 +655,10 @@ loop:
 flow: [researcher, worker, auditor]
 ```
 
+The root 10 h stop is not a config key — it is the adapter writing
+`long-exposure.stop`, using the harness's own `FANOUT_CAP_SECONDS` /
+`WALL_CAP_SECONDS` value (§6).
+
 ### Environment
 
 ```bash
@@ -615,6 +680,7 @@ JUDGE_API_KEY=...
 | Usage ledger | `<INSTANCE_DIR>/output/usage_summary.json` |
 | Telemetry | `<INSTANCE_DIR>/telemetry/events.jsonl` |
 | Health events | `<INSTANCE_DIR>/health_events.jsonl` |
+| Retrieval log | `<OUT_DIR>/retrieval.jsonl` (§8.3) |
 | Judge output | `<WORKSPACE>/_score.json` |
 
 ---
@@ -623,20 +689,19 @@ JUDGE_API_KEY=...
 
 | Decision | Choice | Consequence carried in this plan |
 |---|---|---|
-| Model | `claude-fable-5-1`, every arm, `high` effort | No board tie-back, so arm A is load-bearing; 2× notional price; prompt-fit check added |
+| Model | `claude-fable-5-1`, both arms, `high` effort | No board tie-back, so arm A is load-bearing; 2× notional price; prompt-fit check added |
 | Billing | Max plan via `claude -p`; no API key for agent calls | Cost is notional/API-equivalent and labelled as such (§7); the judge key is the only cash line |
-| Budget | Every ceiling, timer and cap as `main` ships them | Unlimited cycles and no cost cap: the harness runs to exhaustion, the ledger tracks without gating, and a 12 h per-task wall stop is imposed *outside* the harness and reported |
+| Budget | Every ceiling, timer and cap as `main` ships them | Unlimited cycles, no cost cap; the ledger tracks without gating |
+| Outer bound | The harness's own 10 h, applied at the root | No new number invented; the root loop is the one place main leaves uncapped, and the exhaustion-vs-cap split is reported |
 | Configuration | One config, all features on except the final auditor and final reporter, full 40-task scope | No ablation grid; mechanism evidence is observational (§8.6); the periodic reporter is the deliverable |
-| Web access | On and logged, plus a 10-task no-web subset | Peer parity kept; retrieval rate reported; memorisation probe added (§8.3) |
+| Attempts | One shot per task, then move on | No variance probe; paired sign test only, with the untested-variance assumption stated (§8.4) |
+| Web access | Enabled, but no retrieval of the target papers or their results | Per-task denylist, egress block, post-hoc detection, disqualify-and-re-run; no-web subset dropped as redundant |
+| Memorisation | Not probed | Justified in §8.3: it cancels in the paired difference, and for a re-discovery venue it is the benchmark's limitation for models of this class. Absolute scores reported as indicative only |
+| Compute-matched baseline | Not run | §8.1's pre-registered limitation: this design cannot separate structure from spend, and the conclusions must say so |
 
-Decided by implication, and easy to reverse:
-
-- **Arm A is included.** "One run with all features enabled" was read as
-  one long-exposure *configuration* — no feature matrix — not as dropping
-  the baseline. On Fable 5.1 it is the only same-model reference the
-  campaign has.
-- **Arm A+ and the variance probe are proposed, not assumed.** Together
-  they are what make the result defensible rather than suggestive: A+
-  answers "was it just more tokens", the probe answers "is the difference
-  bigger than noise". Dropping either is survivable if the corresponding
-  claim is dropped with it.
+One item remains decided by implication and is easy to reverse: **arm A is
+included.** "One run with all features enabled" was read as one
+long-exposure *configuration* — no feature matrix — not as dropping the
+baseline. On Fable 5.1 it is the only same-model reference the campaign
+has, and §8.3 makes the paired difference the load-bearing number, so
+without it there is a score but no result.
