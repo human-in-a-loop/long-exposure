@@ -420,6 +420,11 @@ knobs" and "Usage ledger, cost, and tool counts"):
 
 ### 5.2 Phase 1: ResearchClawBench (primary, about 3 weeks)
 
+> **Superseded for execution by [`rcb-benchmark-plan.md`](rcb-benchmark-plan.md)**,
+> which pins the model to exact IDs, fixes the arms and staging gates, and
+> carries the runnable config. The sketch below is kept for the reasoning
+> that produced it.
+
 - **Configs (arms):**
   - A0 Claude Code `/goal` baseline, same model, same tool set, same wall
     budget (the benchmark's own Claude Code entry is the reference point;
