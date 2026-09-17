@@ -18,8 +18,10 @@ current thesis, what has been ruled out, what the run is standing on
 unverified, what is parked — and it is advisory: where it disagrees with
 the plan of record or the promise ledger, they win.
 
-One new file, one new template, ~150 lines of code, zero new agents, zero
-new LLM calls.
+One new file, one new template, ~170 lines of code, zero new agents, zero
+new LLM calls. Superseded versions are also stored as `record_type='memoir'`
+rows in `sessions.db`, so `search_sessions` finds old memoirs alongside
+compaction rows.
 
 ## 2. The gap this closes
 
@@ -57,6 +59,10 @@ L3.
 | Auditor's view | The **file path**, not the content. It reads and edits the file with its own tools |
 | Shape | **Fixed skeleton** (§5), each section capped, global token cap enforced by the harness |
 | Authority | Advisory. Plan of record and promise ledger win on any conflict; the memoir is what gets corrected |
+| Archive trigger | **Only when the auditor changed the file** (`file_signature` before vs after). Unchanged cycles leave no entry; a gap in cycle numbers means "unchanged" |
+| Archive searchability | Files in `memoir/history/` **and** a `record_type='memoir'` row in `sessions.db`, using the `lemmas.py` pattern, so `search_sessions` surfaces them |
+| Reporter | **Untouched.** No pointer in its role. It may `Read` the file on its own initiative like any workspace file; nothing tells it to |
+| Branch | `claude/long-exposure-tiered-memory`, cut from `claude/long-exposure-benchmarking-pikxm2`; never to `main` without explicit instruction |
 
 ## 5. The skeleton
 
@@ -157,7 +163,7 @@ cycle N start
   └─ auditor     (memoir_path in window; edits MEMOIR.md in place, minimal)
        └─ after success, at root only:
             file_signature changed?  ──► copy to memoir/history/cycle-NNNN_<ts>.md
-                                          (optionally: sessions.db row, record_type='memoir')
+                                          + sessions.db row, record_type='memoir'
 cycle N+1 start
   └─ read MEMOIR.md ──► …
 ```
@@ -215,14 +221,14 @@ Rules at the edges:
 | Inject | `exploration.py:~4140`, beside the plan/ledger injection block | ~20 lines |
 | Auditor path input | Same block: `score_inputs["memoir_path"]` (root) or read-only note (clone) | ~6 lines |
 | Archive | `exploration.py:~4306`, after the auditor's successful result lands | ~10 lines calling a helper |
-| Helper module | New `long_exposure/memoir.py`: `read_for_injection`, `archive_if_changed`, optional `store_row` | ~80 lines |
+| Helper module | New `long_exposure/memoir.py`: `read_for_injection`, `archive_if_changed`, `store_row` | ~100 lines |
 | Score | `exploration-score.yaml`: `run_memory` in researcher/worker inputs, `memoir_path` in auditor inputs, two sentences in the auditor role | ~6 lines |
 | Config | `config.yaml`: `memoir: {enabled: true, max_tokens: 1200}` | 3 lines |
 
-Roughly 150 lines of production code. Reuses `stage_io.file_signature`
+Roughly 170 lines of production code. Reuses `stage_io.file_signature`
 (change detection), `stage_io.atomic_write_text` (archive write),
-`estimate_tokens` (cap), and — if the sessions.db row is included —
-`store_session` exactly as `lemmas.py` uses it.
+`estimate_tokens` (cap), and `store_session` exactly as `lemmas.py` uses
+it for the archive row.
 
 ## 9. The auditor's two sentences
 
@@ -263,8 +269,8 @@ auditor), no per-role toggle (the roles are fixed by decision).
 - In a clone, `memoir_path` renders the read-only note and no archive is
   written.
 - `memoir.enabled: false` → no seed, no inputs, no archive.
-- Sessions.db row (if included): one `record_type='memoir'` row per
-  archive, findable via the FTS query path `search_sessions` uses.
+- One `record_type='memoir'` row per archive in `sessions.db`, findable
+  via the FTS query path `search_sessions` uses; none when unchanged.
 
 ## 12. Docs
 
@@ -285,29 +291,28 @@ auditor), no per-role toggle (the roles are fixed by decision).
 - No ranking or retrieval over the archive. `Grep` and `search_sessions`
   are enough; the archive is small and cycle-numbered.
 - No state in `exploration_state.json`.
-- No change to compaction, gems, the ledger, or the plan.
+- No change to compaction, gems, the ledger, the plan, or the reporter's
+  role text.
 
 ## 14. Branch
 
 This changes the prompt every researcher and worker sees, which would
 invalidate the "stock configuration, four disclosed deviations" basis of
 the ResearchClawBench run if it landed on
-`claude/long-exposure-benchmarking-pikxm2`. Implementation should go on a
-branch cut from that one — proposed `claude/long-exposure-tiered-memory`
-— and never to `main`. This document is committed to the current branch
-as a plan only.
+`claude/long-exposure-benchmarking-pikxm2`. Implementation goes on
+`claude/long-exposure-tiered-memory`, cut from that branch, and never to
+`main` without explicit instruction. The benchmark branch carries this
+document as a plan only.
 
-## 15. Open questions
+## 15. Resolved
 
-1. **Cap numbers.** 1,200 global and the per-section counts above are
-   guesses; the first real run's `memoir/history/` will say whether they
-   bind.
-2. **Archive rows in `sessions.db`.** Including them means
-   `search_sessions` — which researcher, worker and auditor already have —
-   finds old memoir versions alongside compaction rows, at ~20 lines using
-   the `lemmas.py` pattern. Include now, or leave the archive `Grep`-only
-   and add later if agents ask for it?
-3. **A pointer for the reporter.** The periodic reporter does not get the
-   memoir in-window (by decision), but one sentence in its role naming
-   the file would let L2 reports cite L1. A pointer is not an injection —
-   is that within the decision, or outside it?
+| Question | Decision |
+|---|---|
+| Archive rows in `sessions.db` | **Yes, now.** `search_sessions` finds old memoirs alongside compaction rows |
+| Reporter pointer | **No.** The reporter stays untouched |
+| Archive trigger | **Only on change** |
+| Branch | `claude/long-exposure-tiered-memory` |
+
+Still a guess until a real run says otherwise: the 1,200-token global cap
+and the per-section counts in §5. The first `memoir/history/` will show
+whether they bind.
