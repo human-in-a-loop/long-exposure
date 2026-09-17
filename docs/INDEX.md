@@ -62,6 +62,7 @@ long-exposure does, see the project [README](../README.md).
 | [`gaps_interactive_mode.md`](gaps_interactive_mode.md) | Opt-in interactive Claude transport: design, configuration, verification, and its own gaps table | Considering `claude_transport: interactive` |
 | [`benchmarking-plan.md`](benchmarking-plan.md) | Sept 2026 evaluation of the harness (verified code-vs-docs findings), survey of harness-labelled public benchmarks, and a phased plan to benchmark long-exposure against peer harnesses | Planning or reading a benchmark campaign |
 | [`rcb-benchmark-plan.md`](rcb-benchmark-plan.md) | Runnable pre-registration for the single primary venue (ResearchClawBench): one arm on Claude-Opus-4.6 (the only model with two published same-model harness rows) at main's stock budget, 40 tasks, one shot each, plus contamination controls, judge controls, and the exact bench config | Actually executing the benchmark |
+| [`tiered-memory-plan.md`](tiered-memory-plan.md) | Design for the run memoir (L1) over existing L2 reports and L3 compaction rows: auditor-written, minimal-edit, injected into researcher and worker only, archived per cycle; fixed skeleton, guardrails, integration seams | Implementing or reviewing the tiered narrative memory |
 
 ---
 
