@@ -1,0 +1,384 @@
+"""Run memoir (L1 narrative memory). Offline: every provider call is patched.
+
+Covers the decisions in docs/tiered-memory-plan.md §4: contents injected into
+researcher and worker only, the auditor gets the path, archive only on
+change (file + sessions.db row), clones read but never write, and the
+off switch strips the inputs rather than rendering [UNAVAILABLE].
+"""
+
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from long_exposure import memoir, paths, telemetry
+from long_exposure import provider as _provider
+from long_exposure.conductor import build_agent_prompt
+from long_exposure.exploration import run_exploration
+from auto_compact.db import init_db
+
+from test_run_switches import _write_files
+
+
+class MemoirModuleTests(unittest.TestCase):
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name) / "ws"
+        self.ws.mkdir()
+        paths.ensure_layout(self.ws)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def test_seed_writes_skeleton_once(self):
+        self.assertTrue(memoir.seed_if_missing(self.ws))
+        body = paths.memoir_path(self.ws).read_text()
+        for heading in ("## Thesis", "## Standing on", "## Ruled out",
+                        "## Parked", "## Where to look", "## Changed this cycle"):
+            self.assertIn(heading, body)
+        self.assertIn("THEY win", body)  # the ledger-wins rule travels with the file
+        paths.memoir_path(self.ws).write_text("edited")
+        self.assertFalse(memoir.seed_if_missing(self.ws))
+        self.assertEqual(paths.memoir_path(self.ws).read_text(), "edited")
+
+    def test_injection_has_header_and_seeds_lazily(self):
+        value = memoir.read_for_injection(self.ws, {})
+        self.assertTrue(value.startswith("[Run memoir — advisory"))
+        self.assertIn("plan_of_record.md or the promise ledger, they win", value)
+        self.assertIn("## Thesis", value)
+        self.assertTrue(paths.memoir_path(self.ws).exists())
+
+    def test_over_cap_is_truncated_with_marker_and_event(self):
+        paths.memoir_path(self.ws).write_text("x" * 4000)
+        seen = []
+        with patch("long_exposure.memoir.health_events.append_event",
+                   side_effect=lambda kind, **kw: seen.append(kind)):
+            value = memoir.read_for_injection(self.ws, {"memoir": {"max_tokens": 100}})
+        self.assertIn("[memoir over cap", value)
+        self.assertLess(len(value), 4000)
+        self.assertEqual(seen, ["memoir_over_cap"])
+        # The live file is untouched — only the injected copy is cut.
+        self.assertEqual(len(paths.memoir_path(self.ws).read_text()), 4000)
+
+    def test_under_cap_is_not_truncated_and_no_event(self):
+        paths.memoir_path(self.ws).write_text("short")
+        seen = []
+        with patch("long_exposure.memoir.health_events.append_event",
+                   side_effect=lambda kind, **kw: seen.append(kind)):
+            value = memoir.read_for_injection(self.ws, {"memoir": {"max_tokens": 3000}})
+        self.assertNotIn("over cap", value)
+        self.assertEqual(seen, [])
+
+    def test_config_defaults_and_bad_values(self):
+        self.assertTrue(memoir.enabled({}))
+        self.assertTrue(memoir.enabled({"memoir": {}}))
+        self.assertFalse(memoir.enabled({"memoir": {"enabled": False}}))
+        self.assertEqual(memoir.max_tokens({}), 3000)
+        self.assertEqual(memoir.max_tokens({"memoir": {"max_tokens": "nope"}}), 3000)
+        self.assertEqual(memoir.max_tokens({"memoir": {"max_tokens": 0}}), 3000)
+        self.assertEqual(memoir.max_tokens({"memoir": {"max_tokens": 500}}), 500)
+
+    def test_path_input_is_bare_at_root_and_read_only_in_clone(self):
+        root = memoir.path_input_value(self.ws, is_clone=False)
+        self.assertEqual(root, str(paths.memoir_path(self.ws)))
+        clone = memoir.path_input_value(self.ws, is_clone=True)
+        self.assertIn("do NOT edit", clone)
+        self.assertIn(str(paths.memoir_path(self.ws)), clone)
+
+    def test_archive_only_on_change_with_file_and_row(self):
+        memoir.seed_if_missing(self.ws)
+        conn = init_db(Path(self.td.name) / "sessions.db")
+        before = memoir.signature(self.ws)
+
+        # Unchanged → nothing.
+        self.assertIsNone(memoir.archive_if_changed(self.ws, 3, before, conn))
+        self.assertEqual(list(paths.memoir_history_dir(self.ws).iterdir()), [])
+
+        # Changed → one archive whose content equals the live file, plus a row.
+        target = paths.memoir_path(self.ws)
+        target.write_text(target.read_text().replace("(none yet)", "spectral approach failed", 1))
+        # Force a distinct mtime even on coarse filesystems.
+        st = target.stat()
+        os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        archived = memoir.archive_if_changed(self.ws, 3, before, conn)
+        self.assertIsNotNone(archived)
+        self.assertTrue(archived.name.startswith("cycle-0003_"))
+        self.assertTrue(archived.name.endswith(".md"))
+        self.assertEqual(archived.read_text(), target.read_text())
+
+        rows = conn.execute(
+            "SELECT record_type, topic, subtopic, summary_xml FROM sessions "
+            "WHERE record_type = 'memoir'"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "memoir")
+        self.assertEqual(rows[0][2], "cycle-3")
+        self.assertIn("spectral approach failed", rows[0][3])
+        # Findable through the same FTS table search_sessions queries.
+        hit = conn.execute(
+            "SELECT rowid FROM sessions_fts WHERE sessions_fts MATCH ?", ("spectral",)
+        ).fetchall()
+        self.assertEqual(len(hit), 1)
+        conn.close()
+
+    def test_strip_inputs(self):
+        agents = {
+            "researcher": {"inputs": ["directive", "run_memory"]},
+            "auditor": {"inputs": ["directive", "memoir_path"]},
+            "curator": {"inputs": ["directive"]},
+            "odd": {},
+        }
+        memoir.strip_inputs(agents)
+        self.assertEqual(agents["researcher"]["inputs"], ["directive"])
+        self.assertEqual(agents["auditor"]["inputs"], ["directive"])
+        self.assertEqual(agents["curator"]["inputs"], ["directive"])
+        self.assertEqual(agents["odd"], {})
+
+
+class MemoirPromptRenderingTests(unittest.TestCase):
+    """The input protocol renders the memoir for exactly the roles that
+    declare it — the score, not the harness, decides who sees it."""
+
+    def _prompt(self, agent_def, results, score_inputs):
+        return build_agent_prompt(
+            score_task="t", step_agent_name="x", agent_def=agent_def,
+            results=results, score_inputs=score_inputs,
+        )
+
+    def test_researcher_sees_contents_auditor_sees_path_only(self):
+        results = {"directive": "d", "run_memory": "[Run memoir — advisory]\n\n## Thesis\nX"}
+        score_inputs = {"memoir_path": "/ws/MEMOIR.md"}
+        researcher = self._prompt(
+            {"inputs": ["directive", "run_memory"], "outputs": ["research_brief"]},
+            results, score_inputs,
+        )
+        self.assertIn("[INPUT: run_memory]", researcher)
+        self.assertIn("## Thesis", researcher)
+        self.assertNotIn("memoir_path", researcher)
+
+        auditor = self._prompt(
+            {"inputs": ["directive", "memoir_path"], "outputs": ["audit_report"]},
+            results, score_inputs,
+        )
+        self.assertIn("[INPUT: memoir_path]", auditor)
+        self.assertIn("/ws/MEMOIR.md", auditor)
+        self.assertNotIn("## Thesis", auditor)
+        self.assertNotIn("[INPUT: run_memory]", auditor)
+
+
+def _memoir_score_agents():
+    return (
+        "agents:\n"
+        "  researcher:\n"
+        "    inputs: [directive, audit_report, live_guidance, run_memory]\n"
+        "    outputs: [research_brief]\n"
+        "    role: researcher\n"
+        "  worker:\n"
+        "    inputs: [directive, research_brief, run_memory]\n"
+        "    outputs: [work_output]\n"
+        "    role: worker\n"
+        "  auditor:\n"
+        "    inputs: [directive, work_output, memoir_path]\n"
+        "    outputs: [audit_report]\n"
+        "    role: auditor\n"
+    )
+
+
+def _write_memoir_files(root: Path, *, config_extra: str = "", max_cycles: int = 2):
+    """Like test_run_switches._write_files but with the memoir inputs declared."""
+    workspace = root / "workspace"
+    instance = root / "instance"
+    workspace.mkdir()
+    instance.mkdir()
+    score = root / "score.yaml"
+    score.write_text(
+        "task: test directive\n"
+        "loop:\n"
+        f"  max_cycles: {max_cycles}\n"
+        "  cycle_cooldown_seconds: 0\n"
+        "  report_interval: 100\n"
+        "  daily_sync_interval_hours: 0\n"
+        "  fanout_enabled: false\n"
+        "  end_of_run: false\n"
+        + _memoir_score_agents()
+        + "flow: [researcher, worker, auditor]\n"
+    )
+    config = root / "config.yaml"
+    config.write_text(
+        "llm_provider: local\n"
+        "model: test\n"
+        "local_model: test\n"
+        "local_context_window: 32768\n"
+        "context_window: 32768\n"
+        "compact_threshold: 0.9\n"
+        f"compact_db: {instance / 'sessions.db'}\n"
+        f"working_directory: {workspace}\n"
+        "checkpoint_format: standard\n"
+        "require_checkpoint_first: false\n"
+        "user_gate_approval: false\n"
+        "anti_patterns_enabled: true\n"
+        "telemetry:\n"
+        "  enabled: false\n"
+        + config_extra
+    )
+    return score, config, instance, workspace
+
+
+def _agent_that_edits_memoir(seen: list, workspace: Path, *, edit: bool = True):
+    """Fake agent that records what each role received and, as the auditor,
+    makes a minimal edit to MEMOIR.md the way the real one would."""
+    def fake(agent_name, agent_def, **kwargs):
+        results = kwargs.get("results") or {}
+        score_inputs = kwargs.get("score_inputs") or {}
+        seen.append({
+            "agent": agent_name,
+            "run_memory": results.get("run_memory"),
+            "memoir_path": score_inputs.get("memoir_path"),
+            "declared": list(agent_def.get("inputs", [])),
+        })
+        if agent_name == "auditor" and edit:
+            target = paths.memoir_path(workspace)
+            body = target.read_text()
+            cycle_tag = f"ruled out approach #{len([s for s in seen if s['agent']=='auditor'])}"
+            target.write_text(body + f"\n- {cycle_tag}\n")
+            st = target.stat()
+            os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        return {
+            "agent": agent_name,
+            "outputs": {agent_def["outputs"][0]: f"{agent_name} output " + "x" * 2100},
+            "usage": {"input_tokens": 100, "output_tokens": 2100},
+            "duration_ms": 10,
+            "status": "ok",
+            "error": None,
+            "cost_usd": None,
+            "num_turns": 1,
+            "tool_calls": 1,
+        }
+    return fake
+
+
+class MemoirCycleIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self._env = dict(os.environ)
+        _provider.configure_provider({"llm_provider": "claude"})
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+        telemetry.configure({"telemetry": {"enabled": False}}, None, None)
+        _provider.configure_provider({"llm_provider": "claude"})
+
+    def _run(self, score, config, inst):
+        run_exploration(
+            score_path=str(score), config_path=str(config),
+            output_dir=inst / "output", state_path=inst / "exploration_state.json",
+            task_override=None, instance_dir=inst,
+        )
+
+    def test_roles_receive_the_right_thing_and_archive_tracks_edits(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as td:
+            score, config, inst, ws = _write_memoir_files(Path(td), max_cycles=2)
+            with patch("long_exposure.exploration._call_exploration_agent",
+                       _agent_that_edits_memoir(seen, ws)):
+                self._run(score, config, inst)
+
+            by_role = {}
+            for s in seen:
+                by_role.setdefault(s["agent"], []).append(s)
+            self.assertEqual(len(by_role["auditor"]), 2)
+
+            # Researcher and worker: contents in-window, with the header.
+            for role in ("researcher", "worker"):
+                for call in by_role[role]:
+                    self.assertIsNotNone(call["run_memory"], role)
+                    self.assertTrue(call["run_memory"].startswith("[Run memoir"), role)
+                    self.assertIn("## Thesis", call["run_memory"])
+            # Cycle 2's researcher sees cycle 1's auditor edit.
+            self.assertIn("ruled out approach #1", by_role["researcher"][1]["run_memory"])
+            self.assertNotIn("ruled out approach #1", by_role["researcher"][0]["run_memory"])
+
+            # Auditor: the bare path, and NOT the contents.
+            for call in by_role["auditor"]:
+                self.assertEqual(call["memoir_path"], str(paths.memoir_path(ws)))
+                self.assertNotIn("run_memory", call["declared"])
+
+            # One archive per changed cycle, content == live file at that time.
+            history = sorted(paths.memoir_history_dir(ws).iterdir())
+            self.assertEqual([h.name[:11] for h in history], ["cycle-0001_", "cycle-0002_"])
+            self.assertEqual(history[-1].read_text(), paths.memoir_path(ws).read_text())
+            self.assertIn("ruled out approach #1", history[0].read_text())
+            self.assertNotIn("ruled out approach #2", history[0].read_text())
+
+            # And one sessions.db row per archive.
+            conn = sqlite3.connect(inst / "sessions.db")
+            rows = conn.execute(
+                "SELECT subtopic FROM sessions WHERE record_type='memoir' ORDER BY subtopic"
+            ).fetchall()
+            conn.close()
+            self.assertEqual([r[0] for r in rows], ["cycle-1", "cycle-2"])
+
+    def test_unchanged_memoir_leaves_no_archive(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as td:
+            score, config, inst, ws = _write_memoir_files(Path(td), max_cycles=2)
+            with patch("long_exposure.exploration._call_exploration_agent",
+                       _agent_that_edits_memoir(seen, ws, edit=False)):
+                self._run(score, config, inst)
+            self.assertEqual(list(paths.memoir_history_dir(ws).iterdir()), [])
+            conn = sqlite3.connect(inst / "sessions.db")
+            n = conn.execute("SELECT COUNT(*) FROM sessions WHERE record_type='memoir'").fetchone()[0]
+            conn.close()
+            self.assertEqual(n, 0)
+
+    def test_clone_reads_but_never_writes(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as td:
+            score, config, inst, ws = _write_memoir_files(Path(td), max_cycles=1)
+            with patch("long_exposure.exploration._call_exploration_agent",
+                       _agent_that_edits_memoir(seen, ws)), \
+                    patch("long_exposure.exploration._is_clone", return_value=True):
+                self._run(score, config, inst)
+            researcher = next(s for s in seen if s["agent"] == "researcher")
+            self.assertIn("## Thesis", researcher["run_memory"])
+            auditor = next(s for s in seen if s["agent"] == "auditor")
+            self.assertIn("do NOT edit", auditor["memoir_path"])
+            # The fake auditor still wrote the file, but the harness must not archive it.
+            self.assertEqual(list(paths.memoir_history_dir(ws).iterdir()), [])
+
+    def test_disabled_strips_inputs_and_writes_nothing(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as td:
+            score, config, inst, ws = _write_memoir_files(
+                Path(td), max_cycles=1, config_extra="memoir:\n  enabled: false\n",
+            )
+            with patch("long_exposure.exploration._call_exploration_agent",
+                       _agent_that_edits_memoir(seen, ws, edit=False)):
+                self._run(score, config, inst)
+            for call in seen:
+                self.assertIsNone(call["run_memory"], call["agent"])
+                self.assertIsNone(call["memoir_path"], call["agent"])
+                self.assertNotIn("run_memory", call["declared"])
+                self.assertNotIn("memoir_path", call["declared"])
+            self.assertFalse(paths.memoir_path(ws).exists())
+
+    def test_resumed_pre_memoir_workspace_is_seeded_lazily(self):
+        """A workspace created before the feature has no MEMOIR.md; the first
+        cycle after upgrade must still inject a skeleton rather than an error."""
+        seen = []
+        with tempfile.TemporaryDirectory() as td:
+            score, config, inst, ws = _write_memoir_files(Path(td), max_cycles=1)
+            (ws / "plan_of_record.md").write_text("# existing plan\n")  # looks like a resume
+            with patch("long_exposure.exploration._call_exploration_agent",
+                       _agent_that_edits_memoir(seen, ws, edit=False)):
+                self._run(score, config, inst)
+            researcher = next(s for s in seen if s["agent"] == "researcher")
+            self.assertIn("## Thesis", researcher["run_memory"])
+            self.assertTrue(paths.memoir_path(ws).exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

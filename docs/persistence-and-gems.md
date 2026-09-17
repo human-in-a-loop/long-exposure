@@ -62,6 +62,7 @@ Plus catalog indexes on `(topic)` and `(topic, subtopic)`.
 | `checkpoint` | mid-context snapshot without context reset | Observability; not load-bearing |
 | `lesson` | final auditor's document stage emits a cross-run finding | Cross-run wisdom; +0.3 gem boost; immune from recency decay for ~30 days |
 | `lemma` | agent output includes an accepted `<lemma_proposal>` block | Shared infrastructure facts; excluded from gem ranking |
+| `memoir` | the auditor changed `MEMOIR.md` this cycle (root only) | Archived L1 narrative memory, one row per changed cycle; searchable via `search_sessions`, never injected |
 
 ### Concurrency model
 
@@ -301,6 +302,55 @@ or missing labels/claims, XML-escapes stored content, and writes accepted
 lemmas as `record_type="lemma"` with `topic="lemma_<category>"`. Lemmas are
 excluded from proximity ranking so they do not crowd out research context.
 They remain searchable through MCP/FTS like other records.
+
+---
+
+## The run memoir — the L1 tier the cycle loop actually pushes
+
+Gems are REPL-only (above), so on the harness path the only narrative
+memory an agent receives *automatically* is the previous cycle's outputs
+plus the plan and ledger summary. The run memoir closes that gap with the
+smallest possible mechanism: one agent-owned file, `<workspace>/MEMOIR.md`,
+that the **auditor** edits with minimal changes at the end of each cycle
+and the **researcher and worker** receive as the `run_memory` input at the
+start of the next. Nobody else gets it in-window; the auditor gets only
+the path (`memoir_path`). Design and the decisions behind it:
+`tiered-memory-plan.md`.
+
+Three tiers, and what is pushed versus pulled:
+
+| Tier | Artifact | Residency |
+|---|---|---|
+| L1 | `MEMOIR.md` — thesis, unverified premises, ruled-out approaches, parked items, pointers, this cycle's diff | **Pushed** to researcher and worker every cycle, capped at `memoir.max_tokens` (default 3000; over-cap content is truncated at injection with a `memoir_over_cap` health event) |
+| L2 | `reports/report_cycles_N.md` | Pull; L1's "Where to look" names them |
+| L3 | `sessions.db` compaction rows, lemmas, `memoir/history/` | Pull via `search_sessions`, `Read`, `Grep` |
+
+Rules that keep it honest:
+
+- **Advisory.** Where the memoir disagrees with `plan_of_record.md` or the
+  promise ledger, they win and the memoir is what gets corrected. The
+  rule is in the template header, the auditor's guidance, and the
+  injection header.
+- **Not a second truth store.** Premises in "Standing on" move to the
+  ledger once verified and to "Ruled out" once broken, so the two never
+  hold the same fact.
+- **Archive only on change.** The harness takes `file_signature` before
+  and after the auditor's turn; a changed file is copied to
+  `memoir/history/cycle-NNNN_<ts>.md` and stored as a `record_type='memoir'`
+  row. An unchanged cycle leaves no trace — the normal outcome of
+  minimal-edit discipline.
+- **Root writes only.** Fan-out clones share the workspace and read the
+  memoir for free, but their auditor gets a read-only note instead of the
+  path and the archive hook is gated on the root process. The post-merge
+  cycle runs worker-only, so no rewrite that cycle; the next full cycle's
+  auditor catches up.
+- **Lazy seed.** `MEMOIR.md` is written from `templates/memoir_template.md`
+  the first time a cycle needs it, so a workspace that predates the
+  feature gets one on its next resumed cycle. Nothing is added to
+  `exploration_state.json`.
+- **Off switch.** `memoir.enabled: false` strips `run_memory` and
+  `memoir_path` from every agent's inputs at load, so the prompt is
+  identical to a pre-memoir run rather than carrying `[UNAVAILABLE]`.
 
 ---
 

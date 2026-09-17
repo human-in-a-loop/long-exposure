@@ -177,6 +177,16 @@ def final_audit_summary_path(config_or_workspace) -> Path:
     return final_audit_dir(config_or_workspace) / "final_audit_summary.json"
 
 
+def memoir_path(config_or_workspace) -> Path:
+    """The live run memoir (L1 narrative memory). See docs/tiered-memory-plan.md."""
+    return workspace_root(config_or_workspace) / "MEMOIR.md"
+
+
+def memoir_history_dir(config_or_workspace) -> Path:
+    """Superseded memoir versions, one file per changed cycle."""
+    return workspace_root(config_or_workspace) / "memoir" / "history"
+
+
 def ensure_layout(config_or_workspace) -> None:
     """Create managed routing directories; safe on fresh and resumed runs."""
     for directory in (
@@ -186,5 +196,6 @@ def ensure_layout(config_or_workspace) -> None:
         audits_dir(config_or_workspace),
         final_audit_dir(config_or_workspace),
         final_audit_stages_dir(config_or_workspace),
+        memoir_history_dir(config_or_workspace),
     ):
         directory.mkdir(parents=True, exist_ok=True)

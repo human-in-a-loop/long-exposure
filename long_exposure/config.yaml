@@ -101,6 +101,17 @@ compact_threshold: 0.90
 reanchor_enabled: true
 compact_db: ./data/sessions.db
 max_summary_pct: 0.15
+
+# Run memoir — the L1 tier of narrative memory (docs/tiered-memory-plan.md).
+# A single agent-owned file, MEMOIR.md, that the auditor updates with
+# minimal edits at the end of each cycle and the researcher and worker
+# receive as the `run_memory` input at the start of the next. Advisory:
+# the plan of record and promise ledger win on any conflict. Superseded
+# versions are archived under memoir/history/ and as record_type=memoir
+# rows in sessions.db, never injected.
+memoir:
+  enabled: true
+  max_tokens: 3000   # global cap enforced at injection (chars/4 estimate)
 depth_compression: gentle
 
 # === Fan-out merge synthesis (Stage 2) ===

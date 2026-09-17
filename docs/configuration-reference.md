@@ -157,6 +157,23 @@ compact_xml_retries: 5    # bounded retry on malformed compaction summary XML
 | `depth_compression` | `gentle` (current) or `aggressive`. Influences depth-aware compaction prompt |
 | `compact_xml_retries` | Bounded retry on malformed XML summary; default 5. After exhaustion, store as-is with off-nominal event. **Standalone REPL only**: the cycle loop's compaction stores a plain-text summary, checks well-formedness once, logs `compaction_xml_invalid`, and never retries (`persistence-and-gems.md`, "Two compaction paths"). `max_summary_pct` and `depth_compression` are likewise REPL-only. |
 
+### Run memoir (L1 narrative memory)
+
+```yaml
+memoir:
+  enabled: true
+  max_tokens: 3000
+```
+
+| Key | Meaning |
+|---|---|
+| `enabled` | Seed `MEMOIR.md`, inject it as the `run_memory` input to the researcher and worker, give the auditor its path as `memoir_path`, and archive changed versions after the auditor's turn. `false` strips both inputs from every agent at load so the prompt matches a pre-memoir run. Default `true` |
+| `max_tokens` | Global cap enforced at injection (chars/4 estimate). Over-cap content is truncated with a marker and a `memoir_over_cap` health event; the live file is never altered by the harness. Default 3000 |
+
+The memoir is advisory — the plan of record and promise ledger win on any
+conflict — and the auditor's role text carries the minimal-edit rule. See
+`persistence-and-gems.md` ("The run memoir") and `tiered-memory-plan.md`.
+
 ### Fan-out merge synthesis
 
 ```yaml

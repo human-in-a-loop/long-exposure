@@ -43,8 +43,19 @@ the standard folders:
 ├── data/         curated source data
 ├── docs/         narrative documentation
 ├── tools/        utility scripts
+├── memoir/       history/ — superseded run-memoir versions, cycle-stamped
 └── stale/        archive (files moved here, never deleted)
 ```
+
+Two files sit at the workspace root beside `plan_of_record.md` and
+`STRUCTURE.md`: `promise_ledger.jsonl` (below) and `MEMOIR.md`, the run
+memoir — L1 narrative memory that the auditor edits each cycle and the
+researcher and worker receive as `run_memory`. It is advisory: the plan
+and ledger win on conflict, and a premise leaves the memoir the moment
+it is verified (→ ledger) or broken (→ its "Ruled out" section). It is
+seeded lazily on the first cycle that needs it, not by the bootstrap, so
+it also appears in workspaces that predate the feature. Full design:
+`tiered-memory-plan.md`.
 
 The bootstrap is **idempotent** — re-running on an existing skeleton
 is a no-op. It fires only on cycle 1 of a *fresh* run; on

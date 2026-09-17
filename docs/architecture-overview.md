@@ -194,14 +194,14 @@ See `configuration-reference.md` for the full assembly order.
 
 ## What survives a cycle, a compaction, a stop, and a clear
 
-| Lifetime event | Conversation | `agent_sessions` UUIDs | `sessions.db` | Workspace files | POR + ledger |
-|---|---|---|---|---|---|
-| Cycle boundary | continues | preserved | preserved | preserved | preserved |
-| Auto-compact (90% ctx) | reset | new UUID issued | summary persisted | preserved | preserved |
-| `stop` / Ctrl-C | preserved (state file) | preserved | preserved | preserved | preserved |
-| `resume` | restored | restored | preserved | preserved | preserved |
-| `clear` | reset | reset | preserved | preserved | preserved |
-| Account rotation (rate-limit OR planned 24h) | reset | new UUIDs (per-account) | preserved (shared) | preserved | preserved |
+| Lifetime event | Conversation | `agent_sessions` UUIDs | `sessions.db` | Workspace files | POR + ledger | `MEMOIR.md` |
+|---|---|---|---|---|---|---|
+| Cycle boundary | continues | preserved | preserved | preserved | preserved | preserved |
+| Auto-compact (90% ctx) | reset | new UUID issued | summary persisted | preserved | preserved | preserved |
+| `stop` / Ctrl-C | preserved (state file) | preserved | preserved | preserved | preserved | preserved |
+| `resume` | restored | restored | preserved | preserved | preserved | preserved |
+| `clear` | reset | reset | preserved | preserved | preserved | preserved |
+| Account rotation (rate-limit OR planned 24h) | reset | new UUIDs (per-account) | preserved (shared) | preserved | preserved | preserved |
 
 Two key invariants:
 
@@ -211,6 +211,13 @@ Two key invariants:
   `record_type="lesson"`; accepted shared infrastructure lemmas as
   `record_type="lemma"`. Workspace files are produced from agent
   output but the canonical record is the DB.
+- `MEMOIR.md` is **L1 narrative memory** — advisory, agent-owned, edited
+  by the auditor each cycle with minimal changes and pushed to the
+  researcher and worker as `run_memory`. It complements rather than
+  duplicates the plan and ledger: where they disagree, they win. Changed
+  versions are archived under `memoir/history/` and as
+  `record_type="memoir"` rows (`persistence-and-gems.md`, "The run
+  memoir").
 - `exploration_state.json` is **ephemeral**. It holds the current
   cycle, last results dict, agent session UUIDs, and daily-sync
   bookkeeping. Overwritten each cycle; archived with a timestamp on

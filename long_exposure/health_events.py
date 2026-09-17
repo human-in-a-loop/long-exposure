@@ -33,6 +33,11 @@ in the log):
   - `file_gate_rescue_refused`      rescue declined (too short / would shrink)
   - `pdf_render_failed`             pandoc/tectonic returned non-zero
 
+  Run memoir (L1 narrative memory)
+  - `memoir_over_cap`              MEMOIR.md exceeded memoir.max_tokens; injected truncated
+  - `memoir_archive_failed`        copying a changed memoir to memoir/history/ failed
+  - `memoir_store_failed`          writing the memoir archive row to sessions.db failed
+
   Accounts, pool and rotation
   - `account_state_save_failed`     OSError on _save_account_state
   - `account_mismatch_drop`         clone session dropped (account changed)

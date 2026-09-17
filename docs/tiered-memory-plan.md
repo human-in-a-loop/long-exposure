@@ -1,7 +1,7 @@
 # Tiered narrative memory: the run memoir (L1) over existing L2/L3
 
-Status: **design, not built.** Implementation targets a branch separate
-from `main`; see §14.
+Status: **implemented on `claude/long-exposure-tiered-memory`.** Never to
+`main` without explicit instruction; see §14.
 
 ## 1. What this is, in one paragraph
 
@@ -146,7 +146,7 @@ Why each earns its place:
 
 ### Eviction
 
-Per-section caps, and a global cap of ~1,200 tokens (`memoir.max_tokens`).
+Per-section caps, and a global cap of 3,000 tokens (`memoir.max_tokens`).
 When a section is over cap the auditor drops the entry least likely to be
 re-tried or re-needed — by default the oldest — and the archive keeps it.
 The harness enforces the global cap at injection (§7) so an undisciplined
@@ -170,9 +170,11 @@ cycle N+1 start
 
 Rules at the edges:
 
-- **First cycle.** `bootstrap_workspace` seeds `MEMOIR.md` from a template
-  next to `plan_of_record.md`. Cycle 1's researcher and worker see the
-  empty skeleton, which teaches the shape.
+- **First cycle.** `MEMOIR.md` is seeded lazily from
+  `templates/memoir_template.md` the first time a cycle injects it — not
+  by `bootstrap_workspace`, whose fresh-start-only contract would leave a
+  workspace that predates the feature without one on resume. Cycle 1's
+  researcher and worker see the empty skeleton, which teaches the shape.
 - **Injection header.** The harness prefixes the injected value with one
   line — `[Run memoir — last updated <mtime>; older versions in
   memoir/history/; advisory, ledger and plan win on conflict]` — so the
@@ -217,7 +219,7 @@ Rules at the edges:
 | Seam | Location | Change |
 |---|---|---|
 | Paths | `paths.py:180` `ensure_layout` + new `memoir_path()`, `memoir_history_dir()` | ~15 lines |
-| Seed | `workspace_bootstrap.py:227` `bootstrap_workspace` + `templates/memoir_template.md` | ~15 lines + template |
+| Seed | `memoir.seed_if_missing`, called from `read_for_injection`; `templates/memoir_template.md` | ~15 lines + template |
 | Inject | `exploration.py:~4140`, beside the plan/ledger injection block | ~20 lines |
 | Auditor path input | Same block: `score_inputs["memoir_path"]` (root) or read-only note (clone) | ~6 lines |
 | Archive | `exploration.py:~4306`, after the auditor's successful result lands | ~10 lines calling a helper |
@@ -245,7 +247,7 @@ it for the archive row.
 ```yaml
 memoir:
   enabled: true        # seeds MEMOIR.md, injects into researcher/worker, archives after the auditor
-  max_tokens: 1200     # global cap enforced at injection; the template's per-section caps sit under it
+  max_tokens: 3000     # global cap enforced at injection; the template's per-section caps sit under it
 ```
 
 Two knobs. No cadence knob (it is the cycle), no author knob (it is the
@@ -256,7 +258,8 @@ auditor), no per-role toggle (the roles are fixed by decision).
 `tests/test_memoir.py`, offline, using the `_write_files` /
 `_fake_agent_factory` harness from `tests/test_run_switches.py`:
 
-- Bootstrap seeds the skeleton; resume does not overwrite it.
+- The first injection seeds the skeleton; a later cycle does not overwrite
+  it; a workspace that predates the feature is seeded on its next cycle.
 - Researcher and worker prompts contain `[INPUT: run_memory]` with the
   file's content and the injection header; the auditor's prompt contains
   `[INPUT: memoir_path]` and **not** the content; the reporter's prompt
@@ -313,6 +316,6 @@ document as a plan only.
 | Archive trigger | **Only on change** |
 | Branch | `claude/long-exposure-tiered-memory` |
 
-Still a guess until a real run says otherwise: the 1,200-token global cap
-and the per-section counts in §5. The first `memoir/history/` will show
+Still a guess until a real run says otherwise: the per-section counts in
+§5 (the global cap is set at 3,000 tokens by decision). The first `memoir/history/` will show
 whether they bind.

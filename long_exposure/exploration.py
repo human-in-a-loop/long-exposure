@@ -81,6 +81,7 @@ from long_exposure.orchestrator import (
 )
 from long_exposure import pool
 from long_exposure import paths
+from long_exposure import memoir as _memoir
 from long_exposure import stage_io as _stage_io
 from long_exposure import provider as _provider
 from long_exposure import telemetry
@@ -552,6 +553,10 @@ RUNTIME_INPUTS: frozenset[str] = frozenset({
     "live_guidance",
     "plan_of_record",
     "promise_ledger_summary",
+    # Run memoir (L1 narrative memory): contents for researcher/worker, the
+    # path for the auditor. Stripped at load when memoir.enabled is false.
+    "run_memory",
+    "memoir_path",
     # Cron-polled manager inputs (set by long_exposure.manager)
     "manager_snapshot",
     # Per-cycle reporter inputs (set in _run_reporter)
@@ -3546,6 +3551,10 @@ def run_exploration(
 
     flow = score["flow"]  # list of agent name strings
     agents = score["agents"]
+    if not _memoir.enabled(config):
+        # Keeps the prompt identical to a pre-memoir run instead of rendering
+        # [UNAVAILABLE: run_memory] on every call.
+        _memoir.strip_inputs(agents)
 
     # Load state once up-front so we can resolve `task` before using it.
     # Resolution priority: explicit override > saved state > score YAML.
@@ -4153,6 +4162,20 @@ def run_exploration(
         except Exception as _e:  # never crash the cycle
             results["promise_ledger_summary"] = f"[Ledger summary error: {_e}]"
 
+        # ---- Run memoir (L1 narrative memory) as cycle inputs ----
+        # Contents go to the researcher and worker in-window; the auditor
+        # gets only the path (read-only note in a fan-out clone). Advisory:
+        # plan and ledger win on conflict. docs/tiered-memory-plan.md.
+        if _memoir.enabled(config):
+            try:
+                results["run_memory"] = _memoir.read_for_injection(workspace_root, config)
+                score_inputs["memoir_path"] = _memoir.path_input_value(
+                    workspace_root, is_clone=_is_clone()
+                )
+            except Exception as _e:  # never crash the cycle
+                results["run_memory"] = f"[Run memoir error: {_e}]"
+                score_inputs["memoir_path"] = "[Run memoir unavailable this cycle.]"
+
         print(f"\n{'='*60}", flush=True)
         _cycle_tag = " (post-merge)" if in_post_merge_cycle else ""
         print(f"[long-exposure] === Cycle {cycle}{_cycle_tag} ===", flush=True)
@@ -4245,6 +4268,14 @@ def run_exploration(
                     flush=True,
                 )
 
+                # Memoir change detection brackets the auditor's turn: the
+                # signature taken here is compared after the call, and only a
+                # changed file is archived (docs/tiered-memory-plan.md §6).
+                _memoir_before = (
+                    _memoir.signature(workspace_root)
+                    if agent_name == "auditor" and _memoir.enabled(config)
+                    else None
+                )
                 # Pin this agent to its configured provider for the turn
                 # (no-op unless the run is per-agent-pinned).
                 with agent_routing.agent_provider_context(agent_def, config):
@@ -4295,6 +4326,26 @@ def run_exploration(
                 if result["status"] == "ok":
                     results.update(result["outputs"])
                     consecutive_failures[agent_name] = 0
+
+                    # Archive the memoir if the auditor changed it. Root only:
+                    # clones share the workspace and must never write it.
+                    if (
+                        agent_name == "auditor"
+                        and _memoir.enabled(config)
+                        and not _is_clone()
+                    ):
+                        try:
+                            _archived = _memoir.archive_if_changed(
+                                workspace_root, cycle, _memoir_before, conn
+                            )
+                            if _archived is not None:
+                                print(
+                                    f"[long-exposure]   memoir updated → "
+                                    f"{_archived.name}",
+                                    flush=True,
+                                )
+                        except Exception as _e:  # never crash the cycle
+                            print(f"[long-exposure]   memoir archive skipped: {_e!r}", flush=True)
 
                     # Item 1: explicit agent-driven termination. The auditor is
                     # the closure authority; when it emits BRANCH_COMPLETE_SIGNAL

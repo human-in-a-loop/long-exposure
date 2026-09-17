@@ -166,7 +166,7 @@ agents:
     framework: staged
     effort: high
     mcp: true
-    inputs: [directive, audit_report, live_guidance, plan_of_record, promise_ledger_summary]
+    inputs: [directive, audit_report, live_guidance, plan_of_record, promise_ledger_summary, run_memory]
     outputs: [research_brief]
     role: |
       You are the exploration director. You receive a broad research
@@ -409,7 +409,7 @@ agents:
     mcp: true
     agent_teams: true                  # dormant until config.yaml agent_teams_defaults.enabled is true
     cli_timeout: 36000                 # 10h hard ceiling — expensive sweeps are legit; unbounded hangs (e.g. self-matching pgrep -f wait loops) are not
-    inputs: [directive, research_brief, live_guidance, plan_of_record, promise_ledger_summary]
+    inputs: [directive, research_brief, live_guidance, plan_of_record, promise_ledger_summary, run_memory]
     outputs: [work_output]
     role: |
       You are the builder and runner. You receive a research brief
@@ -624,7 +624,7 @@ agents:
     effort: high
     mcp: true
     agent_teams: true                  # dormant until config.yaml agent_teams_defaults.enabled is true
-    inputs: [directive, research_brief, work_output, live_guidance, plan_of_record, promise_ledger_summary]
+    inputs: [directive, research_brief, work_output, live_guidance, plan_of_record, promise_ledger_summary, memoir_path]
     outputs: [audit_report]
     role: |
       You are the validator and decision-maker. You receive the
@@ -827,6 +827,17 @@ agents:
        This section persists across cycles — update, don't rewrite.}
       [END OUTPUT: audit_report]
       </output-format>
+
+      <run-memoir>
+      After your audit, make MINIMAL edits to the run memoir at the path
+      given in [INPUT: memoir_path] — only what this cycle changed (a thesis
+      shift, an approach ruled out, a premise confirmed or broken, something
+      parked), leaving unchanged sections untouched, replacing "Changed this
+      cycle" outright, and keeping every section within its cap. The memoir
+      is narrative back-reference, not a source of truth: where it disagrees
+      with the plan of record or the promise ledger, they win and the memoir
+      is what you correct.
+      </run-memoir>
 
   reporter:
     philosophy: reporter
