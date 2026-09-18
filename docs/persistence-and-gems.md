@@ -62,7 +62,7 @@ Plus catalog indexes on `(topic)` and `(topic, subtopic)`.
 | `checkpoint` | mid-context snapshot without context reset | Observability; not load-bearing |
 | `lesson` | final auditor's document stage emits a cross-run finding | Cross-run wisdom; +0.3 gem boost; immune from recency decay for ~30 days |
 | `lemma` | agent output includes an accepted `<lemma_proposal>` block | Shared infrastructure facts; excluded from gem ranking |
-| `memoir` | the auditor changed `MEMOIR.md` this cycle (root only) | Archived L1 narrative memory, one row per changed cycle; searchable via `search_sessions`, never injected |
+| `memoir` | the auditor changed `MEMOIR.md` this cycle (root only) | Archived L1 narrative memory, one row per changed cycle; searchable via `search_sessions`, never injected, excluded from gem ranking |
 
 ### Concurrency model
 
@@ -334,8 +334,8 @@ Rules that keep it honest:
 - **Not a second truth store.** Premises in "Standing on" move to the
   ledger once verified and to "Ruled out" once broken, so the two never
   hold the same fact.
-- **Archive only on change.** The harness takes `file_signature` before
-  and after the auditor's turn; a changed file is copied to
+- **Archive only on change.** The harness snapshots the memoir's content
+  before the auditor's turn and compares after; a changed file is copied to
   `memoir/history/cycle-NNNN_<ts>.md` and stored as a `record_type='memoir'`
   row. An unchanged cycle leaves no trace — the normal outcome of
   minimal-edit discipline.

@@ -59,7 +59,7 @@ L3.
 | Auditor's view | The **file path**, not the content. It reads and edits the file with its own tools |
 | Shape | **Fixed skeleton** (§5), each section capped, global token cap enforced by the harness |
 | Authority | Advisory. Plan of record and promise ledger win on any conflict; the memoir is what gets corrected |
-| Archive trigger | **Only when the auditor changed the file** (`file_signature` before vs after). Unchanged cycles leave no entry; a gap in cycle numbers means "unchanged" |
+| Archive trigger | **Only when the auditor changed the file's content** (a content snapshot before the auditor's turn, compared after). Unchanged cycles — including identical rewrites — leave no entry; a gap in cycle numbers means "unchanged" |
 | Archive searchability | Files in `memoir/history/` **and** a `record_type='memoir'` row in `sessions.db`, using the `lemmas.py` pattern, so `search_sessions` surfaces them |
 | Reporter | **Untouched.** No pointer in its role. It may `Read` the file on its own initiative like any workspace file; nothing tells it to |
 | Branch | `claude/long-exposure-tiered-memory`, cut from `claude/long-exposure-benchmarking-pikxm2`; never to `main` without explicit instruction |
@@ -162,7 +162,7 @@ cycle N start
   ├─ worker      (run_memory in window)
   └─ auditor     (memoir_path in window; edits MEMOIR.md in place, minimal)
        └─ after success, at root only:
-            file_signature changed?  ──► copy to memoir/history/cycle-NNNN_<ts>.md
+            content changed?         ──► copy to memoir/history/cycle-NNNN_<ts>.md
                                           + sessions.db row, record_type='memoir'
 cycle N+1 start
   └─ read MEMOIR.md ──► …
@@ -227,8 +227,8 @@ Rules at the edges:
 | Score | `exploration-score.yaml`: `run_memory` in researcher/worker inputs, `memoir_path` in auditor inputs, two sentences in the auditor role | ~6 lines |
 | Config | `config.yaml`: `memoir: {enabled: true, max_tokens: 1200}` | 3 lines |
 
-Roughly 170 lines of production code. Reuses `stage_io.file_signature`
-(change detection), `stage_io.atomic_write_text` (archive write),
+Roughly 170 lines of production code. Reuses `stage_io.atomic_write_text`
+(archive write),
 `estimate_tokens` (cap), and `store_session` exactly as `lemmas.py` uses
 it for the archive row.
 

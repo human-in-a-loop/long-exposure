@@ -20,7 +20,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from long_exposure import health_events, paths
-from long_exposure.stage_io import atomic_write_text, file_signature
+from long_exposure.stage_io import atomic_write_text
 
 DEFAULT_MAX_TOKENS = 3000
 INPUT_NAME = "run_memory"        # researcher + worker: contents, in-window
@@ -90,9 +90,20 @@ def seed_if_missing(workspace: Path) -> bool:
     return True
 
 
-def signature(workspace: Path) -> tuple[int, int] | None:
-    """(size, mtime_ns) of the live memoir, for before/after change detection."""
-    return file_signature(paths.memoir_path(workspace))
+def snapshot(workspace: Path) -> str | None:
+    """The live memoir's content, or None if absent — taken just before the
+    auditor's turn so `archive_if_changed` can compare content afterwards.
+
+    Content, not `(size, mtime_ns)`: a signature answers "was the file
+    written to", which archives a duplicate on an identical rewrite and
+    depends on the kernel's inode-timestamp granularity. The file is at
+    most a few KB, so comparing bytes is both cheaper to reason about and
+    exact.
+    """
+    try:
+        return paths.memoir_path(workspace).read_text()
+    except OSError:
+        return None
 
 
 def _mtime_iso(path: Path) -> str:
@@ -163,25 +174,27 @@ def _archive_name(cycle: int, now: datetime) -> str:
 def archive_if_changed(
     workspace: Path,
     cycle: int,
-    before: tuple[int, int] | None,
+    before: str | None,
     conn=None,
 ) -> Path | None:
-    """Archive the live memoir if the auditor changed it this cycle.
+    """Archive the live memoir if its content changed during the auditor's turn.
 
-    `before` is `signature()` taken just before the auditor ran. On change:
+    `before` is `snapshot()` taken just before the auditor ran. On change:
     copy to `memoir/history/cycle-NNNN_<ts>.md` and, when `conn` is given,
     store a `record_type='memoir'` row so `search_sessions` finds it. An
-    unchanged file leaves no trace — that is the normal outcome of
-    minimal-edit discipline, not an event. Returns the archive path or None.
+    unchanged file — including one rewritten with identical content —
+    leaves no trace; that is the normal outcome of minimal-edit discipline,
+    not an event. Returns the archive path or None.
     """
     target = paths.memoir_path(workspace)
-    after = file_signature(target)
-    if after is None or after == before:
-        return None
     try:
         text = target.read_text()
+    except FileNotFoundError:
+        return None
     except OSError as exc:
         health_events.append_event("memoir_archive_failed", detail=f"read: {exc}")
+        return None
+    if text == before:
         return None
 
     now = datetime.now(timezone.utc)
@@ -217,7 +230,7 @@ def _store_row(conn, cycle: int, now: datetime, text: str) -> None:
             summary_xml=summary_xml,
             record_type=RECORD_TYPE,
             topic=RECORD_TYPE,
-            subtopic=f"cycle-{int(cycle)}",
+            subtopic=f"cycle-{int(cycle):04d}",  # same spelling as the archive filename
             keywords=None,
             fork_id=None,
         )

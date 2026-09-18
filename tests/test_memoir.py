@@ -88,21 +88,22 @@ class MemoirModuleTests(unittest.TestCase):
         self.assertIn("do NOT edit", clone)
         self.assertIn(str(paths.memoir_path(self.ws)), clone)
 
-    def test_archive_only_on_change_with_file_and_row(self):
+    def test_archive_only_on_content_change_with_file_and_row(self):
         memoir.seed_if_missing(self.ws)
         conn = init_db(Path(self.td.name) / "sessions.db")
-        before = memoir.signature(self.ws)
+        target = paths.memoir_path(self.ws)
+        before = memoir.snapshot(self.ws)
 
-        # Unchanged → nothing.
+        # Untouched → nothing.
+        self.assertIsNone(memoir.archive_if_changed(self.ws, 3, before, conn))
+        # Rewritten with IDENTICAL content (new mtime, same bytes) → still nothing.
+        # This is the case a (size, mtime) signature would have archived.
+        target.write_text(before)
         self.assertIsNone(memoir.archive_if_changed(self.ws, 3, before, conn))
         self.assertEqual(list(paths.memoir_history_dir(self.ws).iterdir()), [])
 
         # Changed → one archive whose content equals the live file, plus a row.
-        target = paths.memoir_path(self.ws)
-        target.write_text(target.read_text().replace("(none yet)", "spectral approach failed", 1))
-        # Force a distinct mtime even on coarse filesystems.
-        st = target.stat()
-        os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        target.write_text(before.replace("(none yet)", "spectral approach failed", 1))
         archived = memoir.archive_if_changed(self.ws, 3, before, conn)
         self.assertIsNotNone(archived)
         self.assertTrue(archived.name.startswith("cycle-0003_"))
@@ -115,7 +116,8 @@ class MemoirModuleTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][1], "memoir")
-        self.assertEqual(rows[0][2], "cycle-3")
+        # Same spelling as the archive filename, so Grep and search agree.
+        self.assertEqual(rows[0][2], "cycle-0003")
         self.assertIn("spectral approach failed", rows[0][3])
         # Findable through the same FTS table search_sessions queries.
         hit = conn.execute(
@@ -123,6 +125,29 @@ class MemoirModuleTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(len(hit), 1)
         conn.close()
+
+    def test_missing_file_after_auditor_is_not_an_error(self):
+        # An auditor that deletes the memoir: nothing to archive, no exception.
+        self.assertIsNone(memoir.archive_if_changed(self.ws, 1, "was here", None))
+
+    def test_memoir_rows_never_enter_gem_ranking(self):
+        """Gem ranking skips lemma rows by denylist; memoir rows must be skipped
+        too, or archived memoirs would compete for REPL gem slots."""
+        from auto_compact.proximity import rank_sessions
+        sessions = [
+            {"id": "m1", "record_type": "memoir", "topic": "memoir",
+             "subtopic": "cycle-0001", "created_at": "2026-09-17T00:00:00+00:00"},
+            {"id": "c1", "record_type": "compaction", "topic": "memoir",
+             "subtopic": "x", "created_at": "2026-09-17T00:00:00+00:00"},
+        ]
+        profile = {"topic_weights": {"_same_topic": 1.0, "_same_subtopic": 0.8},
+                   "tool_weights": {}, "keyword_weights": {}}
+        ranked = rank_sessions(
+            sessions, profile, {"topic": "memoir", "subtopic": "x"}, min_score=0.0,
+        )
+        ids = [r["id"] for r in ranked]
+        self.assertNotIn("m1", ids)
+        self.assertIn("c1", ids)
 
     def test_strip_inputs(self):
         agents = {
@@ -244,8 +269,6 @@ def _agent_that_edits_memoir(seen: list, workspace: Path, *, edit: bool = True):
             body = target.read_text()
             cycle_tag = f"ruled out approach #{len([s for s in seen if s['agent']=='auditor'])}"
             target.write_text(body + f"\n- {cycle_tag}\n")
-            st = target.stat()
-            os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
         return {
             "agent": agent_name,
             "outputs": {agent_def["outputs"][0]: f"{agent_name} output " + "x" * 2100},
@@ -319,7 +342,7 @@ class MemoirCycleIntegrationTests(unittest.TestCase):
                 "SELECT subtopic FROM sessions WHERE record_type='memoir' ORDER BY subtopic"
             ).fetchall()
             conn.close()
-            self.assertEqual([r[0] for r in rows], ["cycle-1", "cycle-2"])
+            self.assertEqual([r[0] for r in rows], ["cycle-0001", "cycle-0002"])
 
     def test_unchanged_memoir_leaves_no_archive(self):
         seen = []

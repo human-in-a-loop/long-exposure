@@ -4269,10 +4269,10 @@ def run_exploration(
                 )
 
                 # Memoir change detection brackets the auditor's turn: the
-                # signature taken here is compared after the call, and only a
-                # changed file is archived (docs/tiered-memory-plan.md §6).
+                # content snapshot taken here is compared after the call, and
+                # only a changed file is archived (docs/tiered-memory-plan.md §6).
                 _memoir_before = (
-                    _memoir.signature(workspace_root)
+                    _memoir.snapshot(workspace_root)
                     if agent_name == "auditor" and _memoir.enabled(config)
                     else None
                 )

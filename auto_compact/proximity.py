@@ -211,7 +211,10 @@ def rank_sessions(
     scored = []
 
     for session in sessions:
-        if session.get("record_type") == "lemma":
+        # Lemma rows are infra facts and memoir rows are archived L1 narrative
+        # memory; neither is a session to bootstrap from, so neither competes
+        # for gem slots.
+        if session.get("record_type") in ("lemma", "memoir"):
             continue
         if exclude_id and session.get("id") == exclude_id:
             continue
