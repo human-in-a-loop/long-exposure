@@ -162,7 +162,7 @@ cycle N start
   ├─ worker      (run_memory in window)
   └─ auditor     (memoir_path in window; edits MEMOIR.md in place, minimal)
        └─ after success, at root only:
-            content changed?         ──► copy to memoir/history/cycle-NNNN_<ts>.md
+            content changed?         ──► copy to memoir/history/cycle-NNNNNN_<ts>.md
                                           + sessions.db row, record_type='memoir'
 cycle N+1 start
   └─ read MEMOIR.md ──► …
@@ -199,10 +199,11 @@ Rules at the edges:
 ## 7. Guardrails
 
 1. **Global cap enforced at injection.** If `MEMOIR.md` exceeds
-   `memoir.max_tokens` (via `estimate_tokens`), inject the head, append
-   `[memoir over cap — auditor must trim]`, and emit a
-   `memoir_over_cap` health event. The agent still gets something; the
-   prompt stays bounded.
+   `memoir.max_tokens` (chars/4 estimate), inject the head cut at the last
+   paragraph boundary before the cap (hard cut if the only boundary would
+   waste more than half the budget), append
+   `[memoir over cap — auditor must trim]`, and emit a `memoir_over_cap`
+   health event. The agent still gets something; the prompt stays bounded.
 2. **Ledger wins.** Stated in the template header, in the auditor's
    guidance, and in the injection header. Three places because it is the
    rule that keeps this from becoming a second source of truth.
@@ -265,7 +266,7 @@ auditor), no per-role toggle (the roles are fixed by decision).
   `[INPUT: memoir_path]` and **not** the content; the reporter's prompt
   contains neither.
 - A changed memoir after the auditor step produces exactly one
-  `memoir/history/cycle-NNNN_*.md` whose content equals the live file;
+  `memoir/history/cycle-NNNNNN_*.md` whose content equals the live file;
   an unchanged one produces none.
 - Over-cap content is truncated at injection with the marker and a
   `memoir_over_cap` health event; the live file is untouched.

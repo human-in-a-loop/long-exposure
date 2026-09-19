@@ -63,6 +63,38 @@ class MemoirModuleTests(unittest.TestCase):
         # The live file is untouched — only the injected copy is cut.
         self.assertEqual(len(paths.memoir_path(self.ws).read_text()), 4000)
 
+    def test_truncation_lands_on_a_paragraph_boundary(self):
+        # 20 paragraphs of ~50 chars; cap 100 tokens = 400 chars.
+        paras = [f"Paragraph {i:02d} " + "word " * 8 + "end." for i in range(20)]
+        paths.memoir_path(self.ws).write_text("\n\n".join(paras))
+        with patch("long_exposure.memoir.health_events.append_event"):
+            value = memoir.read_for_injection(self.ws, {"memoir": {"max_tokens": 100}})
+        body = value.split("\n\n", 1)[1]           # drop the injection header
+        kept = body.split(memoir._TRUNCATED_MARKER)[0]
+        self.assertTrue(kept.endswith("end."), kept[-40:])   # whole paragraphs only
+        self.assertLessEqual(len(kept), 400)
+        self.assertGreater(len(kept), 200)                    # used most of the budget
+        self.assertNotIn("Paragraph 19", kept)
+
+    def test_truncation_falls_back_to_hard_cut_without_boundaries(self):
+        # One giant paragraph: no blank line to back up to → hard cut at cap*4.
+        paths.memoir_path(self.ws).write_text("word " * 2000)
+        with patch("long_exposure.memoir.health_events.append_event"):
+            value = memoir.read_for_injection(self.ws, {"memoir": {"max_tokens": 100}})
+        kept = value.split("\n\n", 1)[1].split(memoir._TRUNCATED_MARKER)[0]
+        self.assertLessEqual(len(kept), 400)
+        self.assertGreaterEqual(len(kept), 395)
+
+    def test_truncation_ignores_a_boundary_that_wastes_the_budget(self):
+        # A blank line only in the first tenth: backing up to it would drop
+        # 90% of the allowed head, so the hard cut wins.
+        text = "short intro\n\n" + "x" * 5000
+        paths.memoir_path(self.ws).write_text(text)
+        with patch("long_exposure.memoir.health_events.append_event"):
+            value = memoir.read_for_injection(self.ws, {"memoir": {"max_tokens": 100}})
+        kept = value.split("\n\n", 1)[1].split(memoir._TRUNCATED_MARKER)[0]
+        self.assertGreaterEqual(len(kept), 395)
+
     def test_under_cap_is_not_truncated_and_no_event(self):
         paths.memoir_path(self.ws).write_text("short")
         seen = []
@@ -106,7 +138,7 @@ class MemoirModuleTests(unittest.TestCase):
         target.write_text(before.replace("(none yet)", "spectral approach failed", 1))
         archived = memoir.archive_if_changed(self.ws, 3, before, conn)
         self.assertIsNotNone(archived)
-        self.assertTrue(archived.name.startswith("cycle-0003_"))
+        self.assertTrue(archived.name.startswith("cycle-000003_"))
         self.assertTrue(archived.name.endswith(".md"))
         self.assertEqual(archived.read_text(), target.read_text())
 
@@ -117,7 +149,7 @@ class MemoirModuleTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][1], "memoir")
         # Same spelling as the archive filename, so Grep and search agree.
-        self.assertEqual(rows[0][2], "cycle-0003")
+        self.assertEqual(rows[0][2], "cycle-000003")
         self.assertIn("spectral approach failed", rows[0][3])
         # Findable through the same FTS table search_sessions queries.
         hit = conn.execute(
@@ -136,7 +168,7 @@ class MemoirModuleTests(unittest.TestCase):
         from auto_compact.proximity import rank_sessions
         sessions = [
             {"id": "m1", "record_type": "memoir", "topic": "memoir",
-             "subtopic": "cycle-0001", "created_at": "2026-09-17T00:00:00+00:00"},
+             "subtopic": "cycle-000001", "created_at": "2026-09-17T00:00:00+00:00"},
             {"id": "c1", "record_type": "compaction", "topic": "memoir",
              "subtopic": "x", "created_at": "2026-09-17T00:00:00+00:00"},
         ]
@@ -331,7 +363,7 @@ class MemoirCycleIntegrationTests(unittest.TestCase):
 
             # One archive per changed cycle, content == live file at that time.
             history = sorted(paths.memoir_history_dir(ws).iterdir())
-            self.assertEqual([h.name[:11] for h in history], ["cycle-0001_", "cycle-0002_"])
+            self.assertEqual([h.name[:13] for h in history], ["cycle-000001_", "cycle-000002_"])
             self.assertEqual(history[-1].read_text(), paths.memoir_path(ws).read_text())
             self.assertIn("ruled out approach #1", history[0].read_text())
             self.assertNotIn("ruled out approach #2", history[0].read_text())
@@ -342,7 +374,7 @@ class MemoirCycleIntegrationTests(unittest.TestCase):
                 "SELECT subtopic FROM sessions WHERE record_type='memoir' ORDER BY subtopic"
             ).fetchall()
             conn.close()
-            self.assertEqual([r[0] for r in rows], ["cycle-0001", "cycle-0002"])
+            self.assertEqual([r[0] for r in rows], ["cycle-000001", "cycle-000002"])
 
     def test_unchanged_memoir_leaves_no_archive(self):
         seen = []

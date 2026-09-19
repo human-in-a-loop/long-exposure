@@ -118,9 +118,10 @@ def read_for_injection(workspace: Path, config: dict | None) -> str:
     """The `run_memory` input value: a one-line header plus the memoir.
 
     The header is added here, not stored in the file, so the live file stays
-    purely agent-owned. Content over `memoir.max_tokens` is cut at the cap
-    with a marker and a `memoir_over_cap` health event — the agent still
-    gets the head, and the prompt stays bounded whatever the auditor did.
+    purely agent-owned. Content over `memoir.max_tokens` is cut at the last
+    paragraph boundary before the cap (see `_truncate`), with a marker and a
+    `memoir_over_cap` health event — the agent still gets the head, and the
+    prompt stays bounded whatever the auditor did.
     """
     target = paths.memoir_path(workspace)
     try:
@@ -138,12 +139,29 @@ def read_for_injection(workspace: Path, config: dict | None) -> str:
     # Same chars/4 estimate as orchestrator.estimate_tokens, kept local so
     # this module has no dependency on the orchestrator.
     if len(text) // 4 > cap:
-        text = text[: cap * 4].rstrip() + _TRUNCATED_MARKER
+        text = _truncate(text, cap * 4) + _TRUNCATED_MARKER
         health_events.append_event(
             "memoir_over_cap",
             detail=f"memoir at {target} exceeds {cap} tokens; injected truncated",
         )
     return f"{header}\n\n{text}"
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Cut `text` to at most `limit` characters at a paragraph boundary.
+
+    Backs up to the last blank line before `limit` so the agent never sees a
+    sentence sliced mid-word. If the only boundary in the head would throw
+    away more than half the allowed budget (a memoir written as one giant
+    paragraph), fall back to a hard cut at `limit` — bounded prompt first,
+    tidy edge second.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("\n\n", 0, limit)
+    if cut < limit // 2:
+        cut = limit
+    return text[:cut].rstrip()
 
 
 def path_input_value(workspace: Path, *, is_clone: bool) -> str:
@@ -168,7 +186,9 @@ def path_input_value(workspace: Path, *, is_clone: bool) -> str:
 
 
 def _archive_name(cycle: int, now: datetime) -> str:
-    return f"cycle-{int(cycle):04d}_{now.strftime('%Y-%m-%dT%H%M%SZ')}.md"
+    # Six digits keeps lexical order == cycle order to 999,999 cycles,
+    # which is unbounded in practice even with max_cycles: null.
+    return f"cycle-{int(cycle):06d}_{now.strftime('%Y-%m-%dT%H%M%SZ')}.md"
 
 
 def archive_if_changed(
@@ -180,7 +200,7 @@ def archive_if_changed(
     """Archive the live memoir if its content changed during the auditor's turn.
 
     `before` is `snapshot()` taken just before the auditor ran. On change:
-    copy to `memoir/history/cycle-NNNN_<ts>.md` and, when `conn` is given,
+    copy to `memoir/history/cycle-NNNNNN_<ts>.md` and, when `conn` is given,
     store a `record_type='memoir'` row so `search_sessions` finds it. An
     unchanged file — including one rewritten with identical content —
     leaves no trace; that is the normal outcome of minimal-edit discipline,
@@ -230,7 +250,7 @@ def _store_row(conn, cycle: int, now: datetime, text: str) -> None:
             summary_xml=summary_xml,
             record_type=RECORD_TYPE,
             topic=RECORD_TYPE,
-            subtopic=f"cycle-{int(cycle):04d}",  # same spelling as the archive filename
+            subtopic=f"cycle-{int(cycle):06d}",  # same spelling as the archive filename
             keywords=None,
             fork_id=None,
         )

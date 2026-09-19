@@ -321,7 +321,7 @@ Three tiers, and what is pushed versus pulled:
 
 | Tier | Artifact | Residency |
 |---|---|---|
-| L1 | `MEMOIR.md` — thesis, unverified premises, ruled-out approaches, parked items, pointers, this cycle's diff | **Pushed** to researcher and worker every cycle, capped at `memoir.max_tokens` (default 3000; over-cap content is truncated at injection with a `memoir_over_cap` health event) |
+| L1 | `MEMOIR.md` — thesis, unverified premises, ruled-out approaches, parked items, pointers, this cycle's diff | **Pushed** to researcher and worker every cycle, capped at `memoir.max_tokens` (default 3000; over-cap content is cut at the last paragraph boundary before the cap, with a marker and a `memoir_over_cap` health event) |
 | L2 | `reports/report_cycles_N.md` | Pull; L1's "Where to look" names them |
 | L3 | `sessions.db` compaction rows, lemmas, `memoir/history/` | Pull via `search_sessions`, `Read`, `Grep` |
 
@@ -336,7 +336,7 @@ Rules that keep it honest:
   hold the same fact.
 - **Archive only on change.** The harness snapshots the memoir's content
   before the auditor's turn and compares after; a changed file is copied to
-  `memoir/history/cycle-NNNN_<ts>.md` and stored as a `record_type='memoir'`
+  `memoir/history/cycle-NNNNNN_<ts>.md` and stored as a `record_type='memoir'`
   row. An unchanged cycle leaves no trace — the normal outcome of
   minimal-edit discipline.
 - **Root writes only.** Fan-out clones share the workspace and read the
