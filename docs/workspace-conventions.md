@@ -54,7 +54,8 @@ researcher and worker receive as `run_memory`. It is advisory: the plan
 and ledger win on conflict, and a premise leaves the memoir the moment
 it is verified (→ ledger) or broken (→ its "Ruled out" section). It is
 seeded lazily on the first cycle that needs it, not by the bootstrap, so
-it also appears in workspaces that predate the feature. Full design:
+it also appears in workspaces that predate the feature. Neither the file
+nor `memoir/` ever ships in a curated package. Full design:
 `tiered-memory-plan.md`.
 
 The bootstrap is **idempotent** — re-running on an existing skeleton

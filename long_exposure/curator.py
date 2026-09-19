@@ -101,6 +101,10 @@ _PACKAGE_HARD_EXCLUDE_PATTERNS = [
     _re.compile(r"(^|/)audits/(?!final(/|$))"),
     _re.compile(r"(^|/)audits$"),
     _re.compile(r"(^|/)manager_assessments(/|$)"),
+    # The run memoir (L1 narrative memory) and its archive are internal
+    # process state — advisory, unverified by design — and never ship.
+    _re.compile(r"^MEMOIR\.md$"),
+    _re.compile(r"(^|/)memoir(/|$)"),
 ]
 
 

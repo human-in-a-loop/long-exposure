@@ -21,6 +21,7 @@ lives in named subfolders (e.g., `benchmark-XX-...`).
 | `data/`     | datasets (CSV/JSON/etc); machine-facing                            |
 | `docs/`     | narrative non-reports (design notes, methodology)                  |
 | `tools/`    | cross-cutting utilities (validators, helpers)                      |
+| `memoir/`   | harness-managed: superseded run-memoir versions (`history/`)        |
 | `stale/`    | archived obsolete artifacts                                        |
 
 ## Domain folders

@@ -195,6 +195,37 @@ class MemoirModuleTests(unittest.TestCase):
         self.assertEqual(agents["odd"], {})
 
 
+class MemoirWorkspaceHygieneTests(unittest.TestCase):
+    """The memoir must not trip the validators agents are told to run, and
+    must never ship in a curated package."""
+
+    def test_org_check_is_silent_about_the_memoir(self):
+        from long_exposure.tools import org_check
+        from long_exposure.workspace_bootstrap import bootstrap_workspace
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            bootstrap_workspace(ws, "test directive", "run-x", 1)
+            memoir.seed_if_missing(ws)
+            before = memoir.snapshot(ws)
+            paths.memoir_path(ws).write_text(before + "\n- x\n")
+            memoir.archive_if_changed(ws, 1, before, None)
+            findings = org_check.run(ws)
+            texts = findings.errors + findings.warnings
+            self.assertFalse(
+                any("MEMOIR" in t or "memoir" in t for t in texts), texts
+            )
+
+    def test_curator_never_packages_the_memoir(self):
+        from long_exposure.curator import _is_package_hard_excluded
+        for rel in ("MEMOIR.md", "memoir/history/cycle-000001_x.md",
+                    "memoir/history", "memoir"):
+            self.assertTrue(_is_package_hard_excluded(rel), rel)
+        # Neighbours are untouched.
+        for rel in ("reports/final/final_report.md", "docs/memoirs-of-a-geisha.md",
+                    "plan_of_record.md"):
+            self.assertFalse(_is_package_hard_excluded(rel), rel)
+
+
 class MemoirPromptRenderingTests(unittest.TestCase):
     """The input protocol renders the memoir for exactly the roles that
     declare it — the score, not the harness, decides who sees it."""

@@ -40,6 +40,7 @@ ALLOWED_AT_ROOT_FILES = {
     "plan_of_record.md",
     "promise_ledger.jsonl",
     "STRUCTURE.md",
+    "MEMOIR.md",          # run memoir, L1 narrative memory (harness-seeded)
     "MANIFEST.md",
     "LESSONS.md",
     "REFERENCES.md",
@@ -70,6 +71,7 @@ LEGACY_ROOT_STAGE_PATTERNS = (
 
 ALLOWED_AT_ROOT_DIRS = {
     *STANDARD_FOLDERS,
+    "memoir",             # memoir/history/ — superseded run-memoir versions
     ".venv",
     "venv",
     ".git",

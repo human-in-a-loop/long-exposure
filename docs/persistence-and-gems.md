@@ -348,6 +348,14 @@ Rules that keep it honest:
   the first time a cycle needs it, so a workspace that predates the
   feature gets one on its next resumed cycle. Nothing is added to
   `exploration_state.json`.
+- **Never packaged, never flagged.** The curator hard-excludes `MEMOIR.md`
+  and `memoir/` (advisory process state does not ship), and `org_check`
+  allow-lists both so agents never see a warning about a file the harness
+  created.
+- **Known gap, accepted.** Fan-out branch outcomes have no push path into
+  L1: clones cannot write the memoir and the post-merge cycle has no
+  auditor, so branch-local dead ends reach it only if the next root auditor
+  reads the `merge_report.md` files on its own initiative.
 - **Off switch.** `memoir.enabled: false` strips `run_memory` and
   `memoir_path` from every agent's inputs at load, so the prompt is
   identical to a pre-memoir run rather than carrying `[UNAVAILABLE]`.

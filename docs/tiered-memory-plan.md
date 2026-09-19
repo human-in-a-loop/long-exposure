@@ -63,6 +63,9 @@ L3.
 | Archive searchability | Files in `memoir/history/` **and** a `record_type='memoir'` row in `sessions.db`, using the `lemmas.py` pattern, so `search_sessions` surfaces them |
 | Reporter | **Untouched.** No pointer in its role. It may `Read` the file on its own initiative like any workspace file; nothing tells it to |
 | Branch | `claude/long-exposure-tiered-memory`, cut from `claude/long-exposure-benchmarking-pikxm2`; never to `main` without explicit instruction |
+| Packaging | **Never shipped.** The curator hard-excludes `MEMOIR.md` and `memoir/` — advisory, unverified process state |
+| Validators | `MEMOIR.md` and `memoir/` are allow-listed in `org_check`, and `STRUCTURE.md` names `memoir/`, so agents never see a standing warning about a harness-created file |
+| Fan-out branch outcomes | **Not pushed into L1** (decision). Clone auditors cannot write the memoir and the post-merge cycle has no auditor, so branch-local dead ends reach the memoir only if the next root auditor reads the `merge_report.md` files on its own. A stateless nudge (flag merge reports newer than the memoir in the auditor's live guidance) was designed and declined as not worth the added surface |
 
 ## 5. The skeleton
 
@@ -297,6 +300,8 @@ auditor), no per-role toggle (the roles are fixed by decision).
 - No state in `exploration_state.json`.
 - No change to compaction, gems, the ledger, the plan, or the reporter's
   role text.
+- No push path for fan-out branch outcomes into L1 (§4, "Fan-out branch
+  outcomes") — the one known conceptual gap, accepted.
 
 ## 14. Branch
 
