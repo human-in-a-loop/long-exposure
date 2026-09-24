@@ -34,7 +34,9 @@ in the log):
   - `pdf_render_failed`             pandoc/tectonic returned non-zero
 
   Run memoir (L1 narrative memory)
-  - `memoir_over_cap`              MEMOIR.md exceeded memoir.max_tokens; injected truncated
+  - `memoir_over_cap`              a memoir exceeded memoir.max_tokens; injected truncated
+  - `memoir_branches_over_cap`     collapsed branch memoirs exceeded the cap; truncated
+  - `memoir_clone_write`           a clone wrote the ROOT memoir instead of its shadow
   - `memoir_archive_failed`        copying a changed memoir to memoir/history/ failed
   - `memoir_store_failed`          writing the memoir archive row to sessions.db failed
 

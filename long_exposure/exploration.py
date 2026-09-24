@@ -557,6 +557,7 @@ RUNTIME_INPUTS: frozenset[str] = frozenset({
     # path for the auditor. Stripped at load when memoir.enabled is false.
     "run_memory",
     "memoir_path",
+    "branch_memoirs",
     # Cron-polled manager inputs (set by long_exposure.manager)
     "manager_snapshot",
     # Per-cycle reporter inputs (set in _run_reporter)
@@ -4169,12 +4170,24 @@ def run_exploration(
         if _memoir.enabled(config):
             try:
                 results["run_memory"] = _memoir.read_for_injection(workspace_root, config)
-                score_inputs["memoir_path"] = _memoir.path_input_value(
-                    workspace_root, is_clone=_is_clone()
+                # The path this process may WRITE: a clone's own shadow, the
+                # root memoir otherwise. One writer per file, so the auditor's
+                # "edit the memoir at this path" guidance holds everywhere.
+                score_inputs["memoir_path"] = _memoir.path_input_value(workspace_root)
+                # Collapsed fan-out branch memoirs, for the root auditor to
+                # fold. Empty in a clone and whenever no fork has collapsed
+                # since the root memoir was last edited.
+                results["branch_memoirs"] = (
+                    _memoir.branch_memoirs_for_injection(
+                        workspace_root,
+                        None if _is_clone() else (instance_dir or data_dir),
+                        config,
+                    )
                 )
             except Exception as _e:  # never crash the cycle
                 results["run_memory"] = f"[Run memoir error: {_e}]"
                 score_inputs["memoir_path"] = "[Run memoir unavailable this cycle.]"
+                results["branch_memoirs"] = "[Branch memoirs unavailable this cycle.]"
 
         print(f"\n{'='*60}", flush=True)
         _cycle_tag = " (post-merge)" if in_post_merge_cycle else ""
@@ -4273,7 +4286,9 @@ def run_exploration(
                 # only a changed file is archived (docs/tiered-memory-plan.md §6).
                 _memoir_before = (
                     _memoir.snapshot(workspace_root)
-                    if agent_name == "auditor" and _memoir.enabled(config)
+                    if agent_name == "auditor"
+                    and _memoir.enabled(config)
+                    and not _is_clone()
                     else None
                 )
                 # Pin this agent to its configured provider for the turn
@@ -4464,6 +4479,14 @@ def run_exploration(
                                     f"{_bb_err!r}",
                                     flush=True,
                                 )
+                            # Root memoir must be frozen for the fork's
+                            # duration: no root auditor runs while clones are
+                            # out, and clones write shadows. Snapshot to prove
+                            # it (docs/tiered-memory-plan.md §6).
+                            _memoir_pre_fork = (
+                                _memoir.snapshot(workspace_root)
+                                if _memoir.enabled(config) else None
+                            )
                             _fanout = _run_fanout_conductor(
                                 branches=_branches,
                                 score_path=score_path,
@@ -4491,6 +4514,15 @@ def run_exploration(
                                 # barrier_preempt_timeout_seconds).
                                 loop_cfg=loop_cfg,
                             )
+                            if _memoir.enabled(config):
+                                try:
+                                    _memoir.assert_root_frozen_during_fork(
+                                        workspace_root,
+                                        _memoir_pre_fork,
+                                        _fanout.get("fork_id") or "unknown",
+                                    )
+                                except Exception:
+                                    pass  # observability only
                             # Fold clone spend into the root ledger so the
                             # status table and budget gates cover the fork.
                             _usage.note_fork()

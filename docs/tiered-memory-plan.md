@@ -65,7 +65,12 @@ L3.
 | Branch | `claude/long-exposure-tiered-memory`, cut from `claude/long-exposure-benchmarking-pikxm2`; never to `main` without explicit instruction |
 | Packaging | **Never shipped.** The curator hard-excludes `MEMOIR.md` and `memoir/` — advisory, unverified process state |
 | Validators | `MEMOIR.md` and `memoir/` are allow-listed in `org_check`, and `STRUCTURE.md` names `memoir/`, so agents never see a standing warning about a harness-created file |
-| Fan-out branch outcomes | **Not pushed into L1** (decision). Clone auditors cannot write the memoir and the post-merge cycle has no auditor, so branch-local dead ends reach the memoir only if the next root auditor reads the `merge_report.md` files on its own. A stateless nudge (flag merge reports newer than the memoir in the auditor's live guidance) was designed and declined as not worth the added surface |
+| Fan-out writes | **Per-clone shadow memoirs**, mirroring the shadow-ledger pattern: a clone writes `<clone instance dir>/MEMOIR.md`, never the root file. One writer per file, so the auditor's "edit the memoir at this path" guidance is true in every process |
+| Fan-out reads | A branch reads **both** — the root memoir for run-wide context and its own shadow for branch-local progress, as two labelled sections, each capped independently |
+| Shadow seeding | **Blank skeleton**, not a copy of the root: branch-local-delta semantics, so the fold never re-presents the root's own thesis back to it |
+| Fan-out fold | Shadows newer than the root memoir are injected as the **`branch_memoirs`** input to the root auditor, which folds them with its normal minimal-edit discipline. Stateless and self-clearing; no extra LLM call, no state field |
+| Clone archiving | **None.** Clone cycle numbers are independent of the root's, so three clones archiving into one shared `history/` would collide and be ambiguous. The shadow persists in its fork dir and is preserved through the fold |
+| Fork invariant | The root memoir is **frozen for a fork's duration**; the root snapshots before spawning and checks at collapse, emitting `memoir_clone_write` if a clone wrote the root file anyway |
 
 ## 5. The skeleton
 
@@ -160,7 +165,8 @@ edit cannot blow the prompt.
 ```
 cycle N start
   ├─ read MEMOIR.md ──► results["run_memory"]     (researcher, worker input)
-  ├─ score_inputs["memoir_path"] = <abs path>     (auditor input; read-only note in a clone)
+  ├─ score_inputs["memoir_path"] = <write path>   (auditor: root memoir, or its own shadow in a clone)
+  ├─ results["branch_memoirs"]   = shadows newer than the root memoir (root auditor only)
   ├─ researcher  (run_memory in window)
   ├─ worker      (run_memory in window)
   └─ auditor     (memoir_path in window; edits MEMOIR.md in place, minimal)
@@ -183,15 +189,27 @@ Rules at the edges:
   memoir/history/; advisory, ledger and plan win on conflict]` — so the
   live file stays purely agent-owned and no template text is needed.
 - **Post-merge cycle.** Runs worker-only (no auditor, `exploration.py`
-  post-merge mode), so no memoir write that cycle; the next full cycle's
-  auditor catches up. Its `Changed this cycle` then covers two cycles,
-  which is fine.
-- **Fan-out clones.** They share the workspace, so they *read* the memoir
-  for free. They must **never write it** — three clone auditors editing
-  one file is a race. In a clone the `memoir_path` input carries a
-  read-only note instead of the path, and the archive hook is gated on
-  the root process. The root auditor folds the branches' merge reports
-  into the memoir at the next full cycle.
+  post-merge mode), so no memoir write that cycle — and neither does the
+  fan-out cycle itself, since fan-out replaces the worker AND auditor
+  (`exploration.py:4541`). That is two consecutive cycles without a write,
+  and by the time an auditor runs the merge text has left `results`
+  entirely. The `branch_memoirs` fold below is what closes it.
+- **Fan-out clones.** Each clone writes its **own shadow memoir** at
+  `<clone instance dir>/MEMOIR.md` — beside the `merge_report.md` and
+  `promise_ledger.jsonl` it already keeps there, under the ROOT INSTANCE
+  DIR rather than the workspace (`fanout._fork_dir`), so shadows never
+  touch the workspace and never reach a curated package. Detection is the
+  same `AGENT_FORK_ID` / `AGENT_INSTANCE_DIR` pair `resolve_ledger_path`
+  uses. A clone reads the root memoir *and* its shadow; the shadow starts
+  blank. The archive hook stays root-only, and `archive_if_changed` reads
+  the root path explicitly so a shadow can never land in the shared
+  history.
+- **The fold.** Shadows newer than the root memoir are injected to the
+  root auditor as `branch_memoirs`, already distilled into the same six
+  sections. Two reductions, both measured on a real fork: the template's
+  instruction comment (~420 tokens) is stripped, and a shadow still equal
+  to the blank skeleton is skipped, so a branch that learned nothing costs
+  nothing. Two real branches came to 172 tokens of the 3,000 cap.
 - **Resume.** The file lives in the workspace; nothing is added to
   `exploration_state.json`. The archive filename is the only state.
 - **Unchanged cycle.** No archive entry. "No update" is the normal
@@ -225,10 +243,10 @@ Rules at the edges:
 | Paths | `paths.py:180` `ensure_layout` + new `memoir_path()`, `memoir_history_dir()` | ~15 lines |
 | Seed | `memoir.seed_if_missing`, called from `read_for_injection`; `templates/memoir_template.md` | ~15 lines + template |
 | Inject | `exploration.py:~4140`, beside the plan/ledger injection block | ~20 lines |
-| Auditor path input | Same block: `score_inputs["memoir_path"]` (root) or read-only note (clone) | ~6 lines |
+| Auditor inputs | Same block: `score_inputs["memoir_path"]` (write path) + `results["branch_memoirs"]` (fold) | ~12 lines |
 | Archive | `exploration.py:~4306`, after the auditor's successful result lands | ~10 lines calling a helper |
 | Helper module | New `long_exposure/memoir.py`: `read_for_injection`, `archive_if_changed`, `store_row` | ~100 lines |
-| Score | `exploration-score.yaml`: `run_memory` in researcher/worker inputs, `memoir_path` in auditor inputs, two sentences in the auditor role | ~6 lines |
+| Score | `exploration-score.yaml`: `run_memory` in researcher/worker inputs, `memoir_path` + `branch_memoirs` in auditor inputs, three sentences in the auditor role | ~8 lines |
 | Config | `config.yaml`: `memoir: {enabled: true, max_tokens: 1200}` | 3 lines |
 
 Roughly 170 lines of production code. Reuses `stage_io.atomic_write_text`
@@ -273,8 +291,13 @@ auditor), no per-role toggle (the roles are fixed by decision).
   an unchanged one produces none.
 - Over-cap content is truncated at injection with the marker and a
   `memoir_over_cap` health event; the live file is untouched.
-- In a clone, `memoir_path` renders the read-only note and no archive is
-  written.
+- In a clone, `memoir_path` points at that clone's shadow (never the root),
+  the shadow is seeded blank, the branch reads both sections, and no archive
+  is written. Driven through the real `AGENT_FORK_ID` env pair.
+- Collapsed shadows are labelled, boilerplate-stripped, skeleton-skipped,
+  capped, and self-clearing once the root memoir is edited.
+- The fork invariant holds when untouched and reports `memoir_clone_write`
+  when a clone writes the root file.
 - `memoir.enabled: false` → no seed, no inputs, no archive.
 - One `record_type='memoir'` row per archive in `sessions.db`, findable
   via the FTS query path `search_sessions` uses; none when unchanged.
@@ -300,8 +323,9 @@ auditor), no per-role toggle (the roles are fixed by decision).
 - No state in `exploration_state.json`.
 - No change to compaction, gems, the ledger, the plan, or the reporter's
   role text.
-- No push path for fan-out branch outcomes into L1 (§4, "Fan-out branch
-  outcomes") — the one known conceptual gap, accepted.
+- No mechanical concat of branch memoirs into the root file: the fold is
+  the auditor's edit, so agent ownership of L1 is never broken.
+- No archiving of clone shadows, and no memoir rows from clone processes.
 
 ## 14. Branch
 

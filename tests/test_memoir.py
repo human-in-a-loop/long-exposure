@@ -113,12 +113,54 @@ class MemoirModuleTests(unittest.TestCase):
         self.assertEqual(memoir.max_tokens({"memoir": {"max_tokens": 0}}), 3000)
         self.assertEqual(memoir.max_tokens({"memoir": {"max_tokens": 500}}), 500)
 
-    def test_path_input_is_bare_at_root_and_read_only_in_clone(self):
-        root = memoir.path_input_value(self.ws, is_clone=False)
-        self.assertEqual(root, str(paths.memoir_path(self.ws)))
-        clone = memoir.path_input_value(self.ws, is_clone=True)
-        self.assertIn("do NOT edit", clone)
-        self.assertIn(str(paths.memoir_path(self.ws)), clone)
+    def test_path_input_is_the_file_this_process_may_write(self):
+        # Root: the root memoir, bare.
+        self.assertEqual(
+            memoir.path_input_value(self.ws), str(paths.memoir_path(self.ws))
+        )
+        # Clone: its own shadow, not the root — so the auditor's "edit the
+        # memoir at this path" guidance is true rather than contradicted.
+        with tempfile.TemporaryDirectory() as inst:
+            with patch.dict(os.environ, {"AGENT_FORK_ID": "ab12",
+                                         "AGENT_INSTANCE_DIR": inst}):
+                value = memoir.path_input_value(self.ws)
+        self.assertIn(str(Path(inst) / "MEMOIR.md"), value)
+        self.assertNotIn(str(paths.memoir_path(self.ws)), value)
+        self.assertIn("BRANCH memoir", value)
+
+    def test_shadow_path_only_resolves_inside_a_clone(self):
+        self.assertIsNone(memoir.shadow_path())
+        self.assertEqual(memoir.write_path(self.ws), paths.memoir_path(self.ws))
+        with patch.dict(os.environ, {"AGENT_FORK_ID": "ab12",
+                                     "AGENT_INSTANCE_DIR": "/tmp/clone-1"}):
+            self.assertEqual(memoir.shadow_path(), Path("/tmp/clone-1/MEMOIR.md"))
+            self.assertEqual(memoir.write_path(self.ws), Path("/tmp/clone-1/MEMOIR.md"))
+        # A fork id without an instance dir cannot resolve a shadow.
+        with patch.dict(os.environ, {"AGENT_FORK_ID": "ab12"}, clear=False):
+            os.environ.pop("AGENT_INSTANCE_DIR", None)
+            self.assertIsNone(memoir.shadow_path())
+
+    def test_clone_reads_root_and_its_own_blank_shadow(self):
+        memoir.seed_if_missing(self.ws)
+        root = paths.memoir_path(self.ws)
+        root.write_text(root.read_text().replace("(none yet)", "ROOT THESIS", 1))
+        with tempfile.TemporaryDirectory() as inst:
+            with patch.dict(os.environ, {"AGENT_FORK_ID": "ab12",
+                                         "AGENT_INSTANCE_DIR": inst}):
+                value = memoir.read_for_injection(self.ws, {})
+                shadow = Path(inst) / "MEMOIR.md"
+                self.assertTrue(shadow.exists())          # seeded lazily
+                # Blank skeleton, NOT a copy of the root: branch-local delta.
+                self.assertNotIn("ROOT THESIS", shadow.read_text())
+                self.assertIn("## Thesis", shadow.read_text())
+        self.assertIn("RUN MEMOIR (root, read-only in this branch)", value)
+        self.assertIn("ROOT THESIS", value)
+        self.assertIn("THIS BRANCH'S MEMOIR", value)
+
+    def test_root_injection_has_no_branch_section(self):
+        value = memoir.read_for_injection(self.ws, {})
+        self.assertNotIn("THIS BRANCH", value)
+        self.assertNotIn("read-only in this branch", value)
 
     def test_archive_only_on_content_change_with_file_and_row(self):
         memoir.seed_if_missing(self.ws)
@@ -195,6 +237,151 @@ class MemoirModuleTests(unittest.TestCase):
         self.assertEqual(agents["odd"], {})
 
 
+class MemoirFanOutTests(unittest.TestCase):
+    """Fork and merge: shadows isolate the write, and the fold closes the
+    two-cycle blind spot around every fan-out."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name) / "ws"
+        self.inst = Path(self.td.name) / "instance"
+        self.ws.mkdir(); self.inst.mkdir()
+        paths.ensure_layout(self.ws)
+        memoir.seed_if_missing(self.ws)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _branch(self, fork: str, k: int, body: str) -> Path:
+        d = self.inst / f"fork-{fork}" / f"clone-{k}"
+        d.mkdir(parents=True, exist_ok=True)
+        shadow = d / "MEMOIR.md"
+        shadow.write_text(body)
+        # Newer than the root memoir, as a real collapse would leave it.
+        st = paths.memoir_path(self.ws).stat()
+        os.utime(shadow, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        return shadow
+
+    def _touch_root_newer(self) -> None:
+        """Simulate the root auditor's edit landing after the collapse."""
+        root = paths.memoir_path(self.ws)
+        root.write_text(root.read_text() + "\n- folded\n")
+        newest = max(
+            sh.stat().st_mtime_ns for sh in memoir._branch_shadows(self.inst)
+        )
+        st = root.stat()
+        os.utime(root, ns=(st.st_atime_ns, newest + 1_000_000))
+
+    def test_no_branches_is_an_explicit_empty_value(self):
+        self.assertEqual(
+            memoir.branch_memoirs_for_injection(self.ws, self.inst, {}),
+            memoir._NO_BRANCHES,
+        )
+        # A clone never gets the fold input (root_instance_dir is None).
+        self.assertEqual(
+            memoir.branch_memoirs_for_injection(self.ws, None, {}),
+            memoir._NO_BRANCHES,
+        )
+
+    def test_collapsed_branches_are_labelled_and_offered_once(self):
+        self._branch("ab12", 1, "## Ruled out\n- spectral method — diverged\n")
+        self._branch("ab12", 2, "## Ruled out\n- greedy packing — too slow\n")
+        value = memoir.branch_memoirs_for_injection(self.ws, self.inst, {})
+        self.assertIn("2 fan-out branch memoir(s)", value)
+        self.assertIn("== BRANCH fork-ab12/clone-1 ==", value)
+        self.assertIn("== BRANCH fork-ab12/clone-2 ==", value)
+        self.assertIn("spectral method", value)
+        self.assertIn("greedy packing", value)
+
+        # Self-clearing: once the root auditor edits the memoir, the root file
+        # is newer than the shadows and the input goes empty again. No state.
+        self._touch_root_newer()
+        self.assertEqual(
+            memoir.branch_memoirs_for_injection(self.ws, self.inst, {}),
+            memoir._NO_BRANCHES,
+        )
+
+    def test_fold_strips_boilerplate_and_skips_unedited_branches(self):
+        """Measured on a real fan-out: the template comment is ~420 tokens, so
+        three branches would burn a third of the fold budget on boilerplate,
+        and a branch that learned nothing should cost nothing."""
+        from long_exposure.workspace_bootstrap import render_template
+        skeleton = render_template("memoir_template.md", created="2026-09-24T00:00:00")
+        self._branch("ab12", 1, skeleton)                      # never edited
+        self._branch("ab12", 2, skeleton.replace(
+            "(none yet)", "branch 2 ruled out: tiling failed", 1))
+        value = memoir.branch_memoirs_for_injection(self.ws, self.inst, {})
+        self.assertIn("1 fan-out branch memoir(s)", value)     # not 2
+        self.assertIn("clone-2", value)
+        self.assertNotIn("clone-1", value)                     # skeleton skipped
+        self.assertNotIn("<!--", value)                        # comment stripped
+        self.assertNotIn("Advisory narrative back-reference", value)
+        self.assertIn("tiling failed", value)
+
+    def test_stale_and_empty_shadows_are_skipped(self):
+        stale = self.inst / "fork-old" / "clone-1"
+        stale.mkdir(parents=True)
+        (stale / "MEMOIR.md").write_text("## Ruled out\n- ancient\n")
+        os.utime(stale / "MEMOIR.md", (0, 0))          # older than the root
+        self._branch("ab12", 1, "   \n  \n")            # whitespace only
+        self.assertEqual(
+            memoir.branch_memoirs_for_injection(self.ws, self.inst, {}),
+            memoir._NO_BRANCHES,
+        )
+
+    def test_branch_block_is_capped_at_a_branch_boundary(self):
+        for k in range(3):
+            self._branch("ab12", k, f"## Ruled out\n- branch {k} " + "x" * 3000)
+        seen = []
+        with patch("long_exposure.memoir.health_events.append_event",
+                   side_effect=lambda kind, **kw: seen.append(kind)):
+            value = memoir.branch_memoirs_for_injection(
+                self.ws, self.inst, {"memoir": {"max_tokens": 300}}
+            )
+        self.assertIn("memoir_branches_over_cap", seen)
+        self.assertIn("[memoir over cap", value)
+        self.assertLessEqual(len(value) // 4, 400)
+
+    def test_root_frozen_invariant_holds_and_reports(self):
+        before = memoir.snapshot(self.ws)
+        # Untouched during the fork → invariant holds, no event.
+        seen = []
+        with patch("long_exposure.memoir.health_events.append_event",
+                   side_effect=lambda kind, **kw: seen.append(kind)):
+            self.assertTrue(
+                memoir.assert_root_frozen_during_fork(self.ws, before, "ab12")
+            )
+        self.assertEqual(seen, [])
+
+        # A clone wrote the root file anyway → violation is reported.
+        root = paths.memoir_path(self.ws)
+        root.write_text(before + "\n- a clone wrote here\n")
+        seen = []
+        with patch("long_exposure.memoir.health_events.append_event",
+                   side_effect=lambda kind, **kw: seen.append(kind)):
+            self.assertFalse(
+                memoir.assert_root_frozen_during_fork(self.ws, before, "ab12")
+            )
+        self.assertEqual(seen, ["memoir_clone_write"])
+
+    def test_archive_never_targets_a_shadow(self):
+        """Archiving is root-only by construction: even called from inside a
+        clone env, archive_if_changed reads the ROOT memoir, so a shadow can
+        never land in the shared history or the DB under a clone's cycle."""
+        root = paths.memoir_path(self.ws)
+        before = memoir.snapshot(self.ws)
+        root.write_text(before + "\n- root edit\n")
+        with tempfile.TemporaryDirectory() as inst:
+            shadow = Path(inst) / "MEMOIR.md"
+            shadow.write_text("## Thesis\nbranch-only content\n")
+            with patch.dict(os.environ, {"AGENT_FORK_ID": "ab12",
+                                         "AGENT_INSTANCE_DIR": inst}):
+                archived = memoir.archive_if_changed(self.ws, 5, before, None)
+        self.assertIsNotNone(archived)
+        self.assertNotIn("branch-only content", archived.read_text())
+        self.assertIn("root edit", archived.read_text())
+
+
 class MemoirWorkspaceHygieneTests(unittest.TestCase):
     """The memoir must not trip the validators agents are told to run, and
     must never ship in a curated package."""
@@ -269,7 +456,7 @@ def _memoir_score_agents():
         "    outputs: [work_output]\n"
         "    role: worker\n"
         "  auditor:\n"
-        "    inputs: [directive, work_output, memoir_path]\n"
+        "    inputs: [directive, work_output, memoir_path, branch_memoirs]\n"
         "    outputs: [audit_report]\n"
         "    role: auditor\n"
     )
@@ -325,6 +512,7 @@ def _agent_that_edits_memoir(seen: list, workspace: Path, *, edit: bool = True):
             "agent": agent_name,
             "run_memory": results.get("run_memory"),
             "memoir_path": score_inputs.get("memoir_path"),
+            "branch_memoirs": results.get("branch_memoirs"),
             "declared": list(agent_def.get("inputs", [])),
         })
         if agent_name == "auditor" and edit:
@@ -421,18 +609,31 @@ class MemoirCycleIntegrationTests(unittest.TestCase):
             self.assertEqual(n, 0)
 
     def test_clone_reads_but_never_writes(self):
+        """Drives the REAL clone detection — the AGENT_FORK_ID /
+        AGENT_INSTANCE_DIR pair the fan-out conductor sets, the same pair
+        workspace_bootstrap.resolve_ledger_path uses — rather than patching
+        _is_clone, so the shadow actually resolves the way it does in a
+        spawned clone."""
         seen = []
         with tempfile.TemporaryDirectory() as td:
             score, config, inst, ws = _write_memoir_files(Path(td), max_cycles=1)
             with patch("long_exposure.exploration._call_exploration_agent",
                        _agent_that_edits_memoir(seen, ws)), \
-                    patch("long_exposure.exploration._is_clone", return_value=True):
+                    patch.dict(os.environ, {"AGENT_FORK_ID": "ab12",
+                                            "AGENT_INSTANCE_DIR": str(inst)}):
                 self._run(score, config, inst)
+            # The branch wrote its own shadow beside its state file.
+            self.assertTrue((inst / "MEMOIR.md").exists())
             researcher = next(s for s in seen if s["agent"] == "researcher")
             self.assertIn("## Thesis", researcher["run_memory"])
             auditor = next(s for s in seen if s["agent"] == "auditor")
-            self.assertIn("do NOT edit", auditor["memoir_path"])
-            # The fake auditor still wrote the file, but the harness must not archive it.
+            # The clone auditor is pointed at its own shadow, never the root.
+            self.assertIn("BRANCH memoir", auditor["memoir_path"])
+            self.assertNotIn(
+                str(paths.memoir_path(ws)) + "\n", auditor["memoir_path"]
+            )
+            # The fake auditor still wrote the root file, but the harness must
+            # not archive it from a clone.
             self.assertEqual(list(paths.memoir_history_dir(ws).iterdir()), [])
 
     def test_disabled_strips_inputs_and_writes_nothing(self):
@@ -447,8 +648,9 @@ class MemoirCycleIntegrationTests(unittest.TestCase):
             for call in seen:
                 self.assertIsNone(call["run_memory"], call["agent"])
                 self.assertIsNone(call["memoir_path"], call["agent"])
-                self.assertNotIn("run_memory", call["declared"])
-                self.assertNotIn("memoir_path", call["declared"])
+                self.assertIsNone(call["branch_memoirs"], call["agent"])
+                for name in ("run_memory", "memoir_path", "branch_memoirs"):
+                    self.assertNotIn(name, call["declared"])
             self.assertFalse(paths.memoir_path(ws).exists())
 
     def test_resumed_pre_memoir_workspace_is_seeded_lazily(self):

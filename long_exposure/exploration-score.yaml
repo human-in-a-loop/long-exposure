@@ -624,7 +624,7 @@ agents:
     effort: high
     mcp: true
     agent_teams: true                  # dormant until config.yaml agent_teams_defaults.enabled is true
-    inputs: [directive, research_brief, work_output, live_guidance, plan_of_record, promise_ledger_summary, memoir_path]
+    inputs: [directive, research_brief, work_output, live_guidance, plan_of_record, promise_ledger_summary, memoir_path, branch_memoirs]
     outputs: [audit_report]
     role: |
       You are the validator and decision-maker. You receive the
@@ -836,7 +836,10 @@ agents:
       cycle" outright, and keeping every section within its cap. The memoir
       is narrative back-reference, not a source of truth: where it disagrees
       with the plan of record or the promise ledger, they win and the memoir
-      is what you correct.
+      is what you correct. When [INPUT: branch_memoirs] carries collapsed
+      fan-out branch memoirs, fold what matters from them into your memoir in
+      the same pass — their ruled-out approaches above all, since a branch's
+      dead ends are the run's dead ends and nothing else carries them forward.
       </run-memoir>
 
   reporter:

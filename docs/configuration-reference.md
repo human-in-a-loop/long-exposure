@@ -168,7 +168,7 @@ memoir:
 | Key | Meaning |
 |---|---|
 | `enabled` | Seed `MEMOIR.md`, inject it as the `run_memory` input to the researcher and worker, give the auditor its path as `memoir_path`, and archive changed versions after the auditor's turn. `false` strips both inputs from every agent at load so the prompt matches a pre-memoir run. Default `true` |
-| `max_tokens` | Global cap enforced at injection (chars/4 estimate). Over-cap content is cut at the last paragraph boundary before the cap (hard cut if no boundary exists in the head), with a marker and a `memoir_over_cap` health event; the live file is never altered by the harness. Default 3000 |
+| `max_tokens` | Cap enforced at injection (chars/4 estimate), applied per section — the root memoir, a branch's own shadow, and the collapsed `branch_memoirs` block are each capped independently. Over-cap content is cut at the last paragraph boundary before the cap (hard cut if no boundary exists in the head), with a marker and a `memoir_over_cap` health event; the live file is never altered by the harness. Default 3000 |
 
 The memoir is advisory — the plan of record and promise ledger win on any
 conflict — and the auditor's role text carries the minimal-edit rule. See

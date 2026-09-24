@@ -339,11 +339,21 @@ Rules that keep it honest:
   `memoir/history/cycle-NNNNNN_<ts>.md` and stored as a `record_type='memoir'`
   row. An unchanged cycle leaves no trace — the normal outcome of
   minimal-edit discipline.
-- **Root writes only.** Fan-out clones share the workspace and read the
-  memoir for free, but their auditor gets a read-only note instead of the
-  path and the archive hook is gated on the root process. The post-merge
-  cycle runs worker-only, so no rewrite that cycle; the next full cycle's
-  auditor catches up.
+- **Fan-out uses per-clone shadows.** A clone writes
+  `<clone instance dir>/MEMOIR.md` — never the root file — mirroring the
+  shadow-ledger pattern, so N concurrent clone auditors cannot interleave
+  writes on one unlocked file. A clone reads the root memoir *and* its
+  shadow; the shadow starts blank, holding only branch-local knowledge.
+  Shadows live under the root instance dir, not the workspace, so they
+  never reach a curated package. Archiving stays root-only.
+- **Collapsed branches are folded by the auditor.** Fan-out replaces the
+  worker and auditor for its cycle and the post-merge cycle is worker-only,
+  so no root auditor runs for two cycles around a fork — and by then the
+  merge text has left `results` entirely. Shadows newer than the root
+  memoir are injected as the `branch_memoirs` input to the root auditor,
+  boilerplate stripped and unedited skeletons skipped, capped like the
+  memoir itself. Stateless: "newer than the root memoir" is true exactly
+  from a collapse until the auditor next edits the memoir.
 - **Lazy seed.** `MEMOIR.md` is written from `templates/memoir_template.md`
   the first time a cycle needs it, so a workspace that predates the
   feature gets one on its next resumed cycle. Nothing is added to
@@ -352,10 +362,6 @@ Rules that keep it honest:
   and `memoir/` (advisory process state does not ship), and `org_check`
   allow-lists both so agents never see a warning about a file the harness
   created.
-- **Known gap, accepted.** Fan-out branch outcomes have no push path into
-  L1: clones cannot write the memoir and the post-merge cycle has no
-  auditor, so branch-local dead ends reach it only if the next root auditor
-  reads the `merge_report.md` files on its own initiative.
 - **Off switch.** `memoir.enabled: false` strips `run_memory` and
   `memoir_path` from every agent's inputs at load, so the prompt is
   identical to a pre-memoir run rather than carrying `[UNAVAILABLE]`.
