@@ -24,7 +24,7 @@ to an error.
 | 1 | Agent-planned cycle tail (`<cycle_plan>`) | off | `loop.cycle_planning` |
 | 2 | Model capability profiles (guidance tiering) | off | `model_profiles` |
 | 3 | Startup gate (4 questions, `launch` only) | off | `startup_gate` |
-| 4 | Usage cap as a delta % of a declared weekly allowance | off | `usage_allowance` |
+| 4 | One total spend limit, as a delta % of a declared weekly allowance | off | `usage_allowance` |
 
 ---
 
@@ -285,10 +285,22 @@ resume`, `fanout.py:1073-1083`) and the benchmark adapter working unchanged.
 
 | Q | Prompt | Choices | Applied to |
 |---|---|---|---|
-| 1 | Model to run on | `model_profiles`-aware list from `startup_gate.model_choices`, plus "other (type an id)" | `model` and the matching `agent_models.*.model` entries |
+| 1 | Model to run on | `model_profiles`-aware list from `startup_gate.model_choices`, plus "other (type an id)" | `model`, plus every `agent_models.*.model` that still equals the pre-gate global default |
 | 2 | Workspace directory | current `working_directory` as default; validated to exist and be writable | `working_directory` |
 | 3 | Resume a previous run, or start fresh? | enumerated discoverable runs (see Q4 below), plus "fresh" | `--instance-dir` / state path selection |
 | 4 | Usage limit for this run | integer 1–100, shown **only** when `usage_allowance.enabled` | `usage_allowance.run_pct` |
+
+**How Q1 is applied (decided).** The shipped config pins all eight roles
+explicitly in `agent_models`, so setting the global `model` alone would have
+no effect — the gate answer has to reach the routing table. It rewrites
+`model`, then rewrites each `agent_models.*.model` **whose value equals the
+pre-gate global default**. A deliberately heterogeneous routing (a Codex
+worker, a Sonnet reporter) survives untouched.
+
+Because that rule is subtle, the gate then **prints the resulting routing
+table** — role, provider, model, effort, and the resolved capability profile
+per role (§2.4) — before the run starts. One answer, one visible consequence.
+The same table is written to `gate_answers.json` and copied into `output/`.
 
 ### 3.3 Persistence and headless escape hatches
 
@@ -308,11 +320,39 @@ resume`, `fanout.py:1073-1083`) and the benchmark adapter working unchanged.
 There is no instances root today — instance dirs come only from
 `--instance-dir` or `AGENT_INSTANCE_DIR`, and the legacy default is a single
 `exploration_state.json` in the data dir (`exploration.py:294`, `:297-311`).
-So Q3 needs a source of truth for "what runs exist". Options in Q4 below.
+
+**Decided: a registry file, with an instances-root scan as fallback.**
+
+- **Primary.** Every run appends one JSON line to
+  `~/.long-exposure/runs.jsonl` at startup: `run_id`, instance dir, state
+  path, task, `started_at`. Append-only and atomic-append, so two concurrent
+  runs (or a root and its clones) cannot corrupt it. Clones do **not**
+  register — a fork is not a resumable run. Entries whose state path no
+  longer exists are shown as tombstones and are not offerable.
+- **Fallback.** If the registry is missing or has no usable entries (an older
+  run, a fresh checkout, a moved home directory), glob
+  `startup_gate.instances_root` (default `./instances`) for
+  `*/exploration_state.json` and read `run_id` and cycle out of each.
+
+Both paths feed the same display list, so the gate's behaviour does not
+depend on which one answered. Two code paths is the cost; the benefit is that
+the gate is useful on day one against runs that predate the registry.
 
 ---
 
-## 4. Feature 4 — usage cap as a delta percentage
+### 3.5 Config surface
+
+```yaml
+startup_gate:
+  enabled: false                 # off → `launch` behaves exactly as today
+  model_choices: [opus, fable, sonnet]   # plus "other (type an id)"
+  instances_root: ./instances    # fallback enumeration source for Q3
+  registry_path: ~/.long-exposure/runs.jsonl
+```
+
+---
+
+## 4. Feature 4 — one total spend limit, as a delta percentage
 
 ### 4.1 State the honesty constraint first
 
@@ -334,37 +374,74 @@ knowledge of prior consumption required.
 
 ```yaml
 usage_allowance:
-  enabled: false
+  enabled: false              # optional; false (or run_pct 0) = unlimited
   weekly_allowance_usd: 0     # user-declared, API-equivalent notional dollars
   run_pct: 0                  # 1-100; gate Q4 writes this
-  basis: cost                 # cost | tokens
-  action: end_of_run          # end_of_run (graceful pipeline) | hard_stop
 ```
 
-Implementation is deliberately small: at startup, resolve
-`weekly_allowance_usd * run_pct / 100` and fold it into `loop_cfg` as
-`max_cost_usd`, taking the **minimum** of it and any score-set value. The
-existing `UsageLedger.budget_exceeded(loop_cfg)` check at the cycle boundary
-(`usage_ledger.py:331`) then does the work, and `action: end_of_run` is
-already its behaviour. No new gate site, no new stop path.
+**One total limit, and only one.** The cap is a single number for the whole
+run: `weekly_allowance_usd * run_pct / 100`. There are no per-agent, per-role,
+per-cycle or per-clone sub-budgets — that is a deliberate design constraint,
+not an omission. The run spends freely against the total until the total is
+gone.
 
-### 4.3 The clone overshoot — a real hazard, not a hypothetical
+The delta semantics you asked for come for free from this shape: the ledger
+totals only this run's spend, so a cap measured from run start *is* a delta on
+top of whatever was already consumed, with no knowledge of prior usage
+required.
 
-Clones are spawned with the **same score file** and no budget environment
-(`fanout.py:1073-1139` sets fork, instance, account and pool vars — nothing
-about budget). So each of up to `FANOUT_MAX_BRANCHES = 3` clones would
-independently permit the full run cap, and because clone ledgers merge only
-at barrier collapse, the root cannot see the spend while it happens. Worst
-case is ~4× the declared cap (root + 3 clones), bounded in time by the 10 h
-`FANOUT_CAP_SECONDS` per clone.
+### 4.3 Hitting the limit kills the run
 
-Mitigation to build with the feature, not after: pass an explicit per-clone
-sub-allowance in the spawn env (`LONG_EXPOSURE_MAX_COST_USD = remaining / K`)
-and have the clone's `loop_cfg` resolution honour it. The residual overshoot
-is then one cycle's spend per clone rather than one full cap per clone, and
-that residual gets stated in the docs rather than hidden.
+This is the part that does *not* reuse the existing budget machinery. The
+current `loop.max_cost_usd` gate calls `UsageLedger.budget_exceeded`
+(`usage_ledger.py:331`) at the cycle boundary and ends the run as a natural
+end-of-run — the final auditor, final reporter and curator all still run. A
+total spend limit is a different contract: **when the total is hit the run is
+killed, not stopped.**
 
-### 4.4 Reporting
+Concretely, the kill path:
+
+1. **Terminates immediately**, not at the next cycle boundary. The check runs
+   wherever spend is recorded — after every agent turn — and additionally on
+   the fan-out barrier poll, because that is the only place clone spend
+   becomes visible while clones are alive.
+2. **Kills the clone process groups** before exiting, reusing the existing
+   SIGTERM → 10 s grace → SIGKILL `killpg` sweep (`fanout.py:1998-2019`).
+   Clones were spawned with `start_new_session=True`, so this takes their
+   provider CLI subprocesses with them. Without this, clones outlive the root
+   and keep spending past the limit that just killed it.
+3. **Skips the end-of-run pipeline entirely** — no final auditor, no final
+   reporter, no curator. Those stages cost money, and spending past the cap
+   to write a report about hitting the cap is incoherent.
+4. **Leaves a marker** (`output/killed_spend_limit.json`: the cap, the
+   observed total, the cycle, the timestamp) and exits non-zero, so an
+   operator or a wrapper script can tell a kill from a clean finish. The
+   normal stop signal path stays untouched and still means graceful.
+
+`enabled: false`, `run_pct: 0`, or `weekly_allowance_usd: 0` → the feature is
+inert and the run is unlimited, which stays the default.
+
+### 4.4 Seeing clone spend before the kill is too late
+
+A total-only limit has one hard requirement: the root has to observe clone
+spend *while clones run*. Today it cannot — clone ledgers merge into the root
+only at barrier collapse (`fanout.py:~1980`), and clones are spawned with the
+same score file and no budget environment at all (`fanout.py:1073-1139` sets
+fork, instance, account and pool variables, nothing about spend). So up to
+three clones can each run for 10 h (`FANOUT_CAP_SECONDS`) entirely unseen.
+
+The fix does not need sub-budgets. Every process already writes an
+incrementally-updated `output/usage_summary.json` on each status write
+(`exploration.py:2341`), including clones in their own instance dirs. So the
+root's existing barrier poll sums its own ledger plus each live clone's
+summary file and checks the **total** against the single cap. Missing or
+unparseable clone files count as zero and are logged, never fatal.
+
+Residual overshoot is bounded by the poll interval rather than by anything
+architectural, and gets stated plainly in the docs: the limit is enforced
+within one poll of being crossed, not to the dollar.
+
+### 4.5 Reporting
 
 `usage_summary.md` gains one line and one disclaimer:
 
@@ -374,6 +451,9 @@ Consumed:      $61.42 (76.8% of the run allowance)
 Note: the weekly allowance is operator-declared. The harness cannot read
 subscription usage; this is an API-equivalent proxy, not a meter reading.
 ```
+
+On a kill, `usage_summary.md` says so explicitly and names the marker file,
+so the summary never reads like a completed run.
 
 ---
 
@@ -386,12 +466,20 @@ Feature 1 and touches the busiest part of the cycle loop, so it goes first
 and lands on its own, verified against the existing suite before anything
 else moves.
 
-1. §1.7 refactor — `i == 0` / `i == len(...)-1` → name-based. No behaviour change.
-2. Feature 4 — smallest, self-contained, and the gate's Q4 depends on it.
-3. Feature 2 — one new branch in `render_stages_block` plus profile resolution.
-4. Feature 3 — the gate, which surfaces Features 2 and 4 to the operator.
-5. Feature 1 — the largest, and the one that benefits from the other three
-   being observable when it first runs live.
+1. **§1.7 refactor** — `i == 0` / `i == len(...)-1` → name-based. No
+   behaviour change, so it lands and is verified against the existing suite
+   on its own.
+2. **Feature 2 (profiles)** — one new branch in `render_stages_block` plus
+   per-agent profile resolution. The riskiest part is threading the resolved
+   model through every `assemble_system_prompt` call site, which is
+   mechanical and fully covered by the byte-identical-prompt test.
+3. **Feature 4 (spend limit)** — bigger than it first looked, because the
+   kill path and the live clone-spend poll are both new (§4.3, §4.4). It
+   comes before the gate because gate Q4 exists only if this does.
+4. **Feature 3 (the gate)** — surfaces Features 2 and 4 to the operator, so
+   it wants both already working.
+5. **Feature 1 (cycle planning)** — the largest, and the one that most
+   benefits from the other three being observable when it first runs live.
 
 ### 5.2 Tests each feature owes
 
@@ -410,21 +498,41 @@ else moves.
 - **Gate**: every flag suppresses its question; non-TTY + missing answer →
   non-zero exit naming the flag; `gate_answers.json` round-trips and `resume`
   does not re-ask; `--no-gate` is a no-op path.
-- **Allowance**: percentage → cap arithmetic; min-wins against a score cap;
-  `run_pct: 0` or `weekly_allowance_usd: 0` → feature inert; clone
-  sub-allowance present in the spawn env; the summary line renders with its
-  disclaimer.
+- **Spend limit**: percentage → cap arithmetic; `enabled: false`,
+  `run_pct: 0`, or `weekly_allowance_usd: 0` → feature inert and the run
+  unlimited; the check fires after an agent turn rather than waiting for the
+  cycle boundary; the kill skips final auditor, final reporter and curator;
+  the clone process-group sweep runs before exit; the root's barrier poll
+  sums root + live clone `usage_summary.json` files and a missing or
+  unparseable clone file counts as zero without raising;
+  `killed_spend_limit.json` is written and the exit code is non-zero; the
+  summary line renders with its disclaimer and says "killed" on a kill.
 
 ### 5.3 Docs
 
 `docs/configuration-reference.md` gains all four blocks;
 `docs/soft-guidance.md` gains the thins/never-thins table with the
 "exhortation may thin, machinery may not" line; `docs/usage-guide.md` gains
-the gate walkthrough; `docs/parallelism.md` gains the clone sub-allowance
-note. `docs/rcb-benchmark-plan.md` is affected — a benchmark run would now
+the gate walkthrough; `docs/parallelism.md` gains the live clone-spend poll
+and the kill sweep. `docs/rcb-benchmark-plan.md` is affected — a benchmark run would now
 record `gate_answers.json` as provenance, which strengthens §7 of that plan,
-but the benchmark itself must decide whether to enable Features 1 and 2 (that
-changes what is being measured). Flagged, not decided here.
+and the benchmark will **enable both Feature 1 and Feature 2** (decided).
+That is the "most advanced tool" framing of that plan taken seriously: the
+run measures Fable on a harness that is not fighting it.
+
+Two consequences to write into that plan rather than discover during it:
+
+- **It supersedes the pre-registration.** `docs/rcb-benchmark-plan.md` §7
+  currently describes a fixed-flow, full-guidance harness. Enabling both
+  features changes what is measured, so the plan's configuration appendix and
+  its honesty section both need updating before launch, and the run must be
+  reported as measuring the advanced-mode harness — not as the design
+  originally pre-registered.
+- **Live testing gates the launch.** You have already said this branch needs
+  live testing before it merges; benchmarking on two features that have never
+  run live would make a bad result uninterpretable (harness bug or model
+  limit?). Sequence: implement → live-test the branch → update the benchmark
+  plan's appendix → launch.
 
 ### 5.4 Deliberately not built
 
@@ -432,13 +540,20 @@ changes what is being measured). Flagged, not decided here.
 - No auditor fan-out authority.
 - No researcher self-scheduling (index 0 is never planned).
 - No reading of real subscription usage (§4.1) — not deferred, impossible.
+- **No per-agent, per-role, per-cycle or per-clone spend sub-budgets.** One
+  total limit, or none (§4.2). Explicitly ruled out, not deferred.
+- No graceful end-of-run on a spend kill — the whole point is that the run
+  stops spending (§4.3).
 - No account-pool changes of any kind; that feature stays untouched.
 - No new memory tier. The memoir (L1) is closed.
 - No philosophy or protocol thinning.
 
 ---
 
-## 6. Open questions
+## 6. Decision log
+
+Every question raised by this plan has been answered across two interactive
+rounds. Recorded here so the implementation does not relitigate them.
 
 ### Resolved (round 1)
 
@@ -449,13 +564,22 @@ changes what is being measured). Flagged, not decided here.
 | Profile resolution | **Per agent**, from that agent's routed model; resolved after `agent_routing`, as a pure function of model id + config. |
 | `audit_floor_cycles` | **2.** |
 
-### Still open (round 2)
+### Resolved (round 2)
 
-- **Q4** — run enumeration for gate Q3: a new `instances_root` scan, a
-  registry file the harness appends to, or `sessions.db`?
-- **Q5** — what gate Q1 rewrites: the global `model` only, or also the
-  `agent_models` entries that still point at the old default?
-- **Q6** — does the benchmark run (`docs/rcb-benchmark-plan.md`) enable
-  Features 1 and 2, or stay on the fixed flow and full guidance?
-- **Q7** — the per-clone sub-allowance (§4.3): split the remaining budget
-  evenly, or leave clones uncapped and accept the documented overshoot?
+| Q | Decision |
+|---|---|
+| Gate run enumeration | **Registry file** (`~/.long-exposure/runs.jsonl`, append-only, clones excluded), **falling back** to an `instances_root` scan. |
+| Gate model answer | Rewrites `model` **plus** every `agent_models` entry still on the old default, then **prints the resulting routing table** and the per-role profile. |
+| Benchmark configuration | **Enable both** Feature 1 and Feature 2 — which supersedes the current pre-registration and must follow live testing. |
+| Spend limit shape | **One total limit only** — no per-agent, per-cycle or per-clone sub-budgets. Optional/disable-able. On hitting it the run is **killed**, not gracefully stopped: clone process groups swept, end-of-run pipeline skipped, marker written, non-zero exit. |
+
+### Still open
+
+Nothing blocking. Two things to settle when implementation reaches them,
+neither worth a decision in the abstract:
+
+- The barrier-poll interval that bounds spend-limit overshoot (§4.4) — pick
+  it from the observed poll cadence once the limit is wired up, not now.
+- Whether the exhaustion detector's per-cycle output floor needs adjusting
+  once worker chains raise peak observed output (§1.6) — a question for the
+  first live run, not for the design.
