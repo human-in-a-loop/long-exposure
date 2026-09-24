@@ -222,7 +222,7 @@ Scope is exactly what you approved: ceremony and framework enumerations.
 | Knob | `standard` (today) | `advanced` | Mechanism |
 |---|---|---|---|
 | `require_checkpoint_first` | `false` | `false` | already off; profile pins it |
-| `checkpoint_format` | `standard` (9 fields incl. `<gate-check>`) | `minimal` | existing branch, `orchestrator.py:1727` |
+| `checkpoint_format` | `standard` (9 fields) | `minimal` (6 fields; keeps a one-line `<gate-check>`, drops `<what-i-did>` / `<next-action>` and the multi-line gate answers) | existing branch, `orchestrator.py:1742` |
 | `anti_patterns_enabled` | `true` | `false` | existing branch, `orchestrator.py:1872` |
 | `framework_verbosity` | `full` | `lean` | **new**: `render_stages_block` emits `<purpose>` + `<required-output>` only, dropping `<exit-gates>`, `<failure-modes>`, `<depth-calibration>` (`orchestrator.py:1684`) |
 
@@ -269,17 +269,38 @@ routed model.** So a Fable researcher gets the lean prompt while an Opus
 auditor in the same run keeps the full one — which is the only reading that
 respects a config feature the harness already ships and documents.
 
-The cost is real and worth naming: `assemble_system_prompt` needs the
-resolved model threaded in, which touches every call site (the cycle loop,
-the REPL, the final auditor/reporter, the curator, the manager). Two
-consequences follow:
+**Implemented, and the cost turned out to be zero.** I expected to thread a
+resolved-model argument through every call site. Reading the call graph
+showed that is unnecessary: `assemble_system_prompt` is *always* handed a
+per-agent config from `build_agent_config` (`conductor.py:158`), whose
+`model` key is already the model `agent_models` routed that role to —
+`apply_agent_models` runs at `exploration.py:3427`, well before the cycle
+loop. So resolving the profile at the top of the assembler gives per-agent
+tiering with no signature change, and keeps it a pure function of the
+config, which is what stops two roles on the same model from splitting the
+prompt cache.
 
-- The profile must be resolved **after** `agent_routing` picks the model,
-  not from the config's global `model` key.
-- The prompt cache keys on the system prompt, so two roles on the same model
-  must produce the *same* profile deterministically — the resolution has to
-  be a pure function of the resolved model id plus config, with no ordering
-  or per-cycle state in it.
+Verified through the real dispatch path rather than the assembler alone: a
+config with a Fable researcher and an Opus auditor produces
+`researcher → advanced` (23,984 chars, no anti-patterns, lean stages) and
+`auditor → standard` (29,696 chars, full guidance) in one run.
+
+### 2.5 Lean mode had to be made coherent, not just shorter
+
+Found by reading the rendered lean prompt rather than the diff. Dropping the
+exit-gate enumeration leaves the framework template still saying *"every
+gate must be answered yes with evidence before advancing"* and the
+checkpoint envelope still asking the agent to *"answer the current stage's
+exit gates from the framework"* — pointing at a list that is no longer
+there. That is worse than verbose: it is an instruction the agent cannot
+follow.
+
+So `lean` emits one `<exit-gate-policy>` block (~40 tokens) redefining what
+a gate check means when the list is absent — derive the gates from the
+stage's `<purpose>` and `<required-output>`, state in one line what you
+produced and why it satisfies them — and says explicitly that cadence is
+unchanged. Net saving on the shipped `staged` framework is still ~1,950
+tokens per advanced-profile agent turn.
 
 ---
 

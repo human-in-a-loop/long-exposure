@@ -155,6 +155,36 @@ require_checkpoint_first: false
 user_gate_approval: false
 anti_patterns_enabled: true
 
+# === Model capability profiles (opt-in) ===
+# Thins the CEREMONY in the soft-guidance stack when the model running a turn
+# is one you have declared advanced. The four-layer prompt was calibrated for
+# Opus 4.6/4.7; for a more capable model the named anti-patterns, the
+# nine-field checkpoint envelope and the per-stage exit-gate enumerations are
+# a tax rather than a help.
+#
+# Resolved PER AGENT from the model `agent_models` routed that role to, so a
+# Fable researcher can get the lean prompt while an Opus auditor in the same
+# run keeps the full one.
+#
+# Sets only these four keys, and nothing else can be added to that list:
+#   require_checkpoint_first, checkpoint_format, anti_patterns_enabled,
+#   framework_verbosity (full | lean)
+# Never touches philosophy text, the operating protocol's prescriptive rules,
+# or role blocks — exhortation may thin, machinery may not.
+#
+# `enabled: false` (the default) applies nothing, and `profile: standard`
+# applies nothing either, so a run that does not opt in gets a
+# byte-identical prompt. Unknown model -> `default`, never a silent thinning.
+# See docs/soft-guidance.md and docs/advanced-model-modes-plan.md.
+model_profiles:
+  enabled: false
+  auto: true                 # derive the profile from the resolved model id
+  profile: null              # explicit override: standard | advanced
+  default: standard          # used when auto finds no family match
+  families:
+    advanced: [fable, astra] # case-insensitive substring match on the model id
+  overrides: {}              # e.g. {anti_patterns_enabled: true} to re-add one
+
 # === Permissions ===
 # Directory the agent can access (absolute path, scopes file tools).
 # File tools (Read, Write, Edit, Glob, Grep) are restricted to this path.

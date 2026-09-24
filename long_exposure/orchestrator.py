@@ -56,6 +56,7 @@ from long_exposure import pool as _pool
 from long_exposure import provider as _provider
 from long_exposure import unified_pool
 from long_exposure import agent_routing
+from long_exposure import model_profiles as _model_profiles
 
 # ---------------------------------------------------------------------------
 # Directory setup
@@ -1681,24 +1682,56 @@ def fill_simple_vars(template: str, variables: dict) -> str:
     return result
 
 
-def render_stages_block(stages: list[dict]) -> str:
-    """Render the stages list into XML format for the framework template."""
+def render_stages_block(
+    stages: list[dict],
+    verbosity: str = _model_profiles.VERBOSITY_FULL,
+) -> str:
+    """Render the stages list into XML format for the framework template.
+
+    `verbosity` comes from the resolved model capability profile
+    (`model_profiles.framework_verbosity`). "full" is the shipped default and
+    is byte-identical to the pre-profile output. "lean" keeps each stage's
+    name, order, purpose and required output — the parts that say what a
+    stage IS — and drops the three enumerations a capable model does not
+    need spelled out: the exit-gate checklist, the named failure modes, and
+    the depth-calibration line.
+    """
+    lean = str(verbosity or "").strip().lower() == _model_profiles.VERBOSITY_LEAN
     parts = []
+    if lean:
+        # Without this line the lean block is INCOHERENT, not merely shorter.
+        # The framework template's transition rules still say "every gate must
+        # be answered yes with evidence", and the checkpoint envelope still
+        # asks the agent to "answer the current stage's exit gates from the
+        # framework" — but lean stops enumerating them. The agent would be
+        # told to answer a list that is not present. This redefines what a
+        # gate check means when the list is absent, for ~40 tokens.
+        parts.append(
+            "<exit-gate-policy>\n"
+            "  Exit gates are NOT enumerated in this framework. Where the\n"
+            "  transition rules and the checkpoint envelope refer to a stage's\n"
+            "  exit gates, derive them yourself from that stage's <purpose> and\n"
+            "  <required-output>: state, in one line, what you produced and why\n"
+            "  it satisfies them. Cadence is unchanged — you still transition\n"
+            "  explicitly and still emit the gate-check field.\n"
+            "</exit-gate-policy>"
+        )
     for i, stage in enumerate(stages, 1):
         lines = []
         lines.append(f'<stage name="{stage["name"]}" order="{i}">')
         lines.append(f"  <purpose>{stage['purpose']}</purpose>")
-        lines.append("  <exit-gates>")
-        for gate in stage.get("gates", []):
-            lines.append(f"    <gate>{gate}</gate>")
-        lines.append("  </exit-gates>")
+        if not lean:
+            lines.append("  <exit-gates>")
+            for gate in stage.get("gates", []):
+                lines.append(f"    <gate>{gate}</gate>")
+            lines.append("  </exit-gates>")
         lines.append(f"  <required-output>{stage['output']}</required-output>")
-        if stage.get("anti_patterns"):
+        if stage.get("anti_patterns") and not lean:
             lines.append("  <failure-modes>")
             for ap in stage["anti_patterns"]:
                 lines.append(f'    <mode name="{ap["name"]}">{ap["description"]}</mode>')
             lines.append("  </failure-modes>")
-        if stage.get("philosophy_scaling"):
+        if stage.get("philosophy_scaling") and not lean:
             lines.append(f"  <depth-calibration>{stage['philosophy_scaling']}</depth-calibration>")
         lines.append("</stage>")
         parts.append("\n".join(lines))
@@ -2174,7 +2207,16 @@ def assemble_system_prompt(
     `--mcp-config`; otherwise an agent with `mcp: false` (the curator, say)
     is told about tools that were never launched and a call fails. None
     keeps the legacy behaviour of advertising them to any Claude turn.
+
+    The model capability profile is applied here rather than by the caller.
+    Every call site hands in a per-agent config (`build_agent_config`), whose
+    `model` key is already the model `agent_models` routed that role to, so
+    resolving the profile at this one point gives per-agent tiering with no
+    plumbing and keeps it a pure function of the config — which is what stops
+    two roles on the same model from splitting the prompt cache. A no-op when
+    `model_profiles.enabled` is false.
     """
+    config = _model_profiles.apply(config)
     prompt_parts = []
 
     # --- Layer 1: Philosophy ---
@@ -2218,7 +2260,10 @@ def assemble_system_prompt(
 
     fw_vars["framework_name"] = config["framework"]
     stages = fw_vars.pop("stages", [])
-    fw_vars["stages_block"] = render_stages_block(stages)
+    fw_vars["stages_block"] = render_stages_block(
+        stages,
+        config.get("framework_verbosity", _model_profiles.VERBOSITY_FULL),
+    )
     fw_vars["max_regressions"] = str(fw_vars.get("max_regressions", 2))
 
     prompt_parts.append(fill_simple_vars(framework_template, fw_vars))

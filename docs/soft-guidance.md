@@ -238,6 +238,77 @@ with a tag.
 
 ---
 
+## Tiering guidance by model capability
+
+The four layers were calibrated for Opus 4.6/4.7. For a more capable model
+some of layers 2 and 3 is ceremony rather than mechanism, and the observed
+symptom is a run that over-audits and under-works. `model_profiles` in
+config.yaml thins exactly that, keyed to the model actually running the turn.
+
+The line it draws: **exhortation may thin, machinery may not.**
+
+| May thin (`advanced` profile) | Why it is exhortation |
+|---|---|
+| `anti_patterns_enabled: false` | Named failure modes ("The Leap", "The Spiral") are a mnemonic for self-monitoring. A model that does not exhibit the pattern gains nothing from reading its name. |
+| `checkpoint_format: minimal` | Six fields instead of nine. The cadence is unchanged — what shrinks is the token count of each checkpoint, not the count of them. |
+| `require_checkpoint_first: false` | Already the shipped default; the profile pins it so `advanced` is self-contained. |
+| `framework_verbosity: lean` | Per stage, drops `<exit-gates>`, `<failure-modes>` and `<depth-calibration>`. Keeps name, order, `<purpose>` and `<required-output>` — the parts that say what a stage *is*. |
+
+| Never thins | Why it is machinery |
+|---|---|
+| Philosophy preset text (layer 1) | It is what makes outputs comparable across cycles and across roles. |
+| Operating-protocol prescriptive rules (layer 3) | Off-limits paths, the derived harness fence, tool contracts, the `[INPUT: x]` / `[OUTPUT: x]` envelope, compaction thresholds, the Bash wait-loop rules. The harness *parses* these, or they are safety fences. |
+| Role blocks (layer 3.5) | Each role's job and its `<authority-and-commitment>` invariants. |
+| Live guidance, re-anchor, ledger and memoir seams | Runtime state, not conditioning. |
+
+`ALLOWED_KNOBS` in `long_exposure/model_profiles.py` enforces that line in
+code: a profile — or an operator `overrides` block — can set only those four
+keys. An override naming `working_directory`, `compact_db` or a model id is
+ignored with a warning.
+
+### Lean mode has to stay coherent, not just short
+
+Dropping the exit-gate enumeration is not sufficient on its own. The
+framework template's transition rules still say *"every gate must be answered
+yes with evidence before advancing"*, and the checkpoint envelope still asks
+the agent to *"answer the current stage's exit gates from the framework"*. If
+the enumeration simply vanished, the agent would be told to answer a list
+that is not in its prompt.
+
+So `lean` emits one `<exit-gate-policy>` block (~40 tokens) that redefines
+what a gate check means when the list is absent: derive the gates from the
+stage's `<purpose>` and `<required-output>`, and state in one line what you
+produced and why it satisfies them. Cadence is explicitly preserved.
+
+### Selection is automatic and deterministic
+
+Resolution order is `overrides` > `profile:` > `auto` family match >
+`default`. Family matching is a case-insensitive substring test against the
+resolved model id, so `fable` catches `claude-fable-5-1` and any later point
+release without a config edit. Within a profile the longest pattern wins, and
+profiles are checked in a fixed order — dict ordering must never decide a
+prompt's contents.
+
+An unknown model resolves to `default` (`standard`), never to `advanced`: a
+typo must not silently thin a prompt.
+
+### Resolution is per agent, with no plumbing
+
+`agent_models` routes each role to its own provider and model, so a run can
+have a Fable researcher and an Opus auditor. The profile is resolved inside
+`assemble_system_prompt`, which is always handed a **per-agent** config from
+`build_agent_config` whose `model` key is already that role's routed model.
+So per-agent tiering falls out of the existing call graph with no extra
+argument, and resolution stays a pure function of the config — which is what
+keeps two roles on the same model from splitting the prompt cache.
+
+With `enabled: false` (the default) or `profile: standard`, nothing is
+applied and the prompt is byte-identical to the pre-feature output for every
+routed role. `tests/test_model_profiles.py` asserts that rather than
+asserting about it.
+
+---
+
 ## Code references
 
 - Philosophy + framework presets: `long_exposure/orchestrator.py`
@@ -249,5 +320,8 @@ with a tag.
   `_build_fanout_guidance` in `fanout.py`).
 - Campaign anti-pattern block: `long_exposure/anti_patterns.py` and
   `exploration.py` (`_build_anti_patterns_block`).
+- Model capability profiles: `long_exposure/model_profiles.py`; applied in
+  `orchestrator.assemble_system_prompt`, with the lean stages branch in
+  `orchestrator.render_stages_block`.
 - Validator surfacing (not enforcement):
   `long_exposure/tools/{promise_check,org_check}.py`.

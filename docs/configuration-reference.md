@@ -402,6 +402,51 @@ keywords add direct boosts (or penalties — negative values are valid).
 
 See `persistence-and-gems.md` for the full scoring model.
 
+### `model_profiles` (opt-in)
+
+Thins the *ceremony* in the soft-guidance stack when the model running a turn
+is one you have declared advanced. Default off; with it off the assembled
+prompt is byte-identical to the pre-feature output.
+
+```yaml
+model_profiles:
+  enabled: false
+  auto: true                 # derive the profile from the resolved model id
+  profile: null              # explicit override: standard | advanced
+  default: standard          # used when auto finds no family match
+  families:
+    advanced: [fable, astra] # case-insensitive substring match on the model id
+  overrides: {}              # e.g. {anti_patterns_enabled: true}
+```
+
+| Key | Meaning |
+|---|---|
+| `enabled` | Master switch. `false` applies nothing at all. |
+| `auto` | When true, match the resolved model id against `families`. |
+| `profile` | Explicit profile; beats `auto`. Unknown value warns and falls back to `default`. |
+| `default` | Profile when `auto` finds no match. Unknown value warns and falls back to `standard`. |
+| `families` | Profile name -> list of substrings matched case-insensitively against the model id. Longest pattern wins; profile order is fixed, not dict order. |
+| `overrides` | Per-key escape hatch applied last. Only the four guidance knobs below are accepted; anything else is ignored with a warning. |
+
+The `advanced` profile sets exactly four keys — `require_checkpoint_first:
+false`, `checkpoint_format: minimal`, `anti_patterns_enabled: false`,
+`framework_verbosity: lean` — and can set nothing else (`ALLOWED_KNOBS` in
+`long_exposure/model_profiles.py`). `framework_verbosity: lean` drops each
+stage's `<exit-gates>`, `<failure-modes>` and `<depth-calibration>` and adds
+one `<exit-gate-policy>` block so the transition rules still make sense
+without an enumerated gate list.
+
+`standard` sets nothing, so it can never override a knob you deliberately
+turned off in this file.
+
+**Resolution is per agent.** `agent_models` routes each role to its own
+model, and the profile is resolved from *that* model, so a Fable researcher
+can run the lean prompt while an Opus auditor in the same run keeps the full
+one. Measured saving on the shipped `staged` framework: ~1,950 tokens per
+advanced-profile agent turn.
+
+See `docs/soft-guidance.md` for what may and may not thin, and why.
+
 ---
 
 ## Score YAML (exploration-score.yaml)
