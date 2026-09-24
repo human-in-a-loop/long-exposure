@@ -88,6 +88,40 @@ loop:
     final_auditor: true
     final_reporter: true
     curator: true
+  # Researcher-planned cycle tails (opt-in). When enabled, the researcher
+  # may emit a <cycle_plan> block that shapes the REST of the cycle it has
+  # just opened — chaining workers, or omitting the auditor when there is
+  # nothing to audit. It cannot schedule itself (it has already run), so the
+  # plan replaces flow[1:] only.
+  #
+  # Built for models that the fixed researcher -> worker -> auditor flow
+  # over-audits. `enabled: false` (the default) keeps that fixed flow and a
+  # byte-identical researcher prompt.
+  #
+  # The harness enforces the bounds, so the model need not: at most
+  # max_worker_chain worker turns, at most one auditor, at most
+  # max_turns_per_cycle in total; an auditor turn is always moved last; and
+  # after audit_floor_cycles consecutive audit-free cycles an auditor is
+  # added regardless of the plan. A malformed block is ignored and the fixed
+  # flow runs.
+  #
+  # worker_may_request_audit covers the researcher's blind spot — it plans
+  # before seeing the work — by letting a worker emit [[REQUEST_AUDIT]] to
+  # pull the auditor back into the cycle. That also resets the audit floor
+  # and is logged, so a run that escalates every cycle shows up as a
+  # planning problem rather than being silently patched.
+  #
+  # allow_in_clones is false and should stay false: a clone with no auditor
+  # never emits [[BRANCH_COMPLETE]] and would burn to the 10h fan-out cap,
+  # and branches that ran different shapes are not comparable at the merge.
+  cycle_planning:
+    enabled: false
+    max_worker_chain: 3
+    max_turns_per_cycle: 4
+    audit_floor_cycles: 2
+    allow_in_clones: false
+    worker_may_request_audit: true
+
   # Budget gates, checked at every cycle boundary (like max_cycles). Cost is
   # the sum of provider-reported dollars (Claude `total_cost_usd`) plus
   # estimates from config.yaml `pricing:` for providers that report none.

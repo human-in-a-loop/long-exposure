@@ -40,6 +40,11 @@ in the log):
   - `memoir_archive_failed`        copying a changed memoir to memoir/history/ failed
   - `memoir_store_failed`          writing the memoir archive row to sessions.db failed
 
+  Researcher-planned cycle tails
+  - `cycle_plan_rejected`          a <cycle_plan> block failed validation; fixed flow used
+  - `cycle_plan_audit_forced`      audit floor reached; auditor added despite the plan
+  - `cycle_plan_audit_requested`   worker emitted [[REQUEST_AUDIT]]; auditor re-inserted
+
   Accounts, pool and rotation
   - `account_state_save_failed`     OSError on _save_account_state
   - `account_mismatch_drop`         clone session dropped (account changed)

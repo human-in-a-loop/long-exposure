@@ -191,6 +191,50 @@ cycle). Covered by `tests/test_failure_disposition.py`, which pins both of
 today's flows to their pre-refactor outcomes and both variable-tail bugs to
 their fixed ones.
 
+### 1.7a Implementation notes
+
+**Where the plan is applied.** `flow_this_cycle[1:] = planned_tail`, mutated
+in place while the `for` loop is iterating it — Python iterates the live
+list, so the remaining turns of that very cycle come from the plan. Three
+consequences that had to be handled:
+
+- **`flow_this_cycle = flow` was an alias**, not a copy. Rewriting the tail
+  would have edited the score's own `flow` list, and every later cycle would
+  have inherited one cycle's plan permanently. All three assignment sites now
+  build a fresh list.
+- **A rotation retry restarts the cycle from the researcher**, which emits a
+  fresh plan — so the fixed flow is snapshotted pre-cycle and restored on
+  retry, alongside the existing per-cycle rollbacks. Without that, the retry
+  would run the abandoned attempt's tail while the new researcher believed it
+  was planning it.
+- **Fan-out wins structurally.** The plan block sits *after* the fan-out
+  trigger, which `break`s out of the flow when it fires. Reaching the plan at
+  all means fan-out did not fire, so no precedence rule has to be remembered
+  and a fan-out cycle never logs a plan that will not run.
+
+**The audit-floor streak** counts consecutive *completed* cycles with no
+auditor, and persists in run state next to `low_output_streak` — a
+stop/resume must not hand the run a fresh licence to skip audits. A failed or
+rate-limited cycle does not count: it never got the chance to audit, and
+holding that against the run would force audits onto cycles that produced
+nothing.
+
+**Verified against the real cycle loop**, not just the parser: a planned
+chain runs four turns in one cycle; a plan that drops the auditor runs two;
+the floor fires on exactly the third audit-free cycle; `[[REQUEST_AUDIT]]`
+pulls the auditor back in while merely discussing the token does not; a
+chained worker's output accumulates under `## worker turn 2`; the score's
+flow survives two planned cycles; a clone ignores a plan block; a post-merge
+cycle has no planner and does not crash; and fan-out firing leaves the
+planned tail unrun.
+
+Two failure paths worth calling out, because they are exactly what Stage 1's
+refactor existed for and are now covered end to end: a worker failing as the
+**last** turn of a planned tail gets a failure marker rather than
+`FALLBACK_AUDIT` — pre-refactor it would have fabricated an audit the next
+cycle's researcher would read as real — and a worker failing mid-chain still
+lets the auditor run.
+
 ### 1.8 Config surface
 
 ```yaml
@@ -203,6 +247,9 @@ loop:
     allow_in_clones: false           # root-only, like the fan-out decision
     worker_may_request_audit: true   # [[REQUEST_AUDIT]]; honoured, resets the floor
 ```
+
+Shipped in the **score** (`exploration-score.yaml`, under `loop`) rather than
+config.yaml, because it shapes the flow rather than the models.
 
 Guidance is injected into the researcher only when `enabled` — same pattern as
 `fanout_guide` (`exploration.py:4119`), which is skipped for clones and

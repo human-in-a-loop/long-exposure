@@ -88,6 +88,7 @@ from long_exposure import telemetry
 from long_exposure import unified_pool
 from long_exposure import interactive_transport
 from long_exposure import agent_routing
+from long_exposure import cycle_plan as _cycle_plan
 from long_exposure import spend_limit as _spend_limit
 from long_exposure import startup_gate as _gate
 from auto_compact.db import init_db, store_session
@@ -729,6 +730,7 @@ def save_state(path: Path, cycle: int, results: dict, failures: dict,
                agent_context_tokens: dict | None = None,
                peak_cycle_output: int = 0,
                low_output_streak: int = 0,
+               audit_free_streak: int = 0,
                usage_basis: str | None = None,
                usage_totals: dict | None = None) -> None:
     """Persist run state atomically.
@@ -767,6 +769,10 @@ def save_state(path: Path, cycle: int, results: dict, failures: dict,
         # the relative low-output threshold and streak, deferring closure.
         "peak_cycle_output": peak_cycle_output,
         "low_output_streak": low_output_streak,
+        # Cycle-planning audit floor. Carried across resume for the same
+        # reason as low_output_streak: a stop/resume must not hand the run a
+        # fresh licence to skip audits.
+        "audit_free_streak": audit_free_streak,
         # Usage basis the calibration was measured on: "interactive" (chars/4
         # estimate of the final response only) or a headless provider name
         # (full-turn output_tokens). Resume resets peak/streak when this
@@ -4012,6 +4018,11 @@ def run_exploration(
     # so a stop/resume doesn't reset exhaustion progress (mirrors
     # _reanchor_emitted / agent_context_tokens handling above).
     low_output_streak = int(state.get("low_output_streak") or 0) if state else 0
+    # Consecutive COMPLETED cycles that ended without an auditor turn. Drives
+    # the cycle-planning audit floor, and restored from state so a
+    # stop/resume cannot reset the run's way back to an audit (mirrors
+    # low_output_streak above).
+    audit_free_streak = int(state.get("audit_free_streak") or 0) if state else 0
     topic_exhausted = False  # set True when low-output streak or agent signal triggers closure
     max_cycles_reached = False
     budget_exhausted = False  # set True when loop.max_cost_usd / max_tool_calls is hit
@@ -4217,6 +4228,10 @@ def run_exploration(
         cycle_output_tokens = 0  # track total output tokens for exhaustion detection
         cycle_forced_substantive = False  # post-merge/fan-out cycles never count as low-output
         agent_signaled_complete = False  # set when the auditor emits BRANCH_COMPLETE_SIGNAL
+        cycle_planned_by = None        # "researcher" when a <cycle_plan> shaped the tail
+        worker_turns_done = 0          # worker turns completed in this cycle
+        cycle_plan_forced_audit = False  # audit floor overrode the plan
+        cycle_audit_requested = False  # a worker emitted [[REQUEST_AUDIT]]
 
         # --- Post-merge mode ---
         # A cycle immediately after a fan-out runs worker-only (no researcher,
@@ -4253,9 +4268,13 @@ def run_exploration(
                 )
                 post_merge_pending = False
                 in_post_merge_cycle = False
-                flow_this_cycle = flow
+                flow_this_cycle = list(flow)
         else:
-            flow_this_cycle = flow
+            # A COPY, not an alias. Cycle planning rewrites this list's tail
+            # in place so the running `for` picks up the planned turns; with
+            # an alias that rewrite would edit the score's own `flow` and
+            # every later cycle would inherit one cycle's plan permanently.
+            flow_this_cycle = list(flow)
         telemetry.emit(
             "cycle_start",
             phase="cycle",
@@ -4265,6 +4284,7 @@ def run_exploration(
             status="started",
             data={
                 "flow": flow_this_cycle,
+                "planned_by": "fixed",  # rewritten by cycle_plan_applied
                 "post_merge_pending": post_merge_pending,
                 "in_post_merge_cycle": in_post_merge_cycle,
                 "is_clone": _is_clone(),
@@ -4285,6 +4305,17 @@ def run_exploration(
             None
             if (_is_clone() or in_post_merge_cycle or not fanout_enabled)
             else get_fanout_guidance()
+        )
+
+        # Cycle-planning guidance: same gating as the fan-out block, for the
+        # same reason — a clone never plans, and a post-merge cycle has no
+        # researcher to read it, so injecting it would be dead prompt weight.
+        _planning_active = (
+            _cycle_plan.enabled(loop_cfg, is_clone=_is_clone())
+            and not in_post_merge_cycle
+        )
+        cycle_plan_guide = (
+            _cycle_plan.guidance(loop_cfg) if _planning_active else None
         )
 
         # Sibling visibility: clones only, researcher-cycle only. Reads each
@@ -4378,6 +4409,7 @@ def run_exploration(
         _pre_cycle_consecutive_failures = dict(consecutive_failures)
         _pre_cycle_reanchor_emitted = dict(reanchor_emitted)
         _pre_cycle_agent_context_tokens = dict(agent_context_tokens)
+        _pre_cycle_flow = list(flow_this_cycle)
         while True:
             # Capture the account the flow is about to run under. If we
             # hit a 429, we pass this to rotate_to_next_account so peer
@@ -4434,6 +4466,21 @@ def run_exploration(
                         )
                 if parts:
                     agent_live_parts.append(base_live_guidance)
+                # Cycle-planning blocks are PER AGENT, unlike the shared
+                # guidance above: the planning contract only makes sense to
+                # the researcher, and the escalation token only to the
+                # worker. Injecting either into the other role would be dead
+                # weight at best and an invitation to emit a block the
+                # parser rejects at worst.
+                if _planning_active:
+                    if agent_name == "researcher" and cycle_plan_guide:
+                        agent_live_parts.append(cycle_plan_guide)
+                    elif agent_name == "worker" and _cycle_plan.settings(
+                        loop_cfg
+                    ).get("worker_may_request_audit"):
+                        agent_live_parts.append(
+                            _cycle_plan.worker_escalation_guidance()
+                        )
                 results["live_guidance"] = (
                     "\n\n".join(agent_live_parts)
                     if agent_live_parts
@@ -4511,7 +4558,31 @@ def run_exploration(
                 dur = result.get("duration_ms", 0) / 1000
 
                 if result["status"] == "ok":
-                    results.update(result["outputs"])
+                    # Worker chaining: turn 2+ of a planned chain must ADD to
+                    # what turn 1 produced, not replace it. Without this the
+                    # auditor would see only the last turn and the earlier
+                    # work would vanish from the cycle's record. Turns are
+                    # delimited so the auditor can tell them apart, and the
+                    # same worker session is resumed (agent_sessions), so
+                    # turn 2 continues the conversation rather than
+                    # restarting cold — no new input plumbing needed.
+                    if (
+                        cycle_planned_by
+                        and agent_name == "worker"
+                        and worker_turns_done
+                    ):
+                        for _out_name, _out_text in result["outputs"].items():
+                            _prior = results.get(_out_name) or ""
+                            results[_out_name] = (
+                                f"{_prior}\n\n"
+                                f"## worker turn {worker_turns_done + 1}\n\n"
+                                f"{_out_text}"
+                                if _prior else _out_text
+                            )
+                    else:
+                        results.update(result["outputs"])
+                    if agent_name == "worker":
+                        worker_turns_done += 1
                     consecutive_failures[agent_name] = 0
 
                     # Archive the memoir if the auditor changed it. Root only:
@@ -4617,6 +4688,28 @@ def run_exploration(
                                 flush=True,
                             )
                             break
+
+                    # --- Audit escalation (worker only) ---
+                    # The researcher plans before seeing this cycle's work,
+                    # so the worker is the only role that can observe a
+                    # reason to audit. Honouring it here re-inserts the
+                    # auditor into the remaining flow of THIS cycle.
+                    if (
+                        agent_name == "worker"
+                        and _planning_active
+                        and cycle_planned_by
+                        and _cycle_plan.settings(loop_cfg).get(
+                            "worker_may_request_audit"
+                        )
+                        and _cycle_plan.wants_audit(results.get("work_output"))
+                    ):
+                        _before_len = len(flow_this_cycle)
+                        _escalated = _cycle_plan.insert_requested_audit(
+                            flow_this_cycle, i
+                        )
+                        if len(_escalated) != _before_len:
+                            flow_this_cycle[:] = _escalated
+                            cycle_audit_requested = True
 
                     # --- Fan-out trigger (researcher only, root only) ---
                     # Parser no-ops for clones; the _is_clone() short-circuit
@@ -4752,6 +4845,61 @@ def run_exploration(
                                 flush=True,
                             )
                             break
+
+                    # --- Cycle plan (researcher only) ---
+                    # Applied by rewriting the TAIL of flow_this_cycle in
+                    # place. Python iterates the live list, so the remaining
+                    # turns of this very cycle come from the plan. Index 0 is
+                    # never touched: the researcher has already run, which is
+                    # what removes the self-scheduling paradox.
+                    #
+                    # Placed AFTER the fan-out trigger deliberately. Fan-out
+                    # already replaces worker and auditor and `break`s out of
+                    # the flow, so reaching this point at all means fan-out
+                    # did not fire — "fan-out wins" is structural rather than
+                    # a precedence rule someone has to remember, and a
+                    # fan-out cycle never logs a plan that will not run.
+                    if agent_name == "researcher" and _planning_active:
+                        _planned_tail = _cycle_plan.parse(
+                            results.get("research_brief", ""),
+                            loop_cfg,
+                            agents.keys(),
+                            is_clone=_is_clone(),
+                        )
+                        if _planned_tail:
+                            _new_flow, _planned, _forced = _cycle_plan.build_flow(
+                                _planned_tail,
+                                flow_this_cycle,
+                                loop_cfg,
+                                audit_free_streak,
+                            )
+                            flow_this_cycle[1:] = _new_flow[1:]
+                            cycle_planned_by = "researcher"
+                            cycle_plan_forced_audit = _forced
+                            _why = _cycle_plan.rationale(
+                                results.get("research_brief", "")
+                            )
+                            print(
+                                "[long-exposure] cycle_plan: "
+                                f"{' -> '.join(flow_this_cycle)}"
+                                + (f" — {_why[:160]}" if _why else ""),
+                                flush=True,
+                            )
+                            telemetry.emit(
+                                "cycle_plan_applied",
+                                phase="cycle",
+                                cycle=cycle,
+                                agent=agent_name,
+                                provider=config.get("llm_provider"),
+                                model=config.get("model"),
+                                status="ok",
+                                data={
+                                    "flow": list(flow_this_cycle),
+                                    "audit_forced": _forced,
+                                    "audit_free_streak": audit_free_streak,
+                                    "rationale": _why[:500],
+                                },
+                            )
                 else:
                     # --- Failure handling ---
                     consecutive_failures[agent_name] += 1
@@ -4956,6 +5104,15 @@ def run_exploration(
             cycle_forced_substantive = False
             agent_signaled_complete = False
             cycle_ok = True
+            # Restore the FIXED flow. A rotation restarts the cycle from the
+            # researcher, which will emit a fresh plan; without this reset
+            # the retry would run the abandoned attempt's tail while the new
+            # researcher turn believed it was planning it.
+            flow_this_cycle[:] = _pre_cycle_flow
+            cycle_planned_by = None
+            worker_turns_done = 0
+            cycle_plan_forced_audit = False
+            cycle_audit_requested = False
             # Restore pre-cycle snapshots: `results` mutations from the
             # abandoned attempt, the `last_session_id` parent pointer, and
             # per-agent failure streaks. Without this the retry would see
@@ -4985,6 +5142,19 @@ def run_exploration(
             break
 
         # --- End of cycle bookkeeping ---
+        # Audit-floor streak. Counts CONSECUTIVE COMPLETED cycles that ended
+        # without an auditor, so a floor of 2 permits two audit-free cycles
+        # and forces one onto the third. A failed or rate-limited cycle is
+        # not counted — it did not get the chance to audit, and holding that
+        # against the run would force audits onto cycles that produced
+        # nothing. An honoured [[REQUEST_AUDIT]] resets it like any other
+        # audited cycle, because an auditor did in fact run.
+        if cycle_ok:
+            if "auditor" in flow_this_cycle:
+                audit_free_streak = 0
+            else:
+                audit_free_streak += 1
+
         cycles_since_last_report += 1
 
         if _stop_requested:
@@ -5063,6 +5233,7 @@ def run_exploration(
                    agent_context_tokens=agent_context_tokens,
                    peak_cycle_output=peak_cycle_output,
                    low_output_streak=low_output_streak,
+                   audit_free_streak=audit_free_streak,
                    usage_basis=_usage_basis_arg)
 
         elapsed = time.monotonic() - cycle_start
@@ -5349,6 +5520,7 @@ def run_exploration(
                    agent_context_tokens=agent_context_tokens,
                    peak_cycle_output=peak_cycle_output,
                    low_output_streak=low_output_streak,
+                   audit_free_streak=audit_free_streak,
                    usage_basis=_usage_basis_arg)
 
         # Clone exit path: skip final_reporter and curator. Run reporter
@@ -5548,6 +5720,7 @@ def run_exploration(
                    agent_context_tokens=agent_context_tokens,
                    peak_cycle_output=peak_cycle_output,
                    low_output_streak=low_output_streak,
+                   audit_free_streak=audit_free_streak,
                    usage_basis=_usage_basis_arg)
         final_status = (
             "killed_spend_limit" if spend_limit_killed

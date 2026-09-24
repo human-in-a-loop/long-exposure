@@ -833,6 +833,113 @@ separate integration point; durable memory remains available through
 
 ---
 
+## `loop.cycle_planning` (opt-in) — researcher-planned cycle tails
+
+Lives in the **score** (`exploration-score.yaml`), under `loop`, because it
+shapes the flow rather than the models.
+
+```yaml
+loop:
+  cycle_planning:
+    enabled: false
+    max_worker_chain: 3
+    max_turns_per_cycle: 4
+    audit_floor_cycles: 2
+    allow_in_clones: false
+    worker_may_request_audit: true
+```
+
+When enabled, the researcher may emit a `<cycle_plan>` block that shapes the
+**rest of the cycle it has just opened** — chaining workers, or omitting the
+auditor when there is nothing to audit. It cannot schedule itself (it has
+already run), so the plan replaces `flow[1:]` only. That framing is what
+removes the self-scheduling paradox, and it means the plan governs the very
+next turn rather than the next cycle.
+
+```xml
+<cycle_plan>
+  <turn agent="worker">Build the sweep harness and run the N=64 grid.</turn>
+  <turn agent="worker">Fit the scaling exponent to the grid output.</turn>
+  <turn agent="auditor">Check the fit's residuals against the claim.</turn>
+  <rationale>The fit depends on the grid completing.</rationale>
+</cycle_plan>
+```
+
+`<rationale>` is required and recorded — it is what makes a skipped audit
+reviewable afterwards — but it is not parsed for meaning.
+
+### Validation
+
+Same posture as `<parallel_cycle_fanout>`: reject the whole block on any
+violation, log a reason, fall back to the fixed flow, never raise.
+
+| Rule | On violation |
+|---|---|
+| Every `agent` must be a key of `score.agents` | reject |
+| `researcher` is not permitted (it has already run) | reject |
+| At most `max_worker_chain` worker turns | reject (not truncate — truncating would run a plan the researcher did not write) |
+| At most one `auditor` turn | reject |
+| At most `max_turns_per_cycle` turns | reject |
+| An `auditor` turn not last | **moved last** (an audit before its work is a formatting slip, not a bad plan) |
+| Block absent, empty or malformed | fixed flow, no health event for "absent" |
+
+A rejection emits the `cycle_plan_rejected` health event.
+
+### Bounds the agent cannot waive
+
+- **`audit_floor_cycles`** — the maximum consecutive *completed* cycles that
+  may end without an auditor. At the floor, an auditor is appended
+  regardless of the plan (`cycle_plan_audit_forced`). This bounds the
+  researcher's self-interest — it is the role whose brief the auditor checks
+  — and keeps `[[BRANCH_COMPLETE]]` reachable, since only the auditor emits
+  it. The streak persists into run state, so a stop/resume cannot hand the
+  run a fresh licence to skip audits. A failed or rate-limited cycle does not
+  count toward the streak: it never got the chance to audit.
+- **`max_worker_chain`** — prevents a plan turning a cycle into an unbounded
+  worker loop that would starve the memoir, the reporter cadence and the
+  exhaustion detector.
+
+### The researcher's blind spot, and who covers it
+
+The researcher plans *before* seeing this cycle's work, so it predicts
+whether an audit will be needed rather than observing it. The worker covers
+that: with `worker_may_request_audit`, a worker that hits something
+surprising emits `[[REQUEST_AUDIT]]` on a line of its own and the auditor is
+re-inserted into the cycle, the audit-floor streak resets, and
+`cycle_plan_audit_requested` is logged. The event matters as much as the fix
+— a run escalating every cycle is telling you the planning is wrong, not
+that the work is surprising. Like `[[BRANCH_COMPLETE]]`, the token is matched
+anchored to its own line, so a worker merely *discussing* it does not trigger
+it.
+
+### Fan-out wins
+
+A fan-out already replaces worker and auditor for its cycle. The plan is
+applied *after* the fan-out trigger in the cycle loop, and fan-out `break`s
+out of the flow when it fires — so "fan-out wins" is structural rather than a
+precedence rule, and a fan-out cycle never logs a plan that will not run.
+
+### Root only
+
+`allow_in_clones` is `false` and should stay so. A clone with no auditor
+never emits `[[BRANCH_COMPLETE]]` and would burn to the 10 h
+`FANOUT_CAP_SECONDS` wall with nothing to show; and branches that ran
+different shapes are not comparable, which is what would make the merge's
+divergence table meaningless.
+
+### Worker chaining
+
+Turn *k>1* of a chain resumes the same worker session (`agent_sessions`), so
+it continues the conversation rather than restarting cold — no new input
+plumbing. Its output is **appended** under a `## worker turn k` header rather
+than replacing the previous turn, so the auditor sees the whole chain.
+
+One thing to watch on a first live run: the exhaustion detector's low-output
+floor is relative to the run's own peak cycle output, and chaining raises
+that peak — making the floor stricter for later single-turn cycles.
+
+---
+
 ## Effort levels and budget pressure
 
 Two independent axes that influence model behaviour.
