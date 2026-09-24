@@ -114,6 +114,36 @@ memoir:
   max_tokens: 3000   # global cap enforced at injection (chars/4 estimate)
 depth_compression: gentle
 
+# === Total spend limit (opt-in) ===
+# ONE total limit for the whole run, expressed as a percentage of a weekly
+# allowance you declare. There are no per-agent, per-cycle or per-clone
+# sub-budgets — the run spends freely against the total until it is gone.
+#
+# HONESTY NOTE: the harness cannot read real subscription usage. The `claude`
+# CLI has no `usage` subcommand, `/usage` is interactive-only, and the `-p`
+# envelope carries only total_cost_usd, token counts and num_turns. So
+# `weekly_allowance_usd` is a number YOU declare, in API-equivalent dollars,
+# and every surface that shows the cap says so. It is a proxy, not a meter
+# reading.
+#
+# The delta semantics come for free: the ledger totals only this run's spend,
+# so a cap measured from run start is already a delta on top of whatever you
+# used before it — no need to know where you stand this week.
+#
+# Reaching the limit KILLS the run; it does not stop it gracefully. Clone
+# process groups are swept, the end-of-run pipeline (final auditor, final
+# reporter, curator) is SKIPPED, output/killed_spend_limit.json is written,
+# and the process exits 3. State is still saved, so raising the limit and
+# resuming works.
+#
+# Optional: `enabled: false`, `run_pct: 0`, or `weekly_allowance_usd: 0` all
+# mean unlimited. Distinct from loop.max_cost_usd in the score, which is a
+# graceful natural end-of-run and still runs the final stages.
+usage_allowance:
+  enabled: false
+  weekly_allowance_usd: 0    # operator-declared, API-equivalent dollars
+  run_pct: 0                 # 1-100; this run's delta against that allowance
+
 # === Fan-out merge synthesis (Stage 2) ===
 # When a parallel_cycle_fanout collapses with >= this many branches, the
 # reporter agent is reused at the merge boundary to compress N raw

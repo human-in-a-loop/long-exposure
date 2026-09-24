@@ -88,6 +88,7 @@ from long_exposure import telemetry
 from long_exposure import unified_pool
 from long_exposure import interactive_transport
 from long_exposure import agent_routing
+from long_exposure import spend_limit as _spend_limit
 from auto_compact.db import init_db, store_session
 from long_exposure import usage_ledger as _usage_ledger_mod
 from long_exposure.conductor import _session_turn_tool_calls
@@ -102,6 +103,32 @@ from long_exposure.conductor import _session_turn_tool_calls
 _usage: _usage_ledger_mod.UsageLedger = _usage_ledger_mod.UsageLedger()
 # The active score's `loop:` block, kept for status rendering (budget caps).
 _current_loop_cfg: dict = {}
+# The run's config, for the deterministic status writer. update_status_file
+# is also called from paths that have no config in scope (the manager poller,
+# the crash handlers), so it reads this the same way it reads
+# _current_loop_cfg. Set once in run_exploration; empty means "no run
+# configured", which the spend-limit block treats as disabled.
+_current_run_config: dict = {}
+
+
+class SpendLimitKill(RuntimeError):
+    """Raised by run_exploration when the total spend limit killed the run.
+
+    A distinct type rather than a return value so no intermediate `return`
+    on the way out of the cycle loop can swallow it. Callers translate it
+    into a non-zero exit code (see cli._launch, _cmd_start, _cmd_resume).
+    """
+
+    EXIT_CODE = 3
+
+    def __init__(self, trip: dict, marker=None):
+        self.trip = dict(trip or {})
+        self.marker = marker
+        cap = self.trip.get("cap_usd") or 0.0
+        observed = self.trip.get("observed_usd") or 0.0
+        super().__init__(
+            f"total spend limit reached: ${observed:,.2f} of a ${cap:,.2f} cap"
+        )
 
 
 def _env_flag(name: str) -> bool | None:
@@ -194,6 +221,24 @@ def _record_usage(
         )
         result["cost_estimated_usd"] = added["cost_estimated_usd"] or None
         result["cost_source"] = added["cost_source"]
+        # Total spend limit: check wherever spend is recorded, not at the
+        # next cycle boundary. This is what makes the limit a kill rather
+        # than the graceful `loop.max_cost_usd` stop. Root only — a clone
+        # sees its own spend, never the run total, so it would both
+        # self-kill after spending the whole cap alone and fail to notice
+        # three clones at 40% each (docs: spend_limit module docstring).
+        if not _is_clone():
+            # Read the RUN config, not the per-agent `config` argument. The
+            # limit is a run-global property, and a per-agent
+            # `usage_allowance` override would be precisely the sub-budget
+            # this feature rules out. Reading one source also means a future
+            # _record_usage call site that passes a narrower config cannot
+            # silently disable enforcement.
+            _spend_limit.check(
+                _usage.total_cost_usd(),
+                _current_run_config,
+                source=f"agent:{agent_name}",
+            )
         # One event per recorded call, from every site (cycle agents,
         # out-of-cycle agents, compaction), so `telemetry summarize` can
         # total cost over the same set of calls the ledger sees.
@@ -2325,6 +2370,14 @@ def update_status_file(output_dir: Path, cycle: int, status: str,
         if usage_md is None:
             try:
                 usage_md = _usage.render_markdown(loop_cfg=_current_loop_cfg)
+                # Total spend limit block, with its proxy disclaimer. Empty
+                # string when the feature is off, so a run that does not use
+                # it sees an unchanged status file.
+                _spend_md = _spend_limit.summary_lines(
+                    _current_run_config, _usage.total_cost_usd(),
+                )
+                if _spend_md:
+                    usage_md = f"{usage_md}\n\n{_spend_md}" if usage_md else _spend_md
             except Exception:
                 usage_md = ""
 
@@ -3571,8 +3624,9 @@ def run_exploration(
     conn = init_db(Path(config["compact_db"]))
 
     loop_cfg = score.get("loop", {})
-    global _current_loop_cfg
+    global _current_loop_cfg, _current_run_config
     _current_loop_cfg = loop_cfg
+    _current_run_config = config
     max_cycles = loop_cfg.get("max_cycles")
     base_cooldown = loop_cfg.get("cycle_cooldown_seconds", 0)
     fanout_enabled = _fanout_enabled(loop_cfg)
@@ -3911,6 +3965,18 @@ def run_exploration(
     topic_exhausted = False  # set True when low-output streak or agent signal triggers closure
     max_cycles_reached = False
     budget_exhausted = False  # set True when loop.max_cost_usd / max_tool_calls is hit
+    # Total spend limit (usage_allowance). Distinct from budget_exhausted:
+    # that one is a NATURAL end-of-run and still runs the end-of-run
+    # pipeline; this one KILLS the run and skips it. Root only.
+    spend_limit_killed = False
+    if not _is_clone():
+        _spend_limit.reset()
+        _spend_cap = _spend_limit.cap_usd(config)
+        if _spend_cap is not None:
+            print(
+                f"[long-exposure] Spend limit: {_spend_limit.describe(config)}",
+                flush=True,
+            )
     # Low-output backstop is RELATIVE to the run's own peak cycle output, so it
     # self-calibrates to each branch's structured-output floor instead of a
     # fixed magic number. (A fixed 2000-tok floor failed: idle-but-verbose
@@ -4081,6 +4147,18 @@ def run_exploration(
             print(f"\n[long-exposure] Stopping: {_budget_reason}.", flush=True)
             budget_exhausted = True
             break
+
+        # Total spend limit — a KILL, not a natural end. The tripwire is set
+        # wherever spend is recorded, so this boundary check is the backstop
+        # for spend recorded outside an agent turn (compaction, out-of-cycle
+        # agents) rather than the primary detector.
+        if not _is_clone():
+            _spend_limit.check(
+                _usage.total_cost_usd(), config, source="cycle_boundary",
+            )
+            if _spend_limit.tripped():
+                spend_limit_killed = True
+                break
 
         cycle += 1
         cycle_start = time.monotonic()
@@ -4261,6 +4339,13 @@ def run_exploration(
 
             for i, agent_name in enumerate(flow_this_cycle):
                 if _stop_requested:
+                    break
+
+                # Total spend limit: the tripwire is set by _record_usage as
+                # soon as a turn's cost lands, so checking here stops the
+                # NEXT turn from starting. Without this the remaining agents
+                # in the tail would each spend past a limit already breached.
+                if _spend_limit.tripped():
                     break
 
                 # Check signals between agents
@@ -4841,6 +4926,14 @@ def run_exploration(
                 if entry.get("cycle") != cycle
             ]
 
+        # Total spend limit: leave the cycle loop. Placed after the
+        # rotation-retry block so a trip during a retried cycle is honoured
+        # too, and before the end-of-cycle bookkeeping so no reporter or
+        # daily-sync stage is scheduled on the way out.
+        if _spend_limit.tripped():
+            spend_limit_killed = True
+            break
+
         # --- End of cycle bookkeeping ---
         cycles_since_last_report += 1
 
@@ -5292,6 +5385,18 @@ def run_exploration(
                 stop_requested=operator_stop_requested,
                 clear_requested=operator_clear_requested,
             )
+            # A spend-limit kill overrides every other reason to run the
+            # end-of-run pipeline. Those three stages cost money, and
+            # spending past the cap to write a report about hitting the cap
+            # is incoherent. This is the one difference that makes the limit
+            # a kill rather than the graceful loop.max_cost_usd stop.
+            if spend_limit_killed:
+                should_run_final = False
+                print(
+                    "[long-exposure] End-of-run pipeline skipped: the total "
+                    "spend limit killed the run.",
+                    flush=True,
+                )
             for _stage in _END_OF_RUN_STAGES:
                 if should_run_final and agents.get(_stage) and not _end_of_run_enabled(loop_cfg, _stage):
                     print(
@@ -5395,7 +5500,8 @@ def run_exploration(
                    low_output_streak=low_output_streak,
                    usage_basis=_usage_basis_arg)
         final_status = (
-            "cleared" if _clear_requested
+            "killed_spend_limit" if spend_limit_killed
+            else "cleared" if _clear_requested
             else "completed" if (
                 "should_run_final" in locals() and should_run_final
             )
@@ -5419,6 +5525,8 @@ def run_exploration(
                 "budget_exhausted": (
                     budget_exhausted if "budget_exhausted" in locals() else False
                 ),
+                "spend_limit_killed": spend_limit_killed,
+                "spend_limit_trip": _spend_limit.tripped(),
                 "usage_totals": _usage.totals(),
                 "stop_requested": (
                     operator_stop_requested
@@ -5438,12 +5546,30 @@ def run_exploration(
                 flush=True,
             )
             print("[long-exposure] Final artifacts written.", flush=True)
+        elif spend_limit_killed:
+            print(
+                f"\n[long-exposure] KILLED after {cycle} cycles: total spend "
+                "limit reached.",
+                flush=True,
+            )
+            print("[long-exposure] State preserved. Raise the limit to resume.", flush=True)
         else:
             print(f"\n[long-exposure] Stopped after {cycle} cycles.", flush=True)
             print("[long-exposure] State preserved. Run again to resume.", flush=True)
 
     conn.close()
     print(f"[long-exposure] State: {state_path}", flush=True)
+
+    # Raised LAST, after state is saved, the status file is written and the
+    # DB is closed — a kill must not cost the run its resumability. A
+    # dedicated exception rather than a return value so no intermediate
+    # `return` on the way out can swallow it; callers map it to exit code 3.
+    if spend_limit_killed:
+        _trip = _spend_limit.tripped() or {}
+        _marker = _spend_limit.write_marker(output_dir, _trip, cycle=cycle)
+        if _marker:
+            print(f"[long-exposure] Spend-limit marker: {_marker}", flush=True)
+        raise SpendLimitKill(_trip, _marker)
 
 
 # ---------------------------------------------------------------------------
@@ -5614,14 +5740,23 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == "start":
-        _cmd_start(args)
-    elif args.command == "stop":
-        _cmd_stop(args)
-    elif args.command == "clear":
-        _cmd_clear(args)
-    elif args.command == "resume":
-        _cmd_resume(args)
+    try:
+        if args.command == "start":
+            _cmd_start(args)
+        elif args.command == "stop":
+            _cmd_stop(args)
+        elif args.command == "clear":
+            _cmd_clear(args)
+        elif args.command == "resume":
+            _cmd_resume(args)
+    except SpendLimitKill as kill:
+        # `python -m long_exposure.exploration` is a first-class entrypoint
+        # (it is what the fan-out clone spawn uses), so the kill has to
+        # surface as a status code here too and not as a traceback.
+        print(f"[long-exposure] {kill}", file=sys.stderr, flush=True)
+        if kill.marker:
+            print(f"[long-exposure] Marker: {kill.marker}", file=sys.stderr, flush=True)
+        raise SystemExit(SpendLimitKill.EXIT_CODE)
 
 
 # ---------------------------------------------------------------------------

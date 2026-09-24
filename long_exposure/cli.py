@@ -268,6 +268,13 @@ def _launch(args: argparse.Namespace) -> int:
             task_override=" ".join(args.task) if args.task else None,
             instance_dir=instance_dir,
         )
+    except exploration.SpendLimitKill as kill:
+        # A kill is a distinct outcome from a clean finish and from an
+        # operator stop, so it gets its own exit code for wrapper scripts.
+        print(f"[long-exposure] {kill}", file=sys.stderr)
+        if kill.marker:
+            print(f"[long-exposure] Marker: {kill.marker}", file=sys.stderr)
+        return exploration.SpendLimitKill.EXIT_CODE
     finally:
         stop_event.set()
         if manager_thread is not None:
@@ -484,17 +491,32 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_or_spend_kill(fn, args) -> int:
+    """Run a cycle-loop command, mapping a spend-limit kill to exit code 3.
+
+    `start` and `resume` are the entrypoints a cron job or the fan-out clone
+    spawn uses, so the kill has to surface as a status code there too — not
+    just under `launch`.
+    """
+    try:
+        fn(args)
+    except exploration.SpendLimitKill as kill:
+        print(f"[long-exposure] {kill}", file=sys.stderr)
+        if kill.marker:
+            print(f"[long-exposure] Marker: {kill.marker}", file=sys.stderr)
+        return exploration.SpendLimitKill.EXIT_CODE
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "launch":
         return _launch(args)
     if args.command == "start":
-        exploration._cmd_start(args)
-        return 0
+        return _run_or_spend_kill(exploration._cmd_start, args)
     if args.command == "resume":
-        exploration._cmd_resume(args)
-        return 0
+        return _run_or_spend_kill(exploration._cmd_resume, args)
     if args.command == "stop":
         exploration._cmd_stop(args)
         return 0

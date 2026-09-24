@@ -447,6 +447,68 @@ advanced-profile agent turn.
 
 See `docs/soft-guidance.md` for what may and may not thin, and why.
 
+### `usage_allowance` (opt-in) — one total spend limit
+
+**One** total limit for the whole run, as a percentage of a weekly allowance
+you declare. There are no per-agent, per-role, per-cycle or per-clone
+sub-budgets; the run spends freely against the total until it is gone.
+
+```yaml
+usage_allowance:
+  enabled: false
+  weekly_allowance_usd: 0    # operator-declared, API-equivalent dollars
+  run_pct: 0                 # 1-100; this run's delta against that allowance
+```
+
+Cap = `weekly_allowance_usd * run_pct / 100`. `enabled: false`, `run_pct: 0`
+and `weekly_allowance_usd: 0` all mean unlimited, which is the default;
+`run_pct` above 100 clamps to the allowance. Garbage values (a string, a
+negative, NaN, infinity) read as unlimited rather than raising.
+
+**The allowance is a declared proxy, not a meter reading.** The harness
+cannot read subscription usage: the `claude` CLI exposes no `usage`
+subcommand, `/usage` is interactive-only, and the `-p` envelope carries only
+`total_cost_usd`, token counts and `num_turns`. Every surface that shows the
+cap says so.
+
+The delta semantics you want come for free. The ledger totals only *this*
+run's spend, so a cap measured from run start is already a delta on top of
+whatever was used before it — you never need to know where you stand this
+week.
+
+#### It kills the run; it does not stop it
+
+This is the one place the feature deliberately does *not* reuse
+`loop.max_cost_usd` (below), which fires at the cycle boundary and ends the
+run as a natural end-of-run — final auditor, final reporter and curator all
+still run, and all still spend.
+
+| | `loop.max_cost_usd` | `usage_allowance` |
+|---|---|---|
+| When checked | cycle boundary | wherever spend is recorded, plus the fan-out barrier poll |
+| Overshoot | up to one cycle | up to one agent turn, or one barrier poll during fan-out |
+| End-of-run pipeline | **runs** | **skipped** |
+| Fan-out clones | invisible until barrier collapse | summed live from each clone's `output/usage_summary.json` |
+| Exit code | 0 | **3** |
+| Artifacts | normal | plus `output/killed_spend_limit.json` |
+| Status file | `completed` / `stopped` | `killed_spend_limit` |
+
+On a kill: the next agent turn does not start, clone process groups are
+SIGTERM/SIGKILL swept, the end-of-run pipeline is skipped, state is still
+saved (so raising the limit and resuming works), the marker is written, and
+the process exits 3 from `launch`, `start`, `resume` and
+`python -m long_exposure.exploration` alike.
+
+#### Enforcement lives at the root
+
+Fan-out clones never enforce the cap themselves. A clone sees only its own
+spend, so it would be wrong in both directions: it would self-kill after
+spending the whole cap alone, yet three clones at 40% each — 120% of the cap
+— would each stay under it. Instead the root's barrier poll sums its own
+ledger plus every live clone's incrementally written
+`output/usage_summary.json`, and a trip cascades the stop file to each
+running clone before the sweep.
+
 ---
 
 ## Score YAML (exploration-score.yaml)

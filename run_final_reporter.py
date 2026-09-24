@@ -162,10 +162,12 @@ def main():
     print(f"[run_final] Working dir: {config.get('working_directory')}")
 
     loop_cfg = score.get("loop", {}) or {}
-    # The status renderer and usage_summary.json read this module global for
-    # the budget figures; only run_exploration sets it, so without this the
-    # standalone pipeline wrote a status file with no budget line.
+    # The status renderer and usage_summary.json read these module globals
+    # for the budget and spend-limit figures; only run_exploration sets
+    # them, so without this the standalone pipeline wrote a status file with
+    # no budget line and no spend-limit block.
     _exploration._current_loop_cfg = loop_cfg
+    _exploration._current_run_config = config
 
     def _save():
         """Persist state, carrying forward every field this entrypoint does

@@ -522,6 +522,31 @@ figure CLI reference.
 
 ---
 
+## Spend visibility during a fan-out
+
+A clone's usage ledger merges into the root only at barrier collapse. For a
+total spend limit (`usage_allowance`, see configuration-reference.md) that is
+far too late: up to `FANOUT_MAX_BRANCHES` clones can each run for
+`FANOUT_CAP_SECONDS` (10 h) before the root learns what they spent.
+
+So the barrier poll reads it directly instead. Every process — root and
+clone alike — writes an incrementally updated `output/usage_summary.json` on
+each status write, so the root sums its own ledger plus each live clone's
+file and checks the single run total. Per-file failures degrade to zero and
+are never fatal: a clone that has not written a summary yet, or one caught
+mid-flush, must not be able to crash the root's poll. An under-read delays
+the kill by one poll; an exception would lose the run.
+
+On a trip the root writes `long-exposure.stop` into each running clone dir
+and then falls through to the existing post-barrier sweep, which SIGTERMs
+each clone's process group (10 s grace, then SIGKILL). Clones were spawned
+with `start_new_session=True`, so that takes their provider CLI subprocesses
+with them — without it, clones would outlive the root and keep spending past
+the limit that just killed it.
+
+Clones never enforce the cap themselves; see the "Enforcement lives at the
+root" note in configuration-reference.md for why.
+
 ## Code references
 
 - Parallel-cycle fan-out parser and gates: `long_exposure/fanout.py`

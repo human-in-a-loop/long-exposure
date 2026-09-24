@@ -472,6 +472,33 @@ Residual overshoot is bounded by the poll interval rather than by anything
 architectural, and gets stated plainly in the docs: the limit is enforced
 within one poll of being crossed, not to the dollar.
 
+**Implemented** in `long_exposure/spend_limit.py`, with three check sites:
+
+| Site | What it catches |
+|---|---|
+| `_record_usage` (`source=agent:<name>`) | the primary detector — fires as soon as a turn's cost lands, and the between-turns guard in the flow loop then stops the *next* turn starting |
+| cycle boundary (`source=cycle_boundary`) | spend recorded outside an agent turn — compaction, out-of-cycle agents |
+| fan-out barrier poll (`source=fanout_barrier`) | live clone spend, summed from each clone's `usage_summary.json` |
+
+Two things worth recording because they are easy to get wrong:
+
+- **The hook reads the RUN config, not the per-agent config** it is handed.
+  A per-agent `usage_allowance` override would be exactly the sub-budget
+  this feature rules out, and reading one source also means a future
+  `_record_usage` call site passing a narrower config cannot silently
+  disable enforcement.
+- **The raise happens last** — after `save_state`, after the status file,
+  after `conn.close()`. A kill must not cost the run its resumability.
+
+Verified end to end against the real cycle loop with a stubbed provider
+(`tests/test_spend_limit.py::KillPathIntegrationTests`): a $10 cap and a $25
+first turn stops after `researcher` alone, writes the marker, saves state,
+writes `killed_spend_limit` to the status file, and calls none of the three
+end-of-run stages — while a run under the cap finishes normally and a run
+with the feature off never trips at $10,000 a turn. Clone non-enforcement
+was checked by driving a real clone (`AGENT_FORK_ID` set) at $500/turn
+against a $1 cap: all three agents ran, nothing tripped, no marker.
+
 ### 4.5 Reporting
 
 `usage_summary.md` gains one line and one disclaimer:

@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from long_exposure import provider as _provider
+from long_exposure import spend_limit as _spend_limit
 from long_exposure import telemetry
 from long_exposure import unified_pool
 
@@ -1778,6 +1779,41 @@ def _run_fanout_conductor(
                         f"produce a merge report in the 120s grace window.\n"
                         f"Process group killed.\n"
                     )
+
+        # Total spend limit: the ONLY place the root can see clone spend
+        # while clones are alive. Clone ledgers merge into the root at
+        # barrier collapse, which is far too late — up to
+        # FANOUT_MAX_BRANCHES clones can each run for FANOUT_CAP_SECONDS
+        # (10h) unseen. Every process writes an incrementally updated
+        # output/usage_summary.json, so summing the live ones here gives the
+        # run total. A trip cascades the stop file to every running clone
+        # and then falls through to the sweep below, which SIGTERMs their
+        # process groups; the root's cycle loop sees the tripwire on return
+        # and kills the run.
+        if not _spend_limit.tripped():
+            # Late import: exploration imports this module, so the run's
+            # ledger instance (exploration._usage) can only be reached at
+            # call time without a cycle.
+            from long_exposure import exploration as _exploration
+
+            _clone_usd = _spend_limit.clone_spend_usd(clone_dirs)
+            if _spend_limit.check(
+                _exploration._usage.total_cost_usd(),
+                config,
+                source="fanout_barrier",
+                extra_usd=_clone_usd,
+            ):
+                print(
+                    "[long-exposure] Fan-out: spend limit reached "
+                    f"(clones ${_clone_usd:,.2f}); cascading stop to clones.",
+                    flush=True,
+                )
+                for k, cd in enumerate(clone_dirs):
+                    if outcomes[k]["state"] == "running":
+                        try:
+                            (cd / "long-exposure.stop").write_text("")
+                        except OSError:
+                            pass
 
         # Stage 9: graceful barrier preemption check. Runs AFTER the
         # per-clone state poll above (so we see the freshest outcomes —
