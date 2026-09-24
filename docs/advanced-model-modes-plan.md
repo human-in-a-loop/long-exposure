@@ -181,6 +181,16 @@ would be treated as an ordinary mid-flow failure. Both must be rewritten as
 variable flow is switched on. The three existing `agent_name == "auditor"`
 checks in the same region are already name-based and need no change.
 
+**Implemented.** `_failure_disposition(agent_name, flow_index)` in
+`exploration.py` returns one of `FAILURE_ABORT_CYCLE`,
+`FAILURE_AUDIT_FALLBACK`, `FAILURE_MARK_OUTPUTS`. Role name decides; the
+index is consulted only for the one case where it carries real meaning — the
+cycle's *first* agent failing means nothing upstream produced fresh input, so
+there is nothing for a later turn to act on (the post-merge worker-only
+cycle). Covered by `tests/test_failure_disposition.py`, which pins both of
+today's flows to their pre-refactor outcomes and both variable-tail bugs to
+their fixed ones.
+
 ### 1.8 Config surface
 
 ```yaml

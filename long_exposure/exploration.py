@@ -2390,6 +2390,43 @@ FALLBACK_AUDIT = (
 )
 
 
+# Failure dispositions returned by _failure_disposition below.
+FAILURE_ABORT_CYCLE = "abort_cycle"
+FAILURE_AUDIT_FALLBACK = "audit_fallback"
+FAILURE_MARK_OUTPUTS = "mark_outputs"
+
+
+def _failure_disposition(agent_name: str, flow_index: int) -> str:
+    """Classify an agent failure into a recovery action.
+
+    Name-based, not position-based. The cycle tail is variable once
+    `loop.cycle_planning` is on (the researcher can schedule a worker chain,
+    and can omit the auditor), so the last entry in `flow_this_cycle` is
+    often a worker and the auditor is not always last. Inferring the role
+    from flow position would hand a failed worker the audit fallback and
+    treat a failed non-final auditor as an ordinary mid-flow failure.
+
+    `flow_index` is still consulted for one genuine, non-proxy reason: if the
+    cycle's FIRST agent failed, nothing upstream produced fresh input this
+    cycle, so there is nothing for a later agent to act on. That is the case
+    on a post-merge worker-only cycle.
+
+    Returns:
+      FAILURE_ABORT_CYCLE    — skip the rest of the cycle.
+      FAILURE_AUDIT_FALLBACK — store FALLBACK_AUDIT so the next cycle's
+                               researcher still has an audit_report input.
+      FAILURE_MARK_OUTPUTS   — write a failure marker into this agent's
+                               declared outputs and continue the flow.
+    """
+    if agent_name == "researcher":
+        return FAILURE_ABORT_CYCLE
+    if agent_name == "auditor":
+        return FAILURE_AUDIT_FALLBACK
+    if flow_index == 0:
+        return FAILURE_ABORT_CYCLE
+    return FAILURE_MARK_OUTPUTS
+
+
 # ---------------------------------------------------------------------------
 # Reporter agent
 # ---------------------------------------------------------------------------
@@ -4595,14 +4632,16 @@ def run_exploration(
                         flush=True,
                     )
 
-                    if i == 0:
-                        # Research failed — skip entire cycle
+                    disposition = _failure_disposition(agent_name, i)
+                    if disposition == FAILURE_ABORT_CYCLE:
+                        # No fresh upstream input exists for anything after
+                        # this agent — skip the rest of the cycle.
                         print(
                             "[long-exposure]   Skipping rest of cycle.",
                             flush=True,
                         )
                         break
-                    elif i == len(flow_this_cycle) - 1:
+                    elif disposition == FAILURE_AUDIT_FALLBACK:
                         # Audit failed — use fallback and store it
                         results["audit_report"] = FALLBACK_AUDIT
                         last_session_id = _store_agent_output(
@@ -4614,7 +4653,8 @@ def run_exploration(
                             "session_id": last_session_id,
                         })
                     else:
-                        # Middle agent failed — pass failure marker
+                        # Any other agent (worker) failed — pass a failure
+                        # marker through its declared outputs.
                         for out_name in agent_def.get("outputs", []):
                             results[out_name] = (
                                 f"[AGENT FAILED: {agent_name}] {err}\n\n"
