@@ -23,6 +23,7 @@ from long_exposure.manager import (
     run_manager_poll,
 )
 from long_exposure.orchestrator import load_config, resolve_instance_dir
+from long_exposure import startup_gate as _gate
 from long_exposure.tools.setup_env import doctor_main
 
 
@@ -241,6 +242,50 @@ def _launch(args: argparse.Namespace) -> int:
     state_path = _state_path(args.state, instance_dir)
     output_dir = _output_dir(args.output, instance_dir)
     config = load_config(Path(args.config) if args.config else None)
+
+    # --- Startup gate (launch only) ---
+    # Answers are PERSISTED rather than passed in memory, because
+    # run_exploration reloads the config from disk. Persisting also gives
+    # `resume` the answers for free: it never re-asks, and a crash-restart
+    # keeps the model and caps the operator chose.
+    if _gate.enabled(config) and not args.no_gate:
+        try:
+            answers = _gate.ask(
+                config,
+                flags={
+                    "model": args.gate_model,
+                    "workspace": args.gate_workspace,
+                    "resume": (
+                        _gate.FRESH
+                        if (args.gate_resume or "").strip().lower() == "fresh"
+                        else args.gate_resume
+                    ),
+                    "usage_run_pct": args.gate_usage_pct,
+                },
+            )
+        except _gate.GateAbort as abort:
+            print(f"[long-exposure] Startup gate: {abort}", file=sys.stderr)
+            return _gate.GateAbort.EXIT_CODE
+
+        # Q3: resuming an existing run redirects the state file, and with it
+        # the instance dir and output dir, so the run continues where it was
+        # rather than starting a second run beside it.
+        chosen = answers.get("resume")
+        if chosen and chosen != _gate.FRESH:
+            state_path = Path(chosen)
+            if not args.instance_dir and not args.state:
+                instance_dir = state_path.parent
+                output_dir = _output_dir(args.output, instance_dir)
+
+        summary = _gate.apply_answers(config, answers)
+        saved = _gate.save_answers(
+            _gate.answers_path(instance_dir, state_path), answers,
+        )
+        _gate.print_summary(config, answers, summary)
+        if saved:
+            print(f"\n[gate] Answers persisted: {saved}")
+            print("[gate] `resume` will reuse them without re-asking.")
+
     print("[long-exposure] launch")
     print(f"  provider: {config.get('llm_provider')}")
     print(f"  working_directory: {config.get('working_directory')}")
@@ -424,6 +469,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument("--force-agent", action="store_true")
     p_launch.add_argument("--no-agent", action="store_true")
     p_launch.add_argument("--allow-pause-signal", action="store_true")
+    # Startup gate (startup_gate.enabled). --no-gate skips it entirely; each
+    # --gate-* flag pre-answers one question so a fully-flagged launch is
+    # headless (cron, CI, the benchmark adapter).
+    p_launch.add_argument("--no-gate", action="store_true",
+                          help="Skip the startup gate even when enabled")
+    p_launch.add_argument("--gate-model", default=None,
+                          help="Gate Q1 answer: model id for this run")
+    p_launch.add_argument("--gate-workspace", default=None,
+                          help="Gate Q2 answer: workspace directory")
+    p_launch.add_argument("--gate-resume", default=None,
+                          help="Gate Q3 answer: a state file path, or 'fresh'")
+    p_launch.add_argument("--gate-usage-pct", type=float, default=None,
+                          help="Gate Q4 answer: percent of the declared weekly allowance")
 
     p_start = sub.add_parser("start", help="Start exploration")
     p_start.add_argument("task", nargs="*")

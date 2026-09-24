@@ -89,6 +89,7 @@ from long_exposure import unified_pool
 from long_exposure import interactive_transport
 from long_exposure import agent_routing
 from long_exposure import spend_limit as _spend_limit
+from long_exposure import startup_gate as _gate
 from auto_compact.db import init_db, store_session
 from long_exposure import usage_ledger as _usage_ledger_mod
 from long_exposure.conductor import _session_turn_tool_calls
@@ -3473,6 +3474,32 @@ def run_exploration(
     score = load_exploration_score(score_path)
     config = load_config(config_path)
 
+    # Startup-gate answers, if a `launch` gate persisted any for this run.
+    # Read here rather than passed in memory because load_config above would
+    # have discarded an in-memory overlay — and reading gives `resume` the
+    # answers for free, which is the whole reason the gate never re-asks.
+    # Clones inherit their root's file through the shared instance layout, so
+    # a fan-out branch runs the model the operator actually chose.
+    # `state_path` is resolved properly further down, but the answers file
+    # sits beside it and the model answer has to be applied BEFORE
+    # apply_agent_models merges agent_models onto the score. _resolve_state_path
+    # is pure, so resolving it twice is safe and keeps both orderings correct.
+    _gate_state_path = (
+        Path(state_path) if state_path is not None
+        else _resolve_state_path(None, instance_dir)
+    )
+    _gate_answers = _gate.load_answers(
+        _gate.answers_path(instance_dir, _gate_state_path)
+    )
+    if _gate_answers:
+        _gate_applied = _gate.apply_answers(config, _gate_answers)
+        print(
+            "[long-exposure] Startup-gate answers applied: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(_gate_applied.items())
+                        if k != "roles_rewritten"),
+            flush=True,
+        )
+
     # Centralized per-agent LLM routing (config.yaml `agent_models`). Merge the
     # provider/model/effort template onto each score agent_def BEFORE the
     # provider is configured, so a heterogeneous template is visible to the
@@ -3818,6 +3845,29 @@ def run_exploration(
     if not run_id:
         run_id = derive_run_id()
     telemetry.configure(config, data_dir, run_id)
+    # Register the run so a later startup gate can offer to resume it. The
+    # registry is the gate's primary run list (an instances-root scan is the
+    # fallback for runs that predate it). Clones are excluded inside
+    # register_run: a fork is not a resumable run. Best-effort by design —
+    # a registry problem must never stop a run from starting.
+    _gate.register_run(
+        config,
+        run_id=run_id,
+        instance_dir=instance_dir,
+        state_path=state_path,
+        task=task,
+    )
+    # Provenance: a copy of the gate answers beside the run's artifacts, so
+    # a report (or a benchmark appendix) can state the exact model, workspace
+    # and caps the run actually used rather than what config.yaml says now.
+    if _gate_answers:
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / _gate.ANSWERS_FILENAME).write_text(
+                json.dumps(_gate_answers, indent=2, sort_keys=True) + "\n"
+            )
+        except OSError as _e:
+            print(f"[long-exposure] Gate-answer provenance copy skipped: {_e}", flush=True)
     # The final auditor/reporter/curator read run_id from `results` (ledger
     # cycle counts and reconciliation uuid5 event-ids are keyed on it). It is
     # not an agent input, so it never reaches a prompt; persisting it inside

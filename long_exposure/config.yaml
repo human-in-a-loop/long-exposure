@@ -215,6 +215,39 @@ model_profiles:
     advanced: [fable, astra] # case-insensitive substring match on the model id
   overrides: {}              # e.g. {anti_patterns_enabled: true} to re-add one
 
+# === Startup gate (opt-in) ===
+# Four questions asked ONCE, before a run begins, so the expensive choices
+# are made deliberately instead of inherited from whatever this file says.
+#   Q1 model     Q2 workspace     Q3 resume-or-fresh     Q4 spend limit
+# Q4 appears only when usage_allowance.enabled is true.
+#
+# `launch` ONLY. `start`, `resume` and `python -m long_exposure.exploration`
+# stay non-interactive, which is what keeps cron jobs, the fan-out clone
+# spawn and the benchmark adapter working — a clone that stopped to ask a
+# human which model to use would hang the barrier until the 10h cap.
+#
+# Answers persist to <instance_dir>/gate_answers.json and are re-applied on
+# resume, so the gate never asks twice. A copy lands in the run's output/ for
+# provenance. `launch --no-gate` skips it; --gate-model / --gate-workspace /
+# --gate-resume / --gate-usage-pct pre-answer individual questions, so a
+# fully-flagged launch is headless. A non-TTY with an unanswered question
+# exits 4 and names the missing flag rather than guessing.
+#
+# Q1 rewrites the global `model` AND every agent_models entry still on the
+# old global default, then prints the resulting routing table — the shipped
+# config pins all eight roles, so setting `model` alone would change nothing,
+# while overwriting all eight would destroy a deliberate heterogeneous
+# routing (a Codex worker, a Sonnet reporter).
+#
+# Q3 lists runs from an append-only registry, falling back to a scan of
+# instances_root for runs that predate it.
+startup_gate:
+  enabled: false
+  model_choices: [opus, fable, sonnet]   # plus "other (type a value)"
+  instances_root: ./instances            # fallback enumeration source for Q3
+  registry_path: ~/.long-exposure/runs.jsonl
+  max_runs_listed: 10
+
 # === Permissions ===
 # Directory the agent can access (absolute path, scopes file tools).
 # File tools (Read, Write, Edit, Glob, Grep) are restricted to this path.

@@ -371,6 +371,24 @@ the gate is useful on day one against runs that predate the registry.
 
 ---
 
+### 3.4a Two bugs the tests caught
+
+Recording these because both were silent failures that only surface hours
+into a run:
+
+- **`--gate-resume` pointing at a vanished state file was accepted.** The
+  tombstone check ran only on the interactive menu branch. A flag naming a
+  deleted run would have been taken as a state path, and the run would have
+  started *fresh at that path* — silently losing the operator's intent to
+  resume, which is the worst possible outcome for that question. The check
+  now runs on both branches, and tests the path itself rather than the
+  listing, so a run absent from the registry but present on disk still
+  resumes.
+- **An out-of-range menu number was accepted as free text.** With
+  `allow_other=True`, typing `99` at Q1 fell through to the free-text branch
+  and became a model id. A mistyped number is a mistyped menu choice; it now
+  reprompts.
+
 ### 3.5 Config surface
 
 ```yaml
@@ -379,7 +397,15 @@ startup_gate:
   model_choices: [opus, fable, sonnet]   # plus "other (type an id)"
   instances_root: ./instances    # fallback enumeration source for Q3
   registry_path: ~/.long-exposure/runs.jsonl
+  max_runs_listed: 10
 ```
+
+**Implemented** in `long_exposure/startup_gate.py`. Verified end to end
+through the real CLI: a flagged `launch` answered all four questions
+headlessly, printed the routing table, persisted the answers, wrote the
+provenance copy, appended the registry and completed with exit 0 — and a
+subsequent `resume` with no TTY and no flags asked nothing while still
+applying the persisted model and the $200 spend limit.
 
 ---
 

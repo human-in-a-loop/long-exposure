@@ -509,6 +509,84 @@ ledger plus every live clone's incrementally written
 `output/usage_summary.json`, and a trip cascades the stop file to each
 running clone before the sweep.
 
+### `startup_gate` (opt-in)
+
+Four questions asked once, before a run begins, so the expensive choices are
+made deliberately rather than inherited from whatever this file happens to
+say.
+
+```yaml
+startup_gate:
+  enabled: false
+  model_choices: [opus, fable, sonnet]   # plus "other (type a value)"
+  instances_root: ./instances            # fallback enumeration source for Q3
+  registry_path: ~/.long-exposure/runs.jsonl
+  max_runs_listed: 10
+```
+
+| Q | Question | Flag |
+|---|---|---|
+| 1 | Which model should this run use? | `--gate-model` |
+| 2 | Which workspace directory? | `--gate-workspace` |
+| 3 | Resume a previous run, or start fresh? | `--gate-resume <state-path>\|fresh` |
+| 4 | What share of the declared weekly allowance? *(only when `usage_allowance.enabled`)* | `--gate-usage-pct` |
+
+**`launch` only.** `start`, `resume` and
+`python -m long_exposure.exploration` stay non-interactive. That is what
+keeps cron jobs, the fan-out clone spawn and the benchmark adapter working —
+a clone that stopped to ask a human which model to use would hang the
+barrier until the 10 h cap.
+
+**Answers persist and are re-applied.** They go to
+`<instance_dir>/gate_answers.json` and are read back by `run_exploration`,
+so `resume` never re-asks and a crash-restart keeps the model and caps that
+were chosen. A copy lands in the run's `output/` for provenance — that is
+what lets a report or a benchmark appendix state the model, workspace and
+caps the run *actually used* rather than what this file says now.
+
+**Headless when flagged.** `--no-gate` skips it entirely; each `--gate-*`
+flag pre-answers one question, so a fully-flagged `launch` never blocks. A
+non-TTY with an unanswered question exits **4** and names the missing flag
+rather than guessing: a wrong model is expensive to discover three hours in.
+
+#### What Q1 rewrites
+
+The shipped config pins all eight roles explicitly in `agent_models`, so
+setting the global `model` alone would change nothing about any actual agent
+turn — while overwriting all eight unconditionally would destroy a
+deliberate heterogeneous routing. So Q1 rewrites `model` **and** every
+`agent_models.*.model` that still equals the pre-gate global default,
+leaving a Codex worker or a Sonnet reporter untouched.
+
+Because that rule is subtle, the gate then prints the resulting table — role,
+provider, model, effort, and each role's resolved capability profile — before
+the run starts:
+
+```
+[gate] Resolved per-agent routing
+  role            provider  model                 effort  profile
+  --------------  --------  --------------------  ------  --------
+  researcher      claude    claude-fable-5-1      high    advanced
+  worker          codex     gpt-5.5               high    standard
+  ...
+```
+
+#### Where Q3's run list comes from
+
+There is no instances root in the harness — instance dirs come only from
+`--instance-dir` or `AGENT_INSTANCE_DIR`. So runs are enumerated from an
+append-only registry at `registry_path`, one JSON line per run, written at
+run start. Clones are excluded: a fork is not a resumable run. If the
+registry is missing or empty (an older run, a fresh checkout, a moved home
+directory), the gate falls back to globbing
+`instances_root/*/exploration_state.json`.
+
+A run whose state file has since been deleted is listed as a tombstone
+rather than dropped, so an operator looking for it learns it is gone. Both
+the menu and the `--gate-resume` flag refuse it: accepting a vanished path
+would start a *fresh* run at that path, silently losing the intent to
+resume.
+
 ---
 
 ## Score YAML (exploration-score.yaml)
