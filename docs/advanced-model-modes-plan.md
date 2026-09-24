@@ -70,11 +70,16 @@ real enough to need structural mitigation (§1.5). The comparison:
 **Verdict.** Researcher, confirmed — the latency, authority-coherence, and
 planner-availability arguments are each decisive on their own, and the
 auditor's one genuine advantage (it has observed the work) is recoverable
-cheaply: let the **worker escalate**. A worker that finds something
-surprising emits `[[REQUEST_AUDIT]]`, and the harness re-inserts the auditor
-into the tail even if the plan omitted it. One regex, one re-insert, and the
-researcher's only irrecoverable weakness — that it cannot see the work it is
-planning around — is answered by the role that can. (Open question Q1.)
+cheaply: **the worker escalates, and the harness must honour it**
+(decided). A worker that finds something surprising emits
+`[[REQUEST_AUDIT]]`; the harness re-inserts the auditor into the tail even
+if the plan omitted it, **resets the audit-floor counter**, and emits a
+`cycle_plan_audit_requested` health event. The researcher's only
+irrecoverable weakness — that it cannot see the work it is planning around —
+is answered by the role that can, and the health event makes a researcher
+that plans badly *visible* rather than merely corrected: a run where
+escalation fires every cycle is telling you the planner is not earning its
+keep.
 
 ### 1.3 Block grammar
 
@@ -110,26 +115,35 @@ log a one-line reason, fall back to the fixed flow. Never raise.
    wins**, plan ignored with a logged reason (fan-out already replaces
    worker *and* auditor, `exploration.py:4574`).
 8. Absent, empty, or malformed → fixed flow. No health event for "absent";
-   a `cycle_plan_rejected` health event for malformed.
+   a `cycle_plan_rejected` health event for malformed. Three registry
+   entries in `health_events.py`: `cycle_plan_rejected`,
+   `cycle_plan_audit_forced`, `cycle_plan_audit_requested`.
 
 ### 1.5 Bounds the agent cannot waive
 
 Two harness-enforced floors, both checked after parsing, both non-negotiable
 by the model:
 
-- **`audit_floor_cycles` (default 2).** At most N consecutive cycles may end
-  without an auditor turn. On the cycle that would break the floor, the
-  auditor is appended regardless of the plan, and the fact is logged and
-  surfaced in the cycle banner. This is what keeps the self-exculpation
-  conflict bounded, and it keeps `[[BRANCH_COMPLETE]]` reachable.
+- **`audit_floor_cycles` (default 2, decided).** At most two consecutive
+  cycles may end without an auditor turn. On the cycle that would break the
+  floor, the auditor is appended regardless of the plan, and the fact is
+  logged and surfaced in the cycle banner. This roughly doubles worker share
+  against today's audit-every-cycle flow while keeping the self-exculpation
+  conflict bounded and `[[BRANCH_COMPLETE]]` reachable often enough to close
+  a run promptly. A `[[REQUEST_AUDIT]]` escalation also resets the counter,
+  so an honoured escalation buys the run two more planned cycles rather than
+  consuming the floor's budget.
 - **`max_worker_chain` (default 3).** Prevents a plan that turns a cycle into
   an unbounded worker loop, which would starve the memoir, the reporter
   cadence (`report_interval`), and the exhaustion detector.
 
-Both floors apply in fan-out clones too. A clone with no auditor never emits
-`[[BRANCH_COMPLETE]]` and would run to the 10 h `FANOUT_CAP_SECONDS` wall —
-the floor is the only thing preventing that. (Open question Q2 asks whether
-clones should get cycle planning at all.)
+Neither floor has to carry clones, because **cycle planning is root-only**
+(decided, `allow_in_clones: false`). Clones keep the fixed flow, exactly as
+they already skip the fan-out decision. This removes the sharpest failure
+mode the feature could have introduced: a clone with no auditor never emits
+`[[BRANCH_COMPLETE]]` and would burn to the 10 h `FANOUT_CAP_SECONDS` wall
+with nothing to show. It also keeps branches comparable to each other, which
+is what makes the merge's divergence table mean anything.
 
 ### 1.6 Worker chaining: session continuity, not new plumbing
 
@@ -176,8 +190,8 @@ loop:
     max_worker_chain: 3
     max_turns_per_cycle: 4
     audit_floor_cycles: 2
-    allow_in_clones: false  # see Q2
-    worker_may_request_audit: true   # see Q1
+    allow_in_clones: false           # root-only, like the fan-out decision
+    worker_may_request_audit: true   # [[REQUEST_AUDIT]]; honoured, resets the floor
 ```
 
 Guidance is injected into the researcher only when `enabled` — same pattern as
@@ -240,12 +254,22 @@ Resolution order: `overrides` > `profile` > `auto` family match > `default`.
 `agent_models` already routes each role to its own provider/model, so a run
 can have a Fable researcher and an Opus auditor. But
 `assemble_system_prompt(config, ...)` reads config-level switches, so a naive
-implementation would apply one profile to every role. Two ways out, and it is
-a genuine design fork (Q3): resolve the profile **per agent** from that
-agent's routed model (correct, threads a resolved-model argument into the
-assembler), or resolve **once per run** from the researcher's model
-(trivial, wrong for heterogeneous routing). The profile must be resolved
-*after* `agent_routing` picks the model, either way.
+implementation would apply one profile to every role. **Decided: per agent, from that agent's
+routed model.** So a Fable researcher gets the lean prompt while an Opus
+auditor in the same run keeps the full one — which is the only reading that
+respects a config feature the harness already ships and documents.
+
+The cost is real and worth naming: `assemble_system_prompt` needs the
+resolved model threaded in, which touches every call site (the cycle loop,
+the REPL, the final auditor/reporter, the curator, the manager). Two
+consequences follow:
+
+- The profile must be resolved **after** `agent_routing` picks the model,
+  not from the config's global `model` key.
+- The prompt cache keys on the system prompt, so two roles on the same model
+  must produce the *same* profile deterministically — the resolution has to
+  be a pure function of the resolved model id plus config, with no ordering
+  or per-cycle state in it.
 
 ---
 
@@ -374,10 +398,12 @@ else moves.
 - **Cycle plan**: parse/valid, parse/malformed → fixed flow, researcher in
   block → reject, worker chain clamp, auditor moved to last, fan-out
   co-occurrence → fan-out wins, audit floor forces an auditor on cycle N+1,
-  clone behaviour under `allow_in_clones` both ways, `[[REQUEST_AUDIT]]`
-  re-insert, name-based failure handling for a failed mid-tail worker and a
-  failed non-final auditor.
+  a clone ignores a `<cycle_plan>` block and keeps the fixed flow,
+  `[[REQUEST_AUDIT]]` re-inserts the auditor *and* resets the floor counter,
+  name-based failure handling for a failed mid-tail worker and a failed
+  non-final auditor.
 - **Profiles**: `enabled: false` produces a prompt byte-identical to today
+  for every one of the eight routed roles
   (the non-deprecation guarantee, asserted not asserted-about); family match;
   unknown model → `standard`; `overrides` beats `profile` beats `auto`;
   `lean` stages block omits exactly three element types and nothing else.
@@ -414,19 +440,22 @@ changes what is being measured). Flagged, not decided here.
 
 ## 6. Open questions
 
-Six decisions I do not want to make for you; they are the Q1–Q6 asked
-interactively alongside this document.
+### Resolved (round 1)
 
-- **Q1** — worker escalation (`[[REQUEST_AUDIT]]`): build it as the
-  researcher's blind-spot mitigation, or keep the audit floor as the only
-  safety net?
-- **Q2** — cycle planning in fan-out clones: allow it (with the floor), or
-  root-only like fan-out itself?
-- **Q3** — profile resolution: per-agent from each routed model, or once per
-  run?
+| Q | Decision |
+|---|---|
+| Worker escalation | `[[REQUEST_AUDIT]]` is built, **mandatory to honour**, resets the audit-floor counter, and emits a health event so a bad planner is visible. |
+| Cycle planning in clones | **Root only.** Clones keep the fixed flow, like the fan-out decision itself. |
+| Profile resolution | **Per agent**, from that agent's routed model; resolved after `agent_routing`, as a pure function of model id + config. |
+| `audit_floor_cycles` | **2.** |
+
+### Still open (round 2)
+
 - **Q4** — run enumeration for gate Q3: a new `instances_root` scan, a
   registry file the harness appends to, or `sessions.db`?
 - **Q5** — what gate Q1 rewrites: the global `model` only, or also the
   `agent_models` entries that still point at the old default?
-- **Q6** — `audit_floor_cycles` default: 1 (audit every other cycle at
-  worst), 2 (as drafted), or 3 (most aggressive thinning)?
+- **Q6** — does the benchmark run (`docs/rcb-benchmark-plan.md`) enable
+  Features 1 and 2, or stay on the fixed flow and full guidance?
+- **Q7** — the per-clone sub-allowance (§4.3): split the remaining budget
+  evenly, or leave clones uncapped and accept the documented overshoot?
