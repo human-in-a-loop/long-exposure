@@ -4859,7 +4859,16 @@ def run_exploration(
                     # did not fire — "fan-out wins" is structural rather than
                     # a precedence rule someone has to remember, and a
                     # fan-out cycle never logs a plan that will not run.
-                    if agent_name == "researcher" and _planning_active:
+                    # `not _spend_limit.tripped()`: if this researcher turn
+                    # is the one that blew the total spend limit, the cycle
+                    # is already over. Applying and logging a plan here
+                    # would print a flow that will never run, at exactly the
+                    # moment an operator is working out why the run died.
+                    if (
+                        agent_name == "researcher"
+                        and _planning_active
+                        and not _spend_limit.tripped()
+                    ):
                         _planned_tail = _cycle_plan.parse(
                             results.get("research_brief", ""),
                             loop_cfg,
