@@ -1,10 +1,13 @@
-# Closeout plan: the four advanced-model features
+# Closeout: the four advanced-model features
 
-Branch `claude/long-exposure-tiered-memory` @ `4f58e99`, 36 commits ahead of
-`main`, 650 tests passing, tree clean, wheel builds. Nothing on `main`.
+**Status: CLOSED 2026-09-25.** Everything in this plan was executed (§6).
+Deeper live testing is deferred to a later, dedicated pass by operator
+decision — this was judged rigorous enough for now.
 
-This is the plan to finish, not a proposal to merge. The standing instruction
-stands: **no merge to main until the branch has had live testing.**
+Branch `claude/long-exposure-tiered-memory`, 650 tests passing, tree clean,
+wheel builds. **Nothing on `main`, and no merge is proposed:** the standing
+instruction that the branch needs live testing before it goes near `main`
+still holds, and one smoke cycle is not that.
 
 ## 0. Where things actually stand
 
@@ -39,7 +42,7 @@ Both are things I said were done and are not.
 Also worth adding to `gaps.md` as explicit deferred entries, because they are
 currently only recorded inside a plan doc:
 
-- Cycle planning has never run against a live model.
+- Cycle planning's live mileage (one cycle, researcher declined to plan).
 - The interactive Claude transport has not been exercised with any of the
   four features.
 

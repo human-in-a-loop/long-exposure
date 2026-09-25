@@ -20,8 +20,10 @@ measuring thinned guidance.
 
 **Sequence before launch:** implement → live-test the branch → re-read this
 plan's §5 and §10 against the code → launch. The features are covered by
-640 tests, 200k fuzzed plan blocks and multi-cycle runs against a stubbed
-provider, but no live model has emitted a plan block yet.
+650 tests, 200k fuzzed plan blocks and multi-cycle runs against a stubbed
+provider. One live cycle has now run (2026-09-25): the planning guidance
+reached the researcher and the researcher declined to plan, so the plumbing
+is confirmed and the planner's judgement is not — see §2 gap 5.
 
 ---
 
