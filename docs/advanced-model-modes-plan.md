@@ -24,7 +24,7 @@ to an error.
 | 1 | Agent-planned cycle tail (`<cycle_plan>`) | off | `loop.cycle_planning` |
 | 2 | Model capability profiles (guidance tiering) | off | `model_profiles` |
 | 3 | Startup gate (4 questions, `launch` only) | off | `startup_gate` |
-| 4 | One total spend limit, as a delta % of a declared weekly allowance | off | `usage_allowance` |
+| 4 | One total spend limit, as a delta % of a declared weekly allowance | off (opt-in; no cap is the intended stance) | `usage_allowance` |
 
 ---
 

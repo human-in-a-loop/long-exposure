@@ -774,12 +774,15 @@ Two things follow, neither of which is "rewrite the numbers from one sample":
    test**, from `usage_summary.json`, and re-derive §8 from that before the
    main pass. The smoke test already has to run; it should now also produce
    this number.
-2. **Decide whether the main pass needs a spend cap.** The plan currently
-   keeps main's unlimited budget on the grounds that a cap is a deviation.
-   If the re-derived estimate lands near the top of a 2–4x range, an
-   explicit `usage_allowance` becomes the cheaper deviation to disclose —
-   and it now has a live-verified kill path. Set it with the overshoot in
-   mind: the smoke run's $6 cap stopped at $7.81.
+2. **The main pass does not need a spend cap, and should not have one.**
+   The run bills to a fixed-cost subscription, so the notional dollars above
+   are an accounting figure rather than an invoice — they exist to make the
+   compute disclosure in §7.1 honest, not to be managed down. A cap would
+   add a deviation and could truncate a task mid-cycle, which costs a task
+   score. Keep `usage_allowance` off. Its one legitimate use here would be
+   bounding an *unattended* pass on a shared account; if that ever applies,
+   set it with the overshoot in mind (the smoke run's $6 cap stopped at
+   $7.81).
 
 **Wall clock is the binding constraint, not money.** With the 10 h
 per-task stop, the pass is up to 400 hours serial — over two weeks
@@ -976,7 +979,7 @@ JUDGE_API_KEY=...
 | Outer bound | The harness's own 10 h, applied at the root | No new number invented; the root loop is the one place main leaves uncapped, and the exhaustion-vs-cap split is reported |
 | Configuration | All features on except the final auditor and final reporter; full 40-task scope | The periodic reporter is the deliverable; mechanism evidence is the §7.6 diagnostics |
 | Advanced-model features | **Both enabled.** `loop.cycle_planning` is active; `model_profiles` is enabled but **inert on Opus 4.6** | This run measures stock + the fixes + agent-planned cycle tails, NOT thinned guidance. §5.5 says why, and says what one edit would change it |
-| Spend limit | **Off** | The budget is main's stock, which is unlimited; a cap would be a further deviation |
+| Spend limit | **Off** (the shipped default) | The budget is main's stock, which is unlimited. The cap is opt-in and off by default; the run bills to a fixed-cost subscription, where a cap buys nothing |
 | Startup gate | **Off** | The adapter is non-interactive; the appendix records the configuration instead of `gate_answers.json` |
 | Attempts | One shot per task, then move on | Mean ± SEM over tasks with reference lines; no paired peer test (§7.4) |
 | Web access | Enabled, but no retrieval of the target papers or their results | Per-task denylist, egress block, post-hoc detection, disqualify-and-re-run |

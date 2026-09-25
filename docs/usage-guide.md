@@ -102,13 +102,26 @@ Q3. Resume a previous run, or start fresh?
   1) start a new run
   2) run-2026-09-24T2153Z — cycle 12 — "study the widget"
   ...
-Q4. What share of your declared weekly allowance ($400.00) may this run use?
-    This is a delta on top of what you have already used, and it KILLS the
-    run when reached.
-  percent (1-100): 20
+Q4. Cap this run's spend?
+  1) No cap (default) — run until the work is done
+  2) Cap at a share of the declared $400.00 weekly allowance
+  choice: 1
 ```
 
-Q4 appears only when `usage_allowance.enabled` is true.
+**Q4 is asked every launch, and "no cap" is the default answer.** The cap is
+opt-in: long-exposure is built for a fixed-cost subscription, where a per-run
+dollar cap buys nothing and can truncate a run mid-cycle. The question exists
+so the option is discoverable, not because you are expected to use it.
+
+Two consequences worth knowing:
+
+- Declining at Q4 **overrides** an `enabled: true` in config.yaml.
+- Q4 is the one question a non-TTY does **not** abort on — it takes the
+  default and the run proceeds uncapped. Q1–Q3 still exit 4 and name the
+  missing flag.
+
+If no `usage_allowance.weekly_allowance_usd` is declared, Q4 says so and
+moves on: a percentage of an undeclared allowance means nothing.
 
 Then it prints what your answers did, including the resolved per-agent
 routing table, before any spend happens:

@@ -5,7 +5,7 @@ See docs/advanced-model-modes-plan.md (Feature 3).
   Q1  Which model should this run use?
   Q2  Which workspace directory?
   Q3  Resume a previous run, or start fresh?
-  Q4  What spend limit for this run?  (only when `usage_allowance` is on)
+  Q4  A spend limit for this run?  (always asked; the answer defaults to NO CAP)
 
 ## Where it runs, and where it must not
 
@@ -23,6 +23,14 @@ Every answer also has a flag, so a fully-flagged `launch` is headless. A
 non-TTY stdin with an unanswered question exits and names the missing flag
 rather than defaulting: a wrong model is an expensive mistake to discover
 three hours in.
+
+Q4 is the one exception, because it has a safe default. **No cap is the
+default stance**: long-exposure is built to run on a fixed-cost subscription
+through `claude -p`, where a per-run dollar cap buys an operator nothing and
+can truncate a run mid-cycle for no benefit. So Q4 is always *offered* — an
+operator should know the option exists and should not have to edit
+config.yaml to find it — but declining is the default, and a non-TTY simply
+takes that default rather than aborting.
 
 ## Q1's subtlety
 
@@ -309,14 +317,22 @@ def apply_answers(config: dict, answers: dict) -> dict:
     if workspace:
         config["working_directory"] = str(workspace)
         summary["workspace"] = str(workspace)
-    pct = answers.get("usage_run_pct")
-    if pct is not None:
+    # Q4 can both enable and disable the cap, so it owns `enabled` as well
+    # as `run_pct`. An explicit "no cap" answer must be able to override a
+    # config.yaml that has the feature on, or answering the question would
+    # not mean anything.
+    if "spend_cap" in answers or answers.get("usage_run_pct") is not None:
         block = config.get("usage_allowance")
         if not isinstance(block, dict):
             block = {}
             config["usage_allowance"] = block
-        block["run_pct"] = pct
-        summary["usage_run_pct"] = pct
+        capped = answers.get("spend_cap")
+        if capped is None:
+            capped = (answers.get("usage_run_pct") or 0) > 0
+        block["enabled"] = bool(capped)
+        if capped:
+            block["run_pct"] = answers.get("usage_run_pct") or 0
+            summary["usage_run_pct"] = block["run_pct"]
         summary["spend_limit"] = _spend_limit.describe(config)
     return summary
 
@@ -549,21 +565,61 @@ def ask(
             "Pass --gate-resume fresh to start a new run instead."
         )
 
-    # -- Q4: spend limit (only when the feature is on) -------------------
+    # -- Q4: spend limit — always offered, defaults to NO CAP ------------
+    #
+    # Opt-in by design. The harness is built to run on a fixed-cost
+    # subscription through `claude -p`, so a per-run dollar cap buys an
+    # operator nothing there and can truncate a run mid-cycle for no
+    # benefit. The question is still asked every launch so the option is
+    # discoverable without editing config.yaml — but "no cap" is the
+    # default, and unlike Q1-Q3 a non-TTY takes that default instead of
+    # aborting, because declining is safe.
     allowance = _spend_limit.settings(config)
-    if truthy(allowance.get("enabled"), name="usage_allowance.enabled"):
-        if flags.get("usage_run_pct") is not None:
-            answers["usage_run_pct"] = float(flags["usage_run_pct"])
-        else:
-            need("--gate-usage-pct", "usage limit")
-            declared = allowance.get("weekly_allowance_usd") or 0
+    declared = _spend_limit._float(allowance.get("weekly_allowance_usd"))
+    if flags.get("usage_run_pct") is not None:
+        pct = float(flags["usage_run_pct"])
+        answers["usage_run_pct"] = pct
+        answers["spend_cap"] = pct > 0
+    elif not interactive:
+        answers["spend_cap"] = False          # the safe default, unattended
+    elif declared <= 0:
+        # A percentage of an undeclared allowance is meaningless, so there
+        # is nothing to ask — say why, and how to make the option live.
+        print(
+            "\nQ4. Spend limit: none.\n"
+            "    This run is uncapped, which is the default. Long-exposure "
+            "is built for a\n"
+            "    fixed-cost subscription, where a dollar cap buys nothing. "
+            "To enable the\n"
+            "    option, set usage_allowance.weekly_allowance_usd in "
+            "config.yaml.",
+            flush=True,
+        )
+        answers["spend_cap"] = False
+    else:
+        choice = _ask_choice(
+            "Q4. Cap this run's spend?",
+            [
+                ("none", "No cap (default) — run until the work is done"),
+                (
+                    "cap",
+                    f"Cap at a share of the declared ${declared:,.2f} weekly "
+                    "allowance",
+                ),
+            ],
+            input_fn=input_fn,
+        )
+        if choice == "cap":
             answers["usage_run_pct"] = _ask_pct(
-                "Q4. What share of your declared weekly allowance "
-                f"(${float(declared):,.2f}) may this run use?\n"
-                "    This is a delta on top of what you have already used, "
-                "and it KILLS the run when reached.",
+                "    What share of that allowance may this run use? This is "
+                "a delta on\n"
+                "    top of what you have already used, and it KILLS the run "
+                "when reached.",
                 input_fn=input_fn,
             )
+            answers["spend_cap"] = True
+        else:
+            answers["spend_cap"] = False
 
     return answers
 

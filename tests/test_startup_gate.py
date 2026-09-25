@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from long_exposure import startup_gate as g
+from long_exposure import spend_limit as sl, startup_gate as g
 from long_exposure.orchestrator import load_config
 
 
@@ -307,23 +307,89 @@ class AskTests(unittest.TestCase):
                                   "resume": "fresh"}, tty=False)
             self.assertIn("does not exist", str(ctx.exception))
 
-    def test_q4_appears_only_when_the_spend_limit_is_enabled(self):
+    def test_q4_never_blocks_and_defaults_to_no_cap(self):
+        """Opt-in by design: the cap is offered, declining is the default.
+
+        Unlike Q1-Q3, a non-TTY takes the default instead of aborting,
+        because declining a cap is safe — the harness runs on a fixed-cost
+        subscription where a per-run dollar cap buys nothing.
+        """
+        with TemporaryDirectory() as td:
+            tmp = Path(td)
+            flags = {"model": "opus", "workspace": str(tmp / "ws"),
+                     "resume": "fresh"}
+
+            cfg = self._base(tmp)
+            answers = g.ask(cfg, flags=flags, tty=False)
+            self.assertIs(answers["spend_cap"], False)
+            self.assertNotIn("usage_run_pct", answers)
+
+            # Even with the feature switched on in config, a non-TTY does
+            # not abort on Q4.
+            cfg["usage_allowance"] = {
+                "enabled": True, "weekly_allowance_usd": 400, "run_pct": 20,
+            }
+            answers = g.ask(cfg, flags=flags, tty=False)
+            self.assertIs(answers["spend_cap"], False)
+
+    def test_declining_q4_overrides_a_config_that_enabled_it(self):
+        """Otherwise answering the question would not mean anything."""
         with TemporaryDirectory() as td:
             tmp = Path(td)
             cfg = self._base(tmp)
+            cfg["usage_allowance"] = {
+                "enabled": True, "weekly_allowance_usd": 400, "run_pct": 20,
+            }
+            self.assertEqual(sl.cap_usd(cfg), 80.0)
+            g.apply_answers(cfg, {"spend_cap": False})
+            self.assertIsNone(sl.cap_usd(cfg))
+
+    def test_opting_in_at_q4_enables_the_cap(self):
+        with TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = self._base(tmp)
+            cfg["usage_allowance"] = {
+                "enabled": False, "weekly_allowance_usd": 400, "run_pct": 0,
+            }
+            self.assertIsNone(sl.cap_usd(cfg))
+            g.apply_answers(cfg, {"spend_cap": True, "usage_run_pct": 25})
+            self.assertEqual(sl.cap_usd(cfg), 100.0)
+
+    def test_q4_is_asked_interactively_when_an_allowance_is_declared(self):
+        with TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = self._base(tmp)
+            cfg["usage_allowance"] = {
+                "enabled": False, "weekly_allowance_usd": 400, "run_pct": 0,
+            }
             flags = {"model": "opus", "workspace": str(tmp / "ws"),
                      "resume": "fresh"}
-            self.assertNotIn("usage_run_pct", g.ask(cfg, flags=flags, tty=False))
+            # choice 1 == no cap
+            declined = g.ask(cfg, flags=flags, tty=True,
+                             input_fn=_scripted("1"))
+            self.assertIs(declined["spend_cap"], False)
+            # choice 2 then a percentage
+            opted = g.ask(cfg, flags=flags, tty=True,
+                          input_fn=_scripted("2", "25"))
+            self.assertIs(opted["spend_cap"], True)
+            self.assertEqual(opted["usage_run_pct"], 25.0)
 
+    def test_gate_usage_pct_zero_means_no_cap(self):
+        with TemporaryDirectory() as td:
+            tmp = Path(td)
+            cfg = self._base(tmp)
             cfg["usage_allowance"] = {
-                "enabled": True, "weekly_allowance_usd": 400, "run_pct": 0,
+                "enabled": True, "weekly_allowance_usd": 400, "run_pct": 20,
             }
-            with self.assertRaises(g.GateAbort) as ctx:
-                g.ask(cfg, flags=flags, tty=False)
-            self.assertEqual(ctx.exception.missing_flag, "--gate-usage-pct")
-
-            answered = g.ask(cfg, flags={**flags, "usage_run_pct": 20}, tty=False)
-            self.assertEqual(answered["usage_run_pct"], 20.0)
+            answers = g.ask(
+                cfg,
+                flags={"model": "opus", "workspace": str(tmp / "ws"),
+                       "resume": "fresh", "usage_run_pct": 0},
+                tty=False,
+            )
+            self.assertIs(answers["spend_cap"], False)
+            g.apply_answers(cfg, answers)
+            self.assertIsNone(sl.cap_usd(cfg))
 
     def test_no_previous_runs_means_fresh_without_asking(self):
         with TemporaryDirectory() as td:

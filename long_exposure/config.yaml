@@ -114,10 +114,26 @@ memoir:
   max_tokens: 3000   # global cap enforced at injection (chars/4 estimate)
 depth_compression: gentle
 
-# === Total spend limit (opt-in) ===
-# ONE total limit for the whole run, expressed as a percentage of a weekly
-# allowance you declare. There are no per-agent, per-cycle or per-clone
-# sub-budgets — the run spends freely against the total until it is gone.
+# === Total spend limit — OPT-IN ONLY. DEFAULT: NO CAP. ===
+#
+# There is NO spend limit unless you deliberately turn one on. That is the
+# intended stance, not a placeholder: long-exposure is built to run on a
+# FIXED-COST SUBSCRIPTION (a Max plan, via `claude -p`), where the marginal
+# dollar cost of a run is zero and a per-run cap therefore buys you nothing.
+# What it CAN do is truncate a run mid-cycle for no benefit. Leave it off
+# unless you have a specific reason.
+#
+# Reasons someone might turn it on: metered API billing instead of a
+# subscription, a shared account where one run must not monopolise capacity,
+# or an unattended experiment whose blast radius you want bounded.
+#
+# The startup gate asks about this every launch (Q4) so the option is
+# discoverable without editing this file — and the default answer is "no cap".
+#
+# When you DO turn it on: ONE total limit for the whole run, expressed as a
+# percentage of a weekly allowance you declare. There are no per-agent,
+# per-cycle or per-clone sub-budgets — the run spends freely against the
+# total until it is gone.
 #
 # HONESTY NOTE: the harness cannot read real subscription usage. The `claude`
 # CLI has no `usage` subcommand, `/usage` is interactive-only, and the `-p`
@@ -136,9 +152,10 @@ depth_compression: gentle
 # and the process exits 3. State is still saved, so raising the limit and
 # resuming works.
 #
-# Optional: `enabled: false`, `run_pct: 0`, or `weekly_allowance_usd: 0` all
-# mean unlimited. Distinct from loop.max_cost_usd in the score, which is a
-# graceful natural end-of-run and still runs the final stages.
+# `enabled: false`, `run_pct: 0`, or `weekly_allowance_usd: 0` all mean
+# unlimited — and all three are the shipped defaults. Distinct from
+# loop.max_cost_usd in the score, which is a graceful natural end-of-run and
+# still runs the final stages.
 usage_allowance:
   enabled: false
   weekly_allowance_usd: 0    # operator-declared, API-equivalent dollars

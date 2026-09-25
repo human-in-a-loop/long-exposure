@@ -481,11 +481,28 @@ the per-stage enumerations, so a framework with more stages saves more.
 
 See `docs/soft-guidance.md` for what may and may not thin, and why.
 
-### `usage_allowance` (opt-in) — one total spend limit
+### `usage_allowance` — one total spend limit, OPT-IN, default OFF
 
-**One** total limit for the whole run, as a percentage of a weekly allowance
-you declare. There are no per-agent, per-role, per-cycle or per-clone
-sub-budgets; the run spends freely against the total until it is gone.
+> **There is no spend limit unless you turn one on, and for most operators
+> that is the right setting.** Long-exposure is built to run on a fixed-cost
+> subscription (a Max plan, through `claude -p`), where the marginal cost of
+> a run is zero. A per-run dollar cap buys nothing there, and it *can*
+> truncate a run mid-cycle for no benefit. The shipped default — `enabled:
+> false` — is the intended stance, not an unfinished setting.
+
+Turn it on only for a specific reason: metered API billing rather than a
+subscription, a shared account where one run must not monopolise capacity, or
+an unattended experiment whose blast radius you want bounded.
+
+The startup gate asks about it every launch (Q4) so the option is
+discoverable without editing config.yaml, and **the default answer is "no
+cap"**. Declining at the gate overrides an `enabled: true` in config.yaml —
+otherwise answering the question would not mean anything.
+
+When you do enable it: **one** total limit for the whole run, as a percentage
+of a weekly allowance you declare. There are no per-agent, per-role,
+per-cycle or per-clone sub-budgets; the run spends freely against the total
+until it is gone.
 
 ```yaml
 usage_allowance:
