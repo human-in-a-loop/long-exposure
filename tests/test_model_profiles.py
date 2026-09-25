@@ -158,6 +158,11 @@ class StagesBlockTests(unittest.TestCase):
         self.assertNotIn("<exit-gate-policy>", full)
         self.assertIn("derive them yourself", lean)
 
+    def test_no_gate_policy_when_a_framework_defines_no_stages(self):
+        """A custom framework can have none; the policy would dangle."""
+        self.assertEqual(render_stages_block([], mp.VERBOSITY_LEAN), "")
+        self.assertEqual(render_stages_block([], mp.VERBOSITY_FULL), "")
+
     def test_lean_keeps_every_stage(self):
         lean = render_stages_block(self.stages, mp.VERBOSITY_LEAN)
         self.assertEqual(lean.count("<stage name="), len(self.stages))

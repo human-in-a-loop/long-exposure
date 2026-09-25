@@ -1698,7 +1698,10 @@ def render_stages_block(
     """
     lean = str(verbosity or "").strip().lower() == _model_profiles.VERBOSITY_LEAN
     parts = []
-    if lean:
+    # `and stages`: a custom framework can define none, and a policy block
+    # pointing at <purpose> and <required-output> elements that are not in
+    # the prompt is the very incoherence this block exists to prevent.
+    if lean and stages:
         # Without this line the lean block is INCOHERENT, not merely shorter.
         # The framework template's transition rules still say "every gate must
         # be answered yes with evidence", and the checkpoint envelope still
