@@ -22,11 +22,15 @@ worth adopting, given that the harness must not become Claude-only.
 | Fan-out clones get their own `--instance-dir` (state, output, logs) but **inherit the same `config.working_directory`** — one shared workspace | `fanout.py:1157-1164` (spawn command passes only `--instance-dir`), `fanout.py:566` |
 | The fan-out contract is explicitly shared-workspace: *"The fan-out design lets clones share the workspace freely; the only contract is that no two clones write to the same file"* | `fanout.py:566` |
 | **Worktree isolation has already been tried here and silently failed.** The agent-teams guidance tells the lead: *"Do not rely on isolation:worktree (silently broken in team mode); scope each teammate's writes via an explicit subtree path in its prompt"* | `orchestrator.py:2040` |
-| A cycle costs **$7.81** and **990 s** measured live (Opus 5.5, 3 calls) | `docs/advanced-model-modes-plan.md` §7 |
+| A cycle takes **990 s** and 3 calls measured live (Opus 5.5) | `docs/advanced-model-modes-plan.md` §7 |
+| `branchial_budget.score_branches` already scores each fan-out branch's novelty, but only **advisorily** — it prints and logs | `fanout.py` branchial-budget block |
 
-That last row is the one that decides the swarm question, and the fourth row
-is the one that should make anyone cautious about worktrees as an isolation
-primitive inside a vendor's agent runtime.
+The **990 s** matters for the swarm question (§4) because wall clock, not
+money, is what a barrier across many members pessimises — the harness bills
+to a fixed-cost subscription, so per-run dollars are an accounting figure
+rather than a constraint. The **worktree** row is the one that should make
+anyone cautious about worktrees as an isolation primitive inside a vendor's
+agent runtime.
 
 ---
 
@@ -188,53 +192,125 @@ kind the harness already has four of.
 
 ---
 
-## 4. Swarms: the wall is cost, not engineering
+## 4. Swarms, reframed: the constraint is redundancy, not cost
 
-Scaling `FANOUT_MAX_BRANCHES` from 3 to 20 is not primarily a parallelism
-problem. Each branch is a **full long-exposure process** running the whole
-researcher → worker → auditor cycle.
+**Revised.** The first version of this section argued swarms were
+cost-gated: ~$280 per clone allowed to run to the 10 h cap, so a 20-branch
+fork ran into thousands of dollars. The operator's correction is decisive —
+the harness bills to a fixed-cost subscription, so those dollars are an
+accounting figure, not an invoice. Removing cost does not make the swarm
+question easy; it makes it a **different** question, and a more interesting
+one.
 
-At the measured $7.81/cycle and 990 s/cycle, one clone allowed to run to the
-10 h `FANOUT_CAP_SECONDS` completes roughly 36 cycles ≈ **$280**. So:
+With spend free but tokens still not to be wasted, the binding constraint
+becomes: **does agent number 14 learn anything agents 1–13 did not?**
 
-| Branches | Worst-case fan-out cost (one fork, 10 h) |
+### 4.1 Why "more branches" is the wrong primitive
+
+Twenty agents pointed at one directive will substantially duplicate each
+other. Each will orient itself, survey the same ground, build the same
+scaffolding, and rediscover the same first-order facts. That is not a cost
+problem — it is an *information* problem, and it shows up as:
+
+- **Redundant tokens.** Twenty literature surveys of the same topic is the
+  precise failure mode the operator's "without burning tokens inefficiently"
+  is guarding against.
+- **A merge that degrades with N.** Three merge reports concatenate. Twenty
+  at ~15–30k each is 300–600k tokens into a single synthesis turn — inside a
+  1M window, but the synthesis quality falls off long before the window does,
+  and the reporter is the role that writes the graded deliverable.
+- **A barrier that pessimises to the slowest member.** With 3 branches a
+  straggler is tolerable. With 20, wall clock becomes
+  `max(member_duration)` and one wedged member holds nineteen results
+  hostage until the 10 h cap.
+
+So the reframe: a swarm is not "fan-out with a bigger number". It is a
+**coverage** mechanism, and its design problem is partitioning a space so
+that members do not overlap, then reducing their results without a single
+choke point.
+
+### 4.2 The four topologies, honestly compared
+
+| Topology | Shape | Good for | Cost under unlimited spend |
+|---|---|---|---|
+| **Wide fan-out** (today, scaled) | N independent full cycles, one barrier, one merge | 2–4 genuinely independent questions | Redundancy grows with N; merge and barrier both degrade |
+| **Tree / hierarchical** | coordinator → group leads → members, reduce at each level | Decomposable work with natural grouping | Needs depth > 1 and a reduce at each level; the barrier problem recurs per level but each level is small |
+| **Blackboard / queue** | members pull from a shared task queue, write to shared state, no fixed topology | Many similar independent items (a 200-item sweep with 20 workers) | Decouples agent count from task count. Needs a queue with dedupe and lease semantics |
+| **Debate / ensemble** | N members attack the *same* question, an arbiter synthesises | One hard question where disagreement is informative | Deliberately redundant — the redundancy *is* the signal. Narrow but real |
+
+My read: **tree for structure, queue for the leaves.** A coordinator
+partitions into groups; each group lead owns a queue of concrete items; leaf
+members pull from it. That gets coverage from the partition, load balancing
+from the queue, and bounded reduction from the tree. Debate stays a separate
+narrow feature — and note the harness already has a degenerate form of it,
+since the auditor is an adversarial second opinion on the worker.
+
+### 4.3 What the harness already has that a swarm needs
+
+More than I credited in the first pass:
+
+| Swarm need | Existing machinery |
 |---|---|
-| 3 (today's cap) | ~$840 |
-| 8 | ~$2,240 |
-| 20 | ~$5,600 |
+| Non-overlapping member tasks | `branchial_budget.score_branches` already scores branch novelty and annotates each branch with a `novelty_class`. Today it is **advisory** — printed and logged. A swarm makes it **load-bearest**: reject or re-partition a branch set that scores as redundant |
+| Agent-decided decomposition | The researcher already owns fan-out, and now owns cycle planning. Partitioning is the same kind of decision, expressed as a bigger block |
+| Distinctness enforcement | The fan-out parser already rejects colliding `output_artifact` paths. That is a coverage check in embryo — it enforces distinct *outputs*, and a swarm needs distinct *questions* |
+| Straggler handling | Graceful barrier preemption exists (two triggers, capacity-gated) |
+| Per-member accounting | The usage ledger already folds clone rows via `merge()` |
+| Bounded reduction | `merge_synthesis_min_branches: 4` already switches concat → reporter synthesis. Tree reduction is the generalisation |
 
-Those are Opus-5.5-basis numbers from a single measured cycle, so treat the
-magnitude rather than the digits. The conclusion survives either way: **a
-swarm is economically gated long before it is engineering-gated**, and the
-enabling feature for swarms is therefore the spend limit that already
-exists — not worktrees.
+### 4.4 What actually has to be built
 
-Four things would actually have to change, in dependency order:
+In dependency order. Note that worktrees are last, and cost control is *not
+on the list at all* — which is the substantive change from the first draft.
 
-1. **Per-member cost control.** The total spend limit exists but is
-   root-enforced and root-only. A swarm needs the cap to bind *and* a cheaper
-   member shape — most swarm members should not run a full three-role cycle.
-   A "worker-only member" mode is the obvious primitive and does not exist.
-2. **Hierarchical merge.** Today: concat below 4 branches, reporter synthesis
-   at 4+. At 20, one synthesis turn reading 20 merge reports is itself a
-   context problem. A swarm needs tree reduction — merge in groups, then
-   merge the merges — which is a real design, not a parameter.
-3. **Depth > 1.** The 1-level cap is deliberate and enforced in two places
-   (`_parse_fanout_block`'s `_is_clone()` short-circuit, and
-   `cycle_planning.allow_in_clones: false`). A swarm is naturally a tree, so
-   this cap is the structural blocker. Lifting it re-opens every question the
-   depth-1 decision closed — see `docs/parallelism.md` "Why depth=1".
-4. **Worktree isolation per member** (§2.3), which is the *last* of the four,
-   not the first.
+1. **Concurrency governance replaces cost governance.** The scarce resource
+   on a fixed-cost plan is *rate limit and concurrency*, not dollars. This
+   already half-exists: `_fanout_branch_cap()` clamps branches to live pool
+   capacity. A swarm needs that to become the explicit governing dial — a
+   semaphore sized to plan capacity, with members queued rather than
+   rejected when it is full.
+2. **Cheap member shapes.** A coverage probe does not need
+   researcher → worker → auditor. A **worker-only member** producing one
+   artifact against one question is the right leaf primitive and does not
+   exist today. This is the main token-efficiency lever that survives
+   unlimited spend, and it is independently useful: it is also what the
+   post-merge cycle already does (`flow_this_cycle = [worker]`), so the
+   shape is proven.
+3. **Novelty-gated partitioning.** Promote `branchial_budget` from advisory
+   to a gate: a proposed member set whose questions score as redundant gets
+   sent back for re-partition rather than spawned. This is the direct answer
+   to "unlimited spend without burning tokens inefficiently".
+4. **Rolling collapse instead of a barrier.** Merge members as they finish.
+   Removes the `max(member_duration)` wall-clock behaviour and makes a
+   wedged member cost one member's worth of coverage rather than the whole
+   fork's latency.
+5. **Tree reduction.** Merge in groups, then merge the merges. Generalises
+   the existing `merge_synthesis_min_branches` switch.
+6. **Depth > 1.** The structural blocker, enforced in two places today
+   (`_parse_fanout_block`'s `_is_clone()` short-circuit and
+   `cycle_planning.allow_in_clones: false`). A tree needs it. Lifting it
+   re-opens every question `docs/parallelism.md` "Why depth=1" closed, so it
+   should be lifted deliberately and with a depth cap, not removed.
+7. **Worktree isolation per member** (§2.3), once N is large enough that
+   shared-workspace contention is the real failure mode.
 
-**My recommendation: do not build swarms now.** Not because the engineering
-is hard, but because the unit economics say a 20-branch fork costs thousands
-of dollars per fork, and nothing in the current evidence says 20 branches
-beats 3 on research yield. The cheap experiment that would justify it is
-measuring whether 3 branches already beat 1 — which the harness can do today
-and has not.
+### 4.5 The experiment that should come first
 
----
+Under unlimited spend the question "does a swarm beat three branches?" stops
+being expensive to answer and starts being *cheap* — which makes it
+inexcusable not to answer before building six of the seven items above.
+
+The measurement: run the same directive at **K = 1, 3, 8** and compare the
+deliverables. The harness can nearly do this today — K=1 and K=3 need no new
+code, and K=8 needs only the branch cap raised. What is missing is not
+capability but a comparison surface: the same directive, the same wall-clock
+bound, and a judge or rubric applied to the three outputs.
+
+That is worth doing first for a reason beyond frugality: if K=8 does not
+clearly beat K=3, the right swarm design is probably the **queue** shape
+against many small items rather than the **wide** shape against one
+directive, and building the tree first would have been building the wrong
+thing.
 
 ## 5. Hooks worth adopting, ranked by what they actually fix
 
@@ -335,12 +411,14 @@ ledger could attribute rather than folding into the lead's row.
 4. **`Stop` output-envelope enforcement** (§5.2). Prevents a bug class with
    a known incident history.
 5. **`PostToolUse` validators** (§5.3). Nice-to-have.
-6. **Swarms** — not now (§4). The prerequisite experiment is measuring
-   whether 3 branches beat 1.
+6. **The K = 1 / 3 / 8 coverage experiment** (§4.5). Cheap on a fixed-cost
+   plan, and it decides which swarm shape is worth building.
+7. **Swarm build** — after that experiment, starting with concurrency
+   governance and cheap member shapes (§4.4), not with worktrees.
 
 Worktrees appear nowhere in that list, which is the honest answer to "where
-should they be applied": **nowhere yet** — and inside a swarm build, if one
-is ever justified.
+should they be applied": **nowhere yet** — and late inside a swarm build,
+after the six things that matter more.
 
 ---
 
