@@ -4032,6 +4032,15 @@ def run_exploration(
     spend_limit_killed = False
     if not _is_clone():
         _spend_limit.reset()
+        # Clear a marker left by an earlier killed run: a resume that
+        # finishes cleanly must not still look killed to an operator or a
+        # wrapper script checking for the file.
+        if _spend_limit.clear_marker(output_dir):
+            print(
+                "[long-exposure] Cleared a spend-limit marker from a "
+                "previous run.",
+                flush=True,
+            )
         _spend_cap = _spend_limit.cap_usd(config)
         if _spend_cap is not None:
             print(
@@ -4872,7 +4881,10 @@ def run_exploration(
                         _planned_tail = _cycle_plan.parse(
                             results.get("research_brief", ""),
                             loop_cfg,
-                            agents.keys(),
+                            # The score's FLOW, not every agent it defines.
+                            # Only flow members have their inputs populated
+                            # by this loop; see cycle_plan.parse.
+                            flow,
                             is_clone=_is_clone(),
                         )
                         if _planned_tail:

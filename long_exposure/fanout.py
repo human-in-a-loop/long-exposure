@@ -97,6 +97,13 @@ def _is_stop_requested() -> bool:
 
 FANOUT_MAX_BRANCHES = 3  # legacy cap; superseded by pool fanout_cap when active.
 FANOUT_CAP_SECONDS = 10 * 60 * 60  # 10h wall-clock cap per clone
+# Grace given to a clone to finish writing merge_report.md after the total
+# spend limit trips, before its process group is terminated. Short by design:
+# the point of the limit is to stop spending, so waiting the 120s the 10h-cap
+# path allows would be self-defeating. Long enough only to salvage a report
+# already mid-write, which is the one piece of a branch's work that is not
+# already in the shared workspace.
+SPEND_KILL_GRACE_SECONDS = 10
 
 
 def _fanout_branch_cap() -> int:
@@ -1805,15 +1812,74 @@ def _run_fanout_conductor(
             ):
                 print(
                     "[long-exposure] Fan-out: spend limit reached "
-                    f"(clones ${_clone_usd:,.2f}); cascading stop to clones.",
+                    f"(clones ${_clone_usd:,.2f}); terminating clones.",
                     flush=True,
                 )
-                for k, cd in enumerate(clone_dirs):
-                    if outcomes[k]["state"] == "running":
+                # A stop FILE alone is not enough here. It is honoured at a
+                # clone's next cycle boundary, so a clone in the middle of a
+                # long agent turn keeps spending until it finishes — up to
+                # FANOUT_CAP_SECONDS. For a limit whose whole purpose is to
+                # stop spending, waiting hours is the opposite of a kill. So:
+                # signal, allow a short grace to salvage a merge report
+                # already mid-write, then terminate the process group.
+                _running = [
+                    k for k, o in enumerate(outcomes) if o["state"] == "running"
+                ]
+                for k in _running:
+                    try:
+                        (clone_dirs[k] / "long-exposure.stop").write_text("")
+                    except OSError:
+                        pass
+                _deadline = time.monotonic() + SPEND_KILL_GRACE_SECONDS
+                while time.monotonic() < _deadline:
+                    if all(
+                        _merge_report_path(clone_dirs[k]).exists()
+                        or (procs[k] is not None and procs[k].poll() is not None)
+                        for k in _running
+                    ):
+                        break
+                    time.sleep(0.5)
+                for k in _running:
+                    _mrp = _merge_report_path(clone_dirs[k])
+                    if _mrp.exists():
                         try:
-                            (cd / "long-exposure.stop").write_text("")
-                        except OSError:
+                            outcomes[k]["merge_report"] = _mrp.read_text()
+                            outcomes[k]["state"] = "done_spend_killed"
+                        except OSError as e:
+                            outcomes[k]["state"] = "killed_spend_limit"
+                            outcomes[k]["merge_report"] = (
+                                f"# Merge Report Unreadable\n\n{e}\n"
+                            )
+                    else:
+                        outcomes[k]["state"] = "killed_spend_limit"
+                        outcomes[k]["merge_report"] = (
+                            "# Branch Terminated\n\nThe run's total spend "
+                            "limit was reached while this branch was still "
+                            "running; it was terminated before producing a "
+                            "merge report. Work it wrote to the shared "
+                            "workspace is intact.\n"
+                        )
+                    _p = procs[k]
+                    if _p is None or _p.poll() is not None:
+                        continue
+                    try:
+                        os.killpg(os.getpgid(_p.pid), signal.SIGTERM)
+                        _p.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(os.getpgid(_p.pid), signal.SIGKILL)
+                        except (OSError, ProcessLookupError):
                             pass
+                    except (OSError, ProcessLookupError):
+                        pass
+                    print(
+                        f"[long-exposure]   clone-{k}: terminated "
+                        "(spend limit)",
+                        flush=True,
+                    )
+                # Every running branch now has a terminal state, so the
+                # barrier collapses on this iteration instead of waiting.
+                continue
 
         # Stage 9: graceful barrier preemption check. Runs AFTER the
         # per-clone state poll above (so we see the freshest outcomes —

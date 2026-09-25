@@ -54,6 +54,7 @@ from __future__ import annotations
 import re
 
 from long_exposure import health_events as _health
+from long_exposure.flags import truthy
 
 # Defaults for `loop.cycle_planning`. Off by default: a run that does not opt
 # in keeps the fixed flow and a byte-identical researcher prompt.
@@ -106,9 +107,11 @@ def settings(loop_cfg: dict | None) -> dict:
 
 def enabled(loop_cfg: dict | None, *, is_clone: bool = False) -> bool:
     cfg = settings(loop_cfg)
-    if not cfg.get("enabled"):
+    if not truthy(cfg.get("enabled"), name="cycle_planning.enabled"):
         return False
-    if is_clone and not cfg.get("allow_in_clones"):
+    if is_clone and not truthy(
+        cfg.get("allow_in_clones"), name="cycle_planning.allow_in_clones"
+    ):
         return False
     return True
 
@@ -198,11 +201,19 @@ def wants_audit(text: str | None) -> bool:
 def parse(
     text: str | None,
     loop_cfg: dict | None,
-    known_agents,
+    cycle_agents,
     *,
     is_clone: bool = False,
 ) -> list[str] | None:
     """Parse a `<cycle_plan>` into an ordered list of agent names.
+
+    `cycle_agents` must be the score's **flow** members, not every agent it
+    defines. The cycle loop populates inputs only for the agents in the
+    flow; a plan naming `final_auditor`, `final_reporter`, `curator` or
+    `reporter` would run that agent with `[UNAVAILABLE: stage]`,
+    `[UNAVAILABLE: expected_file]` and so on, burning a full turn to produce
+    something unusable — and, for the roles that set `agent_teams: true`,
+    possibly spawning teammates to do it.
 
     Returns None when the block is absent, malformed, or planning is not
     active — in every one of those cases the caller keeps the fixed flow.
@@ -231,10 +242,14 @@ def parse(
     if not turns:
         return _reject("block has no <turn> entries")
 
-    known = set(known_agents or ())
+    schedulable = set(cycle_agents or ())
     for name in turns:
-        if name not in known:
-            return _reject(f"unknown agent {name!r} — not defined in the score")
+        if name not in schedulable:
+            return _reject(
+                f"agent {name!r} is not in this score's cycle flow "
+                f"({', '.join(sorted(schedulable)) or 'none'}); the cycle "
+                "loop does not populate its inputs"
+            )
         if name == PLANNER:
             return _reject(
                 "the researcher cannot schedule itself; it has already run"
@@ -319,21 +334,30 @@ def apply_floor(
     return list(tail) + [AUDITOR], True
 
 
-def insert_requested_audit(flow: list[str], position: int) -> list[str]:
-    """Add an auditor after `position` because a worker escalated."""
+def insert_requested_audit(flow: list[str], position: int = -1) -> list[str]:
+    """Append an auditor because a worker escalated.
+
+    The auditor goes LAST, not immediately after the escalating worker. If
+    worker 1 of a chain escalates, inserting at its position would run the
+    audit before worker 2 — so `audit_report` and the memoir would describe
+    only part of the cycle's work, and the next cycle's researcher would
+    read that partial audit as the cycle's verdict. It would also contradict
+    the parser's own rule that an auditor turn is always moved last.
+
+    `position` is accepted and ignored, kept so the call site can pass the
+    escalating turn's index for readability.
+    """
     if AUDITOR in flow:
         return list(flow)
     print(
         f"[long-exposure] cycle_plan: worker emitted {REQUEST_AUDIT_SIGNAL}; "
-        "adding the auditor to this cycle.",
+        "adding the auditor at the end of this cycle.",
         flush=True,
     )
     _health.append_event(
         "cycle_plan_audit_requested", "worker escalation honoured", agent=WORKER,
     )
-    out = list(flow)
-    out.insert(position + 1, AUDITOR)
-    return out
+    return list(flow) + [AUDITOR]
 
 
 def build_flow(

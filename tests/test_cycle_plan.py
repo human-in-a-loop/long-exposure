@@ -16,7 +16,10 @@ import yaml
 
 from long_exposure import cycle_plan as cp
 
-KNOWN = ("researcher", "worker", "auditor", "reporter", "curator")
+# The contract is the score's FLOW, not every agent it defines: only flow
+# members have their inputs populated by the cycle loop.
+CYCLE_FLOW = ("researcher", "worker", "auditor")
+KNOWN = CYCLE_FLOW  # back-compat alias for the tests below
 
 
 def _loop(**overrides):
@@ -127,11 +130,34 @@ class ParseTests(unittest.TestCase):
         ):
             self.assertIsNone(cp.parse(text, _loop(), KNOWN), text)
 
-    def test_reporter_is_schedulable_when_the_score_defines_it(self):
-        """Validation is against the score, not a hard-coded role list."""
+    def test_out_of_cycle_agents_are_not_schedulable(self):
+        """Only flow members have their inputs populated by the cycle loop.
+
+        A plan naming final_auditor / final_reporter / curator / reporter
+        would run that agent with [UNAVAILABLE: stage],
+        [UNAVAILABLE: expected_file] and so on — a full turn spent producing
+        something unusable, and for the roles with agent_teams: true,
+        possibly teammates spawned to do it.
+        """
+        for role in ("reporter", "curator", "final_auditor", "final_reporter"):
+            self.assertIsNone(
+                cp.parse(
+                    _block("worker", role),
+                    _loop(max_turns_per_cycle=4),
+                    CYCLE_FLOW,
+                ),
+                role,
+            )
+
+    def test_a_score_with_a_wider_flow_can_schedule_its_own_roles(self):
+        """Validation follows the score's flow, not a hard-coded role list."""
         self.assertEqual(
-            cp.parse(_block("worker", "reporter"), _loop(max_turns_per_cycle=4), KNOWN),
-            ["worker", "reporter"],
+            cp.parse(
+                _block("worker", "verifier"),
+                _loop(max_turns_per_cycle=4),
+                ["researcher", "worker", "verifier", "auditor"],
+            ),
+            ["worker", "verifier"],
         )
 
     def test_rationale_and_directives_are_extracted(self):
@@ -201,10 +227,22 @@ class EscalationTests(unittest.TestCase):
         self.assertFalse(cp.wants_audit(""))
         self.assertFalse(cp.wants_audit(None))
 
-    def test_insert_places_the_auditor_after_the_escalating_worker(self):
+    def test_the_escalated_auditor_goes_last_not_mid_chain(self):
+        """Auditing between chained workers would audit half a cycle.
+
+        Inserting at the escalating worker's position would run the audit
+        before worker 2, so audit_report and the memoir would describe only
+        part of the cycle's work and the next researcher would read that
+        partial verdict as the cycle's. It would also contradict the
+        parser's own "auditor is always moved last" rule.
+        """
         self.assertEqual(
             cp.insert_requested_audit(["researcher", "worker", "worker"], 1),
-            ["researcher", "worker", "auditor", "worker"],
+            ["researcher", "worker", "worker", "auditor"],
+        )
+        self.assertEqual(
+            cp.insert_requested_audit(["researcher", "worker", "worker"], 2),
+            ["researcher", "worker", "worker", "auditor"],
         )
 
     def test_insert_is_a_no_op_when_an_auditor_is_already_scheduled(self):
@@ -654,3 +692,100 @@ class CloneTests(unittest.TestCase):
                 task_override=None, instance_dir=inst,
             )
         self.assertEqual(seen, ["researcher", "worker", "auditor"])
+
+
+class EscalationPlacementIntegrationTests(unittest.TestCase):
+    """An escalated audit must cover the WHOLE cycle, not part of it."""
+
+    def tearDown(self):
+        telemetry.configure({"telemetry": {"enabled": False}}, None, None)
+
+    def test_worker_one_of_a_chain_escalating_still_audits_last(self):
+        seen = []
+
+        def fake(agent_name, agent_def, **kwargs):
+            seen.append(agent_name)
+            body = agent_name + " out " + ("x" * 2100)
+            if agent_name == "researcher":
+                body += "\n" + _block("worker", "worker")
+            # Only the FIRST worker escalates.
+            if agent_name == "worker" and seen.count("worker") == 1:
+                body += "\n[[REQUEST_AUDIT]]\n"
+            return {
+                "agent": agent_name,
+                "outputs": {agent_def["outputs"][0]: body},
+                "usage": {"input_tokens": 100, "output_tokens": 2100},
+                "duration_ms": 10, "status": "ok", "error": None,
+                "cost_usd": 0.0, "num_turns": 1, "tool_calls": 1,
+            }
+
+        td = tempfile.mkdtemp()
+        score, config, inst = _write_files(
+            Path(td),
+            loop_extra=(
+                "  max_cycles: 1\n"
+                "  cycle_planning:\n"
+                "    enabled: true\n"
+                "    audit_floor_cycles: 9\n"
+            ),
+        )
+        with patch("long_exposure.exploration._call_exploration_agent", fake):
+            run_exploration(
+                score_path=str(score), config_path=str(config),
+                output_dir=inst / "output",
+                state_path=inst / "exploration_state.json",
+                task_override=None, instance_dir=inst,
+            )
+        self.assertEqual(
+            seen, ["researcher", "worker", "worker", "auditor"],
+            "the escalated auditor must run after BOTH workers",
+        )
+
+    def test_the_auditor_sees_both_worker_turns(self):
+        """The reason placement matters: audit input completeness."""
+        import json
+
+        seen = []
+        audit_inputs = {}
+
+        def fake(agent_name, agent_def, **kwargs):
+            seen.append(agent_name)
+            if agent_name == "auditor":
+                audit_inputs["work_output"] = (
+                    kwargs.get("results") or {}
+                ).get("work_output", "")
+            body = agent_name + " out " + ("x" * 2100)
+            if agent_name == "researcher":
+                body += "\n" + _block("worker", "worker")
+            if agent_name == "worker":
+                body += f"\nTURN-MARKER-{seen.count('worker')}"
+                if seen.count("worker") == 1:
+                    body += "\n[[REQUEST_AUDIT]]\n"
+            return {
+                "agent": agent_name,
+                "outputs": {agent_def["outputs"][0]: body},
+                "usage": {"input_tokens": 100, "output_tokens": 2100},
+                "duration_ms": 10, "status": "ok", "error": None,
+                "cost_usd": 0.0, "num_turns": 1, "tool_calls": 1,
+            }
+
+        td = tempfile.mkdtemp()
+        score, config, inst = _write_files(
+            Path(td),
+            loop_extra=(
+                "  max_cycles: 1\n"
+                "  cycle_planning:\n"
+                "    enabled: true\n"
+                "    audit_floor_cycles: 9\n"
+            ),
+        )
+        with patch("long_exposure.exploration._call_exploration_agent", fake):
+            run_exploration(
+                score_path=str(score), config_path=str(config),
+                output_dir=inst / "output",
+                state_path=inst / "exploration_state.json",
+                task_override=None, instance_dir=inst,
+            )
+        work = audit_inputs.get("work_output", "")
+        self.assertIn("TURN-MARKER-1", work)
+        self.assertIn("TURN-MARKER-2", work)

@@ -56,6 +56,7 @@ from typing import Any
 from long_exposure import agent_routing
 from long_exposure import model_profiles as _model_profiles
 from long_exposure import spend_limit as _spend_limit
+from long_exposure.flags import truthy
 
 ANSWERS_FILENAME = "gate_answers.json"
 DEFAULT_REGISTRY = Path.home() / ".long-exposure" / "runs.jsonl"
@@ -102,7 +103,9 @@ def settings(config: dict | None) -> dict:
 
 
 def enabled(config: dict | None) -> bool:
-    return bool(settings(config).get("enabled"))
+    return truthy(
+        settings(config).get("enabled"), name="startup_gate.enabled",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +551,7 @@ def ask(
 
     # -- Q4: spend limit (only when the feature is on) -------------------
     allowance = _spend_limit.settings(config)
-    if allowance.get("enabled"):
+    if truthy(allowance.get("enabled"), name="usage_allowance.enabled"):
         if flags.get("usage_run_pct") is not None:
             answers["usage_run_pct"] = float(flags["usage_run_pct"])
         else:

@@ -208,6 +208,10 @@ class ReportingTests(unittest.TestCase):
         sl.check(80.0, _cfg(), source="t")
         out = sl.summary_lines(_cfg(), 80.0)
         self.assertIn("KILLED", out)
+        # Not "**Status:**": the status file already has one of those, and
+        # two differently-worded Status lines in one artifact is confusing
+        # for the operator reading it to find out why the run stopped.
+        self.assertNotIn("**Status:**", out)
         self.assertIn(sl.MARKER_FILENAME, out)
         self.assertIn("end-of-run pipeline was skipped", out)
 
@@ -262,10 +266,20 @@ class WiringTests(unittest.TestCase):
         close = self.exp.rindex("conn.close()")
         self.assertLess(close, raise_at)
 
-    def test_barrier_cascades_the_stop_file_to_clones(self):
-        idx = self.fan.index('source="fanout_barrier"')
-        window = self.fan[idx:idx + 900]
-        self.assertIn("long-exposure.stop", window)
+    def test_barrier_signals_and_terminates_on_a_trip(self):
+        """Behaviour is proven in FanOutKillTests; this guards the structure.
+
+        Scoped to the trip branch by slicing from the barrier's check to the
+        `continue` that collapses it, so the assertions cannot drift onto the
+        unrelated 10h-cap or preemption code below.
+        """
+        start = self.fan.index('source="fanout_barrier"')
+        end = self.fan.index("Stage 9: graceful barrier preemption check", start)
+        branch = self.fan[start:end]
+        self.assertIn("long-exposure.stop", branch)
+        self.assertIn("SIGTERM", branch)
+        self.assertIn("SIGKILL", branch)
+        self.assertIn("SPEND_KILL_GRACE_SECONDS", branch)
 
     def test_exit_code_is_a_distinct_nonzero(self):
         from long_exposure.exploration import SpendLimitKill
@@ -453,3 +467,286 @@ class KillPathIntegrationTests(unittest.TestCase):
         self.assertIn("Run spend limit", status)
         self.assertIn("operator-declared", status)
         self.assertIn("not a meter reading", status)
+
+
+class TripwireConcurrencyTests(unittest.TestCase):
+    """Spend is recorded from the cycle loop AND the manager poller thread.
+
+    manager.py calls _call_agent_with_rotation -> _record_usage -> check, and
+    _manager_loop runs in a daemon thread under `launch --manager`, so two
+    threads really can reach the tripwire at once.
+    """
+
+    def setUp(self):
+        sl.reset()
+
+    def tearDown(self):
+        sl.reset()
+
+    def test_exactly_one_trip_record_under_contention(self):
+        import threading
+
+        cfg = _cfg()
+        records = []
+
+        def tripper(tid):
+            # _cfg() is a $80 cap; every thread is over it, so they all race
+            # to be the one that trips.
+            for _ in range(500):
+                r = sl.check(100.0 + tid, cfg, source=f"t{tid}")
+                if r:
+                    records.append(r)
+
+        threads = [threading.Thread(target=tripper, args=(t,)) for t in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertTrue(records)
+        distinct = {
+            (r["source"], r["observed_usd"], r["tripped_at"]) for r in records
+        }
+        self.assertEqual(len(distinct), 1, f"multiple trip records: {distinct}")
+        self.assertEqual(sl.tripped()["observed_usd"], records[0]["observed_usd"])
+
+    def test_reset_and_check_interleaved_never_raise(self):
+        import threading
+
+        cfg = _cfg()
+        errors = []
+
+        def churn():
+            for i in range(2000):
+                try:
+                    if i % 7 == 0:
+                        sl.reset()
+                    sl.check(80.0, cfg, source="churn")
+                    sl.tripped()
+                except Exception as e:  # noqa: BLE001
+                    errors.append(e)
+
+        threads = [threading.Thread(target=churn) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+
+
+class StaleMarkerTests(unittest.TestCase):
+    """A clean resume must not still look killed."""
+
+    def setUp(self):
+        sl.reset()
+
+    def test_clear_marker_removes_it(self):
+        with TemporaryDirectory() as td:
+            sl.check(80.0, _cfg(), source="t")
+            sl.write_marker(td, cycle=1)
+            self.assertTrue(sl.marker_path(td).exists())
+            self.assertTrue(sl.clear_marker(td))
+            self.assertFalse(sl.marker_path(td).exists())
+
+    def test_clear_marker_is_a_no_op_when_absent(self):
+        with TemporaryDirectory() as td:
+            self.assertFalse(sl.clear_marker(td))
+
+    def test_clear_marker_survives_an_unlink_failure(self):
+        with TemporaryDirectory() as td:
+            sl.check(80.0, _cfg(), source="t")
+            sl.write_marker(td, cycle=1)
+            with mock.patch.object(Path, "unlink", side_effect=OSError("ro")):
+                self.assertFalse(sl.clear_marker(td))
+
+    def test_a_clean_run_clears_a_marker_from_a_killed_one(self):
+        """End to end: kill at a low cap, raise it, resume, marker gone."""
+        import tempfile
+        from unittest.mock import patch
+
+        from long_exposure.exploration import SpendLimitKill, run_exploration
+        from tests.test_run_switches import _write_files
+
+        td = Path(tempfile.mkdtemp())
+        (td / "run").mkdir()
+        score, config, inst = _write_files(td / "run", loop_extra="  max_cycles: 6\n")
+        base = config.read_text()
+
+        def write_cfg(pct):
+            config.write_text(
+                base
+                + "usage_allowance:\n  enabled: true\n"
+                + "  weekly_allowance_usd: 100\n"
+                + f"  run_pct: {pct}\n"
+            )
+
+        def fake(agent_name, agent_def, **kwargs):
+            return {
+                "agent": agent_name,
+                "outputs": {agent_def["outputs"][0]: agent_name + " " + "x" * 2100},
+                "usage": {"input_tokens": 100, "output_tokens": 600},
+                "duration_ms": 5, "status": "ok", "error": None,
+                "cost_usd": 1.0, "num_turns": 1, "tool_calls": 1,
+            }
+
+        def go():
+            with patch(
+                "long_exposure.exploration._call_exploration_agent", fake
+            ):
+                run_exploration(
+                    score_path=str(score), config_path=str(config),
+                    output_dir=inst / "output",
+                    state_path=inst / "exploration_state.json",
+                    task_override=None, instance_dir=inst,
+                )
+
+        write_cfg(2)
+        sl.reset()
+        with self.assertRaises(SpendLimitKill):
+            go()
+        self.assertTrue((inst / "output" / sl.MARKER_FILENAME).exists())
+
+        write_cfg(90)  # room for the remaining cycles
+        sl.reset()
+        go()
+        self.assertFalse(
+            (inst / "output" / sl.MARKER_FILENAME).exists(),
+            "a clean resume still looks killed",
+        )
+
+
+class FanOutKillTests(unittest.TestCase):
+    """The barrier must TERMINATE clones on a trip, not just signal them.
+
+    A stop file is honoured at a clone's next cycle boundary, so a clone in
+    the middle of a long agent turn keeps spending until it finishes — up to
+    FANOUT_CAP_SECONDS (10h). For a limit whose purpose is to stop spending,
+    that is the opposite of a kill.
+
+    Uses real subprocesses so poll()/killpg behave as in production.
+    """
+
+    def setUp(self):
+        sl.reset()
+
+    def tearDown(self):
+        sl.reset()
+        from long_exposure import telemetry
+
+        telemetry.configure({"telemetry": {"enabled": False}}, None, None)
+        for _k, _cd, p in getattr(self, "_spawned", []):
+            if p.poll() is None:
+                try:
+                    import os
+                    import signal
+
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def test_a_trip_terminates_running_clones_promptly(self):
+        import json
+        import os
+        import subprocess
+        import tempfile
+        import threading
+        import time
+        from unittest.mock import patch
+
+        import long_exposure.exploration as exploration
+        from long_exposure import fanout
+
+        sb = Path(tempfile.mkdtemp())
+        root = sb / "root"
+        root.mkdir()
+        ws = sb / "ws"
+        ws.mkdir()
+        config = {
+            "usage_allowance": {
+                "enabled": True, "weekly_allowance_usd": 100, "run_pct": 10,
+            },
+            "working_directory": str(ws),
+            "llm_provider": "local", "model": "test",
+        }
+
+        self._spawned = []
+
+        def fake_spawn(cdir, fork_id, k, score_path, config_path, **kw):
+            p = subprocess.Popen(["sleep", "60"], start_new_session=True)
+            self._spawned.append((k, Path(cdir), p))
+            return p
+
+        stop = threading.Event()
+
+        def clone_writer():
+            """Report clone spend the way a live clone's status write does."""
+            time.sleep(0.2)
+            for step in range(1, 40):
+                if stop.is_set():
+                    return
+                for _k, cdir, _p in list(self._spawned):
+                    out = Path(cdir) / "output"
+                    out.mkdir(parents=True, exist_ok=True)
+                    (out / "usage_summary.json").write_text(
+                        json.dumps({"totals": {"cost_usd": step * 2.0}})
+                    )
+                time.sleep(0.1)
+
+        # Root ledger stays well under the cap, so ONLY clone spend can trip
+        # it — the property that distinguishes this from the root-side check.
+        exploration._usage.load({})
+        exploration._usage.record(
+            "researcher",
+            {"usage": {"input_tokens": 10, "output_tokens": 10},
+             "cost_usd": 0.5, "status": "ok", "num_turns": 1, "tool_calls": 1},
+            provider="local", model="test", config=config,
+        )
+        self.assertLess(exploration._usage.total_cost_usd(), 10.0)
+
+        threading.Thread(target=clone_writer, daemon=True).start()
+        started = time.monotonic()
+        try:
+            with patch.object(fanout, "_spawn_clone", fake_spawn), \
+                 patch.object(fanout, "SPEND_KILL_GRACE_SECONDS", 1):
+                fanout._run_fanout_conductor(
+                    branches=[
+                        {"objective": "a", "output_artifact": "a.md"},
+                        {"objective": "b", "output_artifact": "b.md"},
+                    ],
+                    score_path="long_exposure/exploration-score.yaml",
+                    config_path=None, root_instance_dir=root, data_dir=root,
+                    task="t", parent_results={}, parent_agent_sessions={},
+                    parent_agent_summaries={}, working_directory=str(ws),
+                    parent_run_id="run-t", reporter_def=None,
+                    config=config,
+                    loop_cfg={"barrier_preempt_timeout_seconds": 0,
+                              "min_clone_cycles_before_preempt": 0},
+                )
+        finally:
+            stop.set()
+        elapsed = time.monotonic() - started
+
+        trip = sl.tripped()
+        self.assertIsNotNone(trip, "clone spend did not trip the limit")
+        self.assertEqual(trip["source"], "fanout_barrier")
+        self.assertGreater(trip["clone_usd"], 0.0)
+        self.assertLess(trip["root_usd"], 10.0)
+
+        # The clones were `sleep 60`. If the barrier had only signalled them,
+        # it would have waited the full 60s.
+        self.assertLess(
+            elapsed, 30.0,
+            f"barrier took {elapsed:.1f}s — it waited for the clones instead "
+            "of terminating them",
+        )
+        for _k, _cd, p in self._spawned:
+            self.assertIsNotNone(
+                p.poll(), "a clone process outlived the barrier",
+            )
+
+    def test_the_grace_period_is_short_by_design(self):
+        """The 10h-cap path allows 120s; spending that long here is absurd."""
+        from long_exposure import fanout
+
+        self.assertLessEqual(fanout.SPEND_KILL_GRACE_SECONDS, 30)
+        self.assertGreater(fanout.SPEND_KILL_GRACE_SECONDS, 0)

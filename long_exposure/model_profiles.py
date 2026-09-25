@@ -31,6 +31,8 @@ roles on the same model.
 
 from __future__ import annotations
 
+from long_exposure.flags import truthy
+
 STANDARD = "standard"
 ADVANCED = "advanced"
 PROFILES = (STANDARD, ADVANCED)
@@ -109,7 +111,9 @@ def settings(config: dict | None) -> dict:
 
 
 def enabled(config: dict | None) -> bool:
-    return bool(settings(config).get("enabled"))
+    return truthy(
+        settings(config).get("enabled"), name="model_profiles.enabled",
+    )
 
 
 def _match_family(model: str, families: dict) -> str | None:
@@ -144,7 +148,7 @@ def resolve(config: dict | None) -> str:
     typo must never silently thin a prompt.
     """
     cfg = settings(config)
-    if not cfg.get("enabled"):
+    if not enabled(config):
         return STANDARD
 
     fallback = str(cfg.get("default") or STANDARD).strip().lower()
@@ -160,7 +164,7 @@ def resolve(config: dict | None) -> str:
         _warn(f"unknown profile {explicit!r}; using {fallback!r}.")
         return fallback
 
-    if cfg.get("auto"):
+    if truthy(cfg.get("auto"), True, name="model_profiles.auto"):
         matched = _match_family(
             str((config or {}).get("model") or ""), cfg.get("families") or {}
         )
@@ -173,7 +177,7 @@ def resolve(config: dict | None) -> str:
 def knobs(config: dict | None) -> dict:
     """The knob values this config's profile sets, with `overrides` on top."""
     cfg = settings(config)
-    if not cfg.get("enabled"):
+    if not enabled(config):
         return {}
 
     resolved = dict(PROFILE_KNOBS.get(resolve(config), {}))
