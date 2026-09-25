@@ -336,7 +336,54 @@ it needs only §3's git sync layer, which is the first thing on the build list
 anyway. The K = 1/3/8 branch-count experiment from draft 2 is **withdrawn**:
 under federation, local branch count is not the scaling dial.
 
-## 5. Hooks worth adopting, ranked by what they actually fix
+## 5. Hooks — BUILT (2026-09-25)
+
+The three chosen hooks are implemented, tested (42 tests) and verified
+against a live `claude -p`. What follows is the design rationale, with the
+implementation notes folded in.
+
+### 5.0 What shipped
+
+| Piece | Where |
+|---|---|
+| Shared stdin/stdout protocol | `long_exposure/hooks/_io.py` |
+| `PreToolUse` path fence | `long_exposure/hooks/fence.py` |
+| `Stop` output-envelope check | `long_exposure/hooks/envelope.py` |
+| `PreCompact`/`PostCompact` observability | `long_exposure/hooks/compaction.py` |
+| Per-vendor installer + fail-closed verify | `long_exposure/hooks_install.py` |
+| CLI | `long-exposure hooks-install [--target …] [--verify] [--uninstall] [--dry-run]` |
+| Config | `hooks:` block in config.yaml |
+| Harness wiring | `orchestrator._add_hook_env`, called on every agent turn |
+
+Two things the live testing changed, both worth recording because neither
+was visible from the design:
+
+- **Both behaviour-changing hooks are gated on being inside a harness
+  turn** (`LONG_EXPOSURE_HOOK_ACTIVE`, set by `_add_hook_env`). An ungated
+  envelope hook nudged a bare `claude -p` turn into inventing an
+  `[OUTPUT: result]` label it was never asked for — the model said so
+  itself: *"no output type was ever declared to me in this conversation,
+  I'll use a generic label"*. Installed in an operator's home config, that
+  would tax every unrelated turn they take.
+- **The fence defaults to `scope: turn`** for the same reason plus a
+  sharper one: `scope: always` would deny the *operator* access to the
+  harness source tree, which is where they develop it.
+
+Verified live four ways: denies the harness root inside a harness turn,
+allows ordinary commands, stays silent outside a harness turn, and makes the
+agent emit the correctly-named `[OUTPUT: work_output]` block.
+
+### 5.0.1 The bug the tests caught
+
+The installer's ownership marker was the module name
+(`long_exposure.hooks`), which appears only inside the shim's text — while
+the vendor config stores the shim's **path** (`long-exposure-fence.sh`). So
+`_is_ours` never matched: uninstall silently left our entries behind and a
+re-install would have duplicated them. Matched on the shim basename now,
+against the known hook names, so an operator's own script living under a
+path that happens to contain "long-exposure" is never removed.
+
+### 5.1 `PreToolUse` on Bash → make the directory fence real (highest value)
 
 Each is a hardening of guidance that already exists in prompt text, and each
 maps to a problem this repo has already had.
@@ -407,7 +454,18 @@ ledger — the guidance even reasons about "halves per-teammate cost" without
 being able to measure it. These hooks give a per-teammate record, which the
 ledger could attribute rather than folding into the lead's row.
 
-### 5.6 Deliberately **not** adopting
+### 5.6 Threat model, stated once and plainly
+
+The fence **stops mistakes, not adversaries.** It matches off-limits paths
+against the literal text of a command, so a path assembled from shell
+variables, an unexpanded `$HOME`, base64, or a `cd` followed by a relative
+reference would all pass. That is the correct trade for the actual risk: the
+failure it prevents is an agent that reasoned its way to `rm -rf` on the
+wrong tree, or decided the harness had a bug worth patching mid-run. It is
+not a sandbox and the docs must not describe it as one. Real isolation is a
+container boundary — a deployment decision, not a hook.
+
+### 5.7 Deliberately **not** adopting
 
 - **`WorktreeCreate` / `WorktreeRemove`** — Claude-only, and the repo already
   documents worktree isolation silently failing in team mode. If worktrees
@@ -428,13 +486,10 @@ ledger could attribute rather than folding into the lead's row.
 
 1. **Git sync layer** (§3). Unlocks the scenario actually described, pure
    git, vendor-neutral, modest scope.
-2. **`PreToolUse` path fence** (§5.1). Turns the harness's most important
-   soft boundary into a hard one; identical on Claude and Codex.
-3. **`PreCompact`/`PostCompact` observability** (§5.4). Nearly free, and it
-   improves the cost model everything else is reasoned from.
-4. **`Stop` output-envelope enforcement** (§5.2). Prevents a bug class with
-   a known incident history.
-5. **`PostToolUse` validators** (§5.3). Nice-to-have.
+2. ~~**`PreToolUse` path fence**~~ — **DONE** (§5.0).
+3. ~~**`PreCompact`/`PostCompact` observability**~~ — **DONE** (§5.0).
+4. ~~**`Stop` output-envelope enforcement**~~ — **DONE** (§5.0).
+5. **`PostToolUse` validators** (§5.3). Not in the first cut, by decision.
 6. **The two-operator federation experiment** (§4.5) — which needs only
    item 1, and answers the slice-granularity question with data.
 7. **Claims registry, union-merged ledger, per-operator memoirs** (§4.2),

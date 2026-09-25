@@ -81,6 +81,47 @@ pre-edited score, but you'll usually want to pass the directive inline.
 
 ---
 
+## Lifecycle hooks (opt-in)
+
+Three hooks that harden rules the system prompt already states. Off until
+installed, and installed by their own command — never as a side effect of
+anything else, because they write into files you own:
+
+```bash
+long-exposure hooks-install --target all       # ~/.claude, ~/.codex, ~/.gemini
+long-exposure hooks-install --target claude --directory .   # project-local
+long-exposure hooks-install --verify           # exercise the fence, exit 1 if inert
+long-exposure hooks-install --uninstall        # removes only our entries
+```
+
+| Hook | Event | What it does |
+|---|---|---|
+| **fence** | `PreToolUse` | Denies commands touching the off-limits paths the operating protocol names — provider credentials, SSH/GPG keys, `~/.env`, shell and git config, and the harness's own source tree |
+| **envelope** | `Stop` | If the final message has no complete `[OUTPUT: x]` block, continues the turn and asks for it. Prevents the deliverable being lost behind a trailing checkpoint |
+| **compaction** | `PreCompact`, `PostCompact` | One `health_events` row per provider-side compaction, which the harness cannot otherwise see |
+
+Claude and Codex run the same scripts unmodified. Gemini gets the fence
+(as `BeforeTool`) and is told the other two have no equivalent event.
+
+**They only act inside a long-exposure agent turn.** Your own interactive
+sessions with either CLI are untouched — the harness sets an env var when it
+spawns an agent, and the hooks check for it. That also means
+`hooks.fence.scope: always` is available but not the default: `always` would
+deny *you* access to the harness source tree.
+
+**The fence stops mistakes, not adversaries.** It matches paths against the
+literal command text, so an obfuscated path would pass. It exists because
+these runs go for hours, unattended, with tool permissions pre-granted, and
+the harness root is on every agent's `PYTHONPATH`. Real isolation is a
+container.
+
+Set `hooks.fence.required: true` to refuse to start a run when the fence is
+installed but not actually enforcing — checked by exercising it, not by
+reading config, since a shim can point at a moved checkout or lose its
+execute bit.
+
+---
+
 ## The startup gate (opt-in)
 
 Off by default. When `startup_gate.enabled` is true in config.yaml,
