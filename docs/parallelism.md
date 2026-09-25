@@ -537,12 +537,30 @@ are never fatal: a clone that has not written a summary yet, or one caught
 mid-flush, must not be able to crash the root's poll. An under-read delays
 the kill by one poll; an exception would lose the run.
 
-On a trip the root writes `long-exposure.stop` into each running clone dir
-and then falls through to the existing post-barrier sweep, which SIGTERMs
-each clone's process group (10 s grace, then SIGKILL). Clones were spawned
-with `start_new_session=True`, so that takes their provider CLI subprocesses
-with them — without it, clones would outlive the root and keep spending past
-the limit that just killed it.
+On a trip the root does three things in order, and the order is the point:
+
+1. writes `long-exposure.stop` into each running clone dir, so a clone that
+   is between cycles can exit cleanly and write its own merge report;
+2. waits `SPEND_KILL_GRACE_SECONDS` (10 s) for a merge report already
+   mid-write — short by design, since the 120 s the 10 h-cap path allows
+   would mean spending for two more minutes to stop spending;
+3. **terminates each still-running clone's process group** — SIGTERM, 5 s,
+   then SIGKILL.
+
+Step 3 is what makes this a kill. A stop file is honoured at a clone's next
+cycle boundary, so a clone in the middle of a long agent turn would otherwise
+keep spending until it finished — up to `FANOUT_CAP_SECONDS`, ten hours —
+while the root sat in the barrier waiting for it. Measured against real
+subprocesses that ignore the stop file: 61 s of waiting became 15 s.
+
+Clones are spawned with `start_new_session=True`, so killing the process
+group takes their provider CLI subprocesses with them. Every running branch
+is given a terminal state in the same pass, so the barrier collapses on that
+iteration rather than polling again.
+
+A branch terminated this way is marked `killed_spend_limit` and gets a
+placeholder merge report recording that the work it wrote to the shared
+workspace is intact — only its report was lost.
 
 Clones never enforce the cap themselves; see the "Enforcement lives at the
 root" note in configuration-reference.md for why.

@@ -1,12 +1,27 @@
 # ResearchClawBench: execution plan for the bench-mode branch
 
 Scope: one venue, one model, **one arm**, one shot per task. This is the
-runnable plan for `claude/long-exposure-benchmarking-pikxm2`. The wider
-survey and the rejected venues stay in `docs/benchmarking-plan.md`; this
-document supersedes its §5.2.
+runnable plan for the advanced-mode branch. The wider survey and the
+rejected venues stay in `docs/benchmarking-plan.md`; this document
+supersedes its §5.2.
 
-Status: **pre-registration.** Nothing here has been run. Peer numbers are
-from the published paper, not from our runs.
+Status: **pre-registration, revised.** Nothing here has been run. Peer
+numbers are from the published paper, not from our runs.
+
+**Revision (2026-09-25).** The original pre-registration described a
+fixed-flow, full-guidance harness. The run now also enables
+`loop.cycle_planning`, so the researcher shapes each cycle's tail — a real
+behavioural change, and the substance of what this run measures beyond
+stock. `model_profiles` is enabled too but is **inert on Opus 4.6**, so the
+guidance stack is *not* thinned. §5.5 states exactly what the configuration
+yields, §2 gap 5 records that cycle planning has no prior live mileage, and
+§9 carries the kill criterion for it. The results must not be described as
+measuring thinned guidance.
+
+**Sequence before launch:** implement → live-test the branch → re-read this
+plan's §5 and §10 against the code → launch. The features are covered by
+640 tests, 200k fuzzed plan blocks and multi-cycle runs against a stubbed
+provider, but no live model has emitted a plan block yet.
 
 ---
 
@@ -85,6 +100,12 @@ final auditor and final reporter (§5), on `claude-opus-4-6`, across all 40
 tasks, one attempt each. No baseline arm, no ablation grid. 41 runs
 including the smoke test.
 
+**The configuration in one line:** main's stock budget, this branch's bug
+fixes, the run memoir on, and **researcher-planned cycle tails on**. Model
+capability profiles are enabled but inert on this model, so the guidance
+stack is *not* thinned — §5.5 spells that out, and the results must not be
+described as measuring thinned guidance.
+
 ### What it measures
 
 - **A harness comparison on a shared model.** Our score sits next to
@@ -95,14 +116,15 @@ including the smoke test.
 - **Whether the pair approaches the benchmark's own threshold.** Fifty
   means the hidden target paper was re-discovered; nothing published is
   close.
-- **How the harness behaves on 40 real research tasks at its default
-  operating point** — cycles to exhaustion, auditor verdict patterns,
-  fan-out incidence, spend, failure modes (§7.6). Engineering evidence
-  that stands on its own.
+- **How the harness behaves on 40 real research tasks at this operating
+  point** — cycles to exhaustion, auditor verdict patterns, fan-out
+  incidence, spend, failure modes (§7.6). Engineering evidence that stands
+  on its own. Note "this operating point", not "its default": cycle
+  planning is on, which the shipped default is not.
 
 ### What it still cannot establish
 
-The model is controlled; the *conditions* are not. Four gaps, all of which
+The model is controlled; the *conditions* are not. Five gaps, all of which
 must travel with the number:
 
 1. **Different judge invocation.** Same judge model name (`gpt-5.1`), but
@@ -113,12 +135,20 @@ must travel with the number:
 3. **One run per task on both sides.** Neither our number nor theirs
    carries a variance estimate, so a small gap is not distinguishable from
    run-to-run noise.
-4. **No compute-matched control.** Long-exposure at its default operating
-   point spends one to two orders of magnitude more tokens than Claude
-   Code's single call. A win is a win *at the harness's own operating
-   point*, not at equal spend.
+4. **No compute-matched control.** Long-exposure at this operating point
+   spends one to two orders of magnitude more tokens than Claude Code's
+   single call. A win is a win *at the harness's own operating point*, not
+   at equal spend.
+5. **Cycle planning has never run against a real model.** It is covered by
+   unit tests, 200k fuzzed blocks and multi-cycle runs against a stubbed
+   provider, but no live model has yet emitted a `<cycle_plan>` block. Two
+   distinct unknowns follow: whether the model emits well-formed blocks at
+   all (a high `cycle_plan_rejected` count would mean the guidance is not
+   landing), and whether its scheduling judgement is good (if the audit
+   floor and worker escalations supply most of the audits, it is not). A
+   smoke task must be inspected for both before the full pass — see §9.
 
-Three sentences are therefore pre-registered for the conclusions, so they
+Four sentences are therefore pre-registered for the conclusions, so they
 cannot be dropped when the numbers arrive:
 
 1. The comparison to 21.5 and 19.9 is **same-model but not
@@ -128,6 +158,9 @@ cannot be dropped when the numbers arrive:
    conditions gap above is unquantified.
 3. There was **no compute-matched control**, so any advantage is
    confounded with spending far more tokens.
+4. The run used **researcher-planned cycle tails, a configuration with no
+   prior live mileage**, and the guidance stack was **not** thinned
+   (`model_profiles` is inert on this model).
 
 An in-house baseline — RCB's Claude Code preset on `claude-opus-4-6`, 40
 runs, roughly $80–$200 notional — is what would close gap 1 and 2 and turn
@@ -250,18 +283,28 @@ means *every cycle*, not *never* (`exploration.py:4980` tests `>=`); and
 `agents.json` entry in §10. It also carries the retrieval denylist and
 egress policy from §7.3.
 
-**4. Smoke test and two reads** (one day). One validation task, the real
-config, stopped after three cycles. Asserts: `report/report.md` exists, is
-non-empty, and `result.json` records its source file; `result.json` has
-non-zero cost, tool calls and turns; the `compact_db` path is task-local;
-the served model is `claude-opus-4-6`; no call hit the idle watchdog; the
-retrieval log is being captured.
+**4. Smoke test and three reads** (one day). One validation task, the real
+config, stopped after **six** cycles — not three, because the audit floor
+is 2 and a shorter run cannot show the floor firing. Asserts:
+`report/report.md` exists, is non-empty, and `result.json` records its
+source file; `result.json` has non-zero cost, tool calls and turns; the
+`compact_db` path is task-local; the served model is `claude-opus-4-6`; no
+call hit the idle watchdog; the retrieval log is being captured; and the
+resolved capability profile is `standard` (it must be — §5.5; an
+`advanced` here means the family list was edited by accident).
 
 Then, read by a human from the artifacts:
 
 - **Report shape.** The deliverable must read as clear, concise
   synthesized findings, not a process log. The periodic reporter is
   cumulative by design, so this is the check most likely to fail.
+- **Cycle-plan fit** — the new read, and the one with no prior mileage
+  (§2 gap 5). From the transcripts and `health_events.jsonl`: did the
+  researcher emit any block at all; were the blocks well-formed
+  (`cycle_plan_rejected` near zero); do the planned shapes look sensible
+  against what the brief asked for; did the audit floor fire at cycle 3 as
+  designed; and did the periodic reporter still flush a deliverable
+  despite longer cycles. This read decides §9's planning kill criterion.
 - **Prompt fit** (sanity check, not a risk on this model — see §3). One
   trim is allowed here, decided from transcripts and never from scores
   (§7.2), then frozen.
@@ -341,7 +384,7 @@ exhaustion-vs-10 h split is a reported result, not a footnote:** if a
 large share of tasks hit the cap, the headline is "score after 10 h"
 rather than "score at natural exhaustion", and the write-up must say so.
 
-### The four deliberate deviations from stock
+### The deliberate deviations from stock
 
 | Deviation | Why |
 |---|---|
@@ -349,9 +392,60 @@ rather than "score at natural exhaustion", and the write-up must say so.
 | `end_of_run.final_auditor: false`, `final_reporter: false` | Operator decision; see the deliverable note |
 | `compact_db` → absolute, per task | Cross-task contamination (§4 item 1) |
 | `working_directory` → the RCB task workspace | Required by the adapter contract |
+| `loop.cycle_planning.enabled: true` | Operator decision; see §5.5 |
+| `model_profiles.enabled: true` | Operator decision; see §5.5 — **inert on this model** |
 
 Everything else — including `curator: true`, since "everything else on" —
-stays as shipped.
+stays as shipped. `usage_allowance` stays **off**: the budget is main's
+stock, which is unlimited, and adding a cap would be a further deviation.
+`startup_gate` stays **off**: the adapter drives runs non-interactively, and
+a gate with no TTY and no flags exits 4 (see configuration-reference.md).
+
+### 5.5 What "both features enabled" actually yields on Opus 4.6
+
+This needs stating plainly, because the decision to enable both features and
+the decision to run Opus 4.6 pull against each other.
+
+**`loop.cycle_planning` is active and changes the run.** The researcher may
+chain up to three workers in a cycle and may omit the auditor, bounded by an
+audit floor of 2 consecutive audit-free cycles, with `[[REQUEST_AUDIT]]`
+available to the worker. This is a real behavioural change from the fixed
+`researcher → worker → auditor` flow and is the substance of what the run
+measures beyond stock.
+
+**`model_profiles` is inert.** The feature thins guidance only for models
+listed in its `advanced` family, which ships as `[fable, astra]`. On
+`claude-opus-4-6` it resolves to `standard` and sets no knobs — verified, not
+assumed. So enabling it changes nothing about the assembled prompt for this
+run.
+
+That is not an accident of configuration; it is the feature working as
+designed. The profiles exist because the full guidance stack was calibrated
+for Opus 4.6 and 4.7 and suits them. Thinning it for the model it was tuned
+for would be measuring a configuration nobody would deploy.
+
+So this run measures: **stock harness + the bug fixes + agent-planned cycle
+tails, on Opus 4.6.** It does *not* measure the thinned guidance stack. The
+report must say exactly that rather than "both advanced-model features
+enabled", which would imply a prompt change that did not happen.
+
+If you want the thinned stack measured, one edit does it —
+`model_profiles.families.advanced: [fable, astra, claude-opus-4-6]` — but it
+changes the question from "does agent-planned scheduling help?" to "does
+thinning guidance hurt a model that never needed it thinned?", and it forfeits
+§1's comparability argument, which rests on Opus 4.6 running a
+recognisable harness. Left off.
+
+### 5.6 How cycle planning interacts with the rest of the plan
+
+| Plan element | Interaction |
+|---|---|
+| One shot per task (below) | Unchanged. Planning shapes cycles *within* the single attempt. |
+| Fan-out | Unchanged and still enabled. Fan-out already replaces worker and auditor for its cycle and takes precedence over a plan; a fan-out cycle runs no planned tail. |
+| Clones | Planning is root-only (`allow_in_clones: false`, shipped default). Every branch runs the fixed flow, which is what keeps branches comparable at the merge. |
+| The 10 h stance (§5.3) | Unchanged. Planning does not touch wall-clock limits. |
+| Harness diagnostics (§7.6) | Gains three counters: `cycle_plan_rejected`, `cycle_plan_audit_forced`, `cycle_plan_audit_requested`, all in `health_events.jsonl`. |
+| Reporting (§7.5) | Per task, record how many cycles were planned vs fixed, the flow each cycle ran, and the audit-free streak. A run where the researcher never plans is a null result for the feature and must be reported as one. |
 
 ### The deliverable, and one shot at it
 
@@ -556,13 +650,30 @@ so plainly rather than leaning on a p-value.
   one operator's hard-coded paths replaced by the derived harness root. A
   run on this branch does not see the prompt main would send — a
   behavioural difference, not just a bug fix.
-- **Which branch deltas can touch this run.** The only other behavioural
-  change between main and this branch that the graded configuration could
-  reach is the final-stage token threshold (20k → 100k) and the restored
-  `_N_MAX` cap — both inert here, because the final auditor and reporter
-  are off. Everything else is bug fixes, the two switches, and
-  observability. State this, with the diff published, so a reader need not
-  take it on trust.
+- **Which branch deltas can touch this run.** Three groups, and only the
+  first changes behaviour a judge could see:
+  - **Cycle planning (active).** The researcher shapes each cycle's tail.
+    Report the per-task split of planned vs fixed cycles, the flow each
+    cycle ran, worker-chain lengths, and how often the audit floor or a
+    worker escalation forced an auditor. A task where the researcher never
+    emitted a plan is a null result for the feature and is reported as one.
+  - **Inert in this configuration.** `model_profiles` (resolves to
+    `standard` on Opus 4.6, §5.5); the final-stage token threshold
+    (20k → 100k) and the restored `_N_MAX` cap (the final auditor and
+    reporter are off); the run memoir's fan-out shadow handling (no
+    behavioural effect at the root). The spend limit and startup gate are
+    off entirely.
+  - **Bug fixes and observability.** Everything else, including the two
+    switches and the usage ledger.
+
+  Publish the diff so a reader need not take the classification on trust.
+
+- **The run memoir is active and is a prompt difference.** `memoir.enabled`
+  ships `true`, so the researcher and worker each receive a `run_memory`
+  input of up to 3,000 tokens that main does not send, and the auditor is
+  asked to maintain it. This is narrative memory the published Claude Code
+  row did not have. Disclose it alongside the tool surface, and report the
+  memoir's size trajectory per task.
 
 ### 7.6 Harness diagnostics
 
@@ -572,6 +683,13 @@ it properly. All of it is already instrumented:
 - Cycles to termination per task, and the exhaustion-vs-10 h-cap split.
 - Auditor verdict distribution per cycle, and score against how many
   cycles the auditor gated.
+- **Cycle-planning counters**, from `health_events.jsonl`:
+  `cycle_plan_rejected` (a block the parser refused — a high count means
+  the guidance is not landing), `cycle_plan_audit_forced` (the floor
+  overrode the plan), `cycle_plan_audit_requested` (a worker escalated).
+  The last two together are the honest read on whether the researcher's
+  scheduling judgement was any good: if the floor and the workers are
+  supplying most of the audits, the planner is not earning its keep.
 - Fan-out incidence: branches spawned per task, and score on tasks where
   fan-out fired against tasks where it did not. Observational, and
   labelled so — the researcher chose when to fan out.
@@ -633,6 +751,10 @@ net.
 | Unlimited cycles hit the 10 h stop often | Exhaustion-vs-cap split per task | Re-frame the headline as "score after 10 h" |
 | Max-plan rate limits throttle a parallel pass | Rate-limit events in `result.json` | Lower parallelism; report cooldown time |
 | Fan-out clones cross-contaminate | §4 item 1 assertion per task | Isolation boundary is the task, not the clone |
+| The model never emits a `<cycle_plan>` block | `cycle_plan_rejected` count and the per-cycle flow log | Report it as a null result for the feature. Do NOT rewrite the guidance mid-campaign — that is tuning against the benchmark |
+| The model emits malformed blocks constantly | `cycle_plan_rejected` high on the smoke task | Decide before the full pass: run planning off (and say so), or fix the guidance and restart the pass. Never mid-campaign |
+| Planning skips audits and the score collapses | `cycle_plan_audit_forced` / `cycle_plan_audit_requested` vs score | A finding, not a fault: report it. It is evidence the researcher's scheduling judgement is poor on this model |
+| A planned worker chain starves the periodic reporter | `report_interval` is per cycle, and chaining makes cycles longer | Watch the smoke task's report count; if the deliverable never flushes, that is a kill criterion below |
 
 Kill criteria:
 
@@ -642,6 +764,13 @@ Kill criteria:
 - **If neither Opus 4.6 nor 4.7 is served, stop and re-decide** rather
   than substituting a current model, which would silently convert this
   back into the uncomparable experiment §1 exists to avoid.
+- **If the smoke task shows cycle planning misbehaving, decide before the
+  full pass, not during it.** Misbehaving means: the guidance is not
+  landing (mostly rejected blocks), or a worker chain is long enough that
+  the periodic reporter never flushes a gradeable deliverable. Either way
+  the choice is to run with planning off and disclose it, or fix and
+  restart the pass. Changing configuration mid-campaign forfeits the
+  pre-registration.
 
 ---
 
@@ -679,6 +808,29 @@ agent_models:
 working_directory: <WORKSPACE>           # per task
 compact_db: <INSTANCE_DIR>/sessions.db   # absolute, per task — isolation
 
+# --- branch-only keys, set explicitly for the record ---
+# Enabled per the operator decision, and INERT on this model: the advanced
+# family ships as [fable, astra], so claude-opus-4-6 resolves to `standard`
+# and no guidance knob is set. Verified, not assumed. See §5.5 — do not
+# report this run as measuring thinned guidance.
+model_profiles:
+  enabled: true
+  auto: true
+  default: standard
+  families:
+    advanced: [fable, astra]             # deliberately NOT claude-opus-4-6
+  overrides: {}
+
+# Off: the adapter drives runs non-interactively, and a gate with no TTY and
+# no flags exits 4.
+startup_gate:
+  enabled: false
+
+# Off: the budget is main's stock, which is unlimited. A cap here would be a
+# further deviation, and the ledger already records spend without gating.
+usage_allowance:
+  enabled: false
+
 # --- everything below is main's default, reproduced for the record ---
 cli_timeout: 0
 provider_idle_timeout_seconds: 1800
@@ -706,6 +858,16 @@ loop:
   # No max_cost_usd / max_tool_calls: main has no such keys, so the ledger
   # tracks and never gates.
   fanout_enabled: true           # branch-only key; true == main's behaviour
+  # Branch-only. The substance of what this run measures beyond stock:
+  # the researcher may shape the rest of each cycle. Bounds are the shipped
+  # defaults; see configuration-reference.md and §5.5/§5.6.
+  cycle_planning:
+    enabled: true
+    max_worker_chain: 3
+    max_turns_per_cycle: 4
+    audit_floor_cycles: 2
+    allow_in_clones: false       # root only — keeps branches comparable
+    worker_may_request_audit: true
   end_of_run:                    # branch-only key
     enabled: true
     final_auditor: false         # operator decision
@@ -755,6 +917,9 @@ JUDGE_API_KEY=...
 | Budget | Every ceiling, timer and cap as `main` ships them | Unlimited cycles, no cost cap; the ledger tracks without gating |
 | Outer bound | The harness's own 10 h, applied at the root | No new number invented; the root loop is the one place main leaves uncapped, and the exhaustion-vs-cap split is reported |
 | Configuration | All features on except the final auditor and final reporter; full 40-task scope | The periodic reporter is the deliverable; mechanism evidence is the §7.6 diagnostics |
+| Advanced-model features | **Both enabled.** `loop.cycle_planning` is active; `model_profiles` is enabled but **inert on Opus 4.6** | This run measures stock + the fixes + agent-planned cycle tails, NOT thinned guidance. §5.5 says why, and says what one edit would change it |
+| Spend limit | **Off** | The budget is main's stock, which is unlimited; a cap would be a further deviation |
+| Startup gate | **Off** | The adapter is non-interactive; the appendix records the configuration instead of `gate_answers.json` |
 | Attempts | One shot per task, then move on | Mean ± SEM over tasks with reference lines; no paired peer test (§7.4) |
 | Web access | Enabled, but no retrieval of the target papers or their results | Per-task denylist, egress block, post-hoc detection, disqualify-and-re-run |
 | Memorisation | Not probed | Largely common-mode for the comparison since the peer rows share the weights; absolute scores still reported as an upper bound (§7.3) |

@@ -10,6 +10,25 @@ per-agent overrides.
 (`PHILOSOPHY_PRESETS`, `FRAMEWORK_PRESETS`,
 `PHILOSOPHY_EFFORT_MAP`).
 
+## Boolean values
+
+Write `true` / `false`. The four opt-in features below
+(`model_profiles`, `usage_allowance`, `startup_gate`,
+`loop.cycle_planning`) parse their switches through
+`long_exposure/flags.py`, which also accepts `yes` / `no`, `on` / `off`,
+`1` / `0` and the quoted spellings of all of them, case-insensitively.
+
+That exists because YAML makes it easy to write a boolean that is not one.
+A quoted `enabled: "false"` is truthy to a bare `bool()`, so before this
+a run the operator believed was uncapped would be killed by the spend limit,
+and a flow they believed was fixed would start being planned by the
+researcher. An unrecognised value warns once and falls back to the
+documented default rather than silently choosing.
+
+Note that the older switches (`fanout_enabled`, `end_of_run`, and the rest)
+predate this and still use a plain `bool()`, so a quoted value there behaves
+the old way.
+
 ---
 
 ## config.yaml
@@ -406,7 +425,8 @@ See `persistence-and-gems.md` for the full scoring model.
 
 Thins the *ceremony* in the soft-guidance stack when the model running a turn
 is one you have declared advanced. Default off; with it off the assembled
-prompt is byte-identical to the pre-feature output.
+prompt is byte-identical to the output from before the feature existed
+(checked against that commit, not inferred — see `docs/soft-guidance.md`).
 
 ```yaml
 model_profiles:
@@ -439,11 +459,25 @@ without an enumerated gate list.
 `standard` sets nothing, so it can never override a knob you deliberately
 turned off in this file.
 
-**Resolution is per agent.** `agent_models` routes each role to its own
-model, and the profile is resolved from *that* model, so a Fable researcher
-can run the lean prompt while an Opus auditor in the same run keeps the full
-one. Measured saving on the shipped `staged` framework: ~1,950 tokens per
-advanced-profile agent turn.
+**Resolution is per agent** on the conductor paths: `agent_models` routes
+each role to its own model, and the profile is resolved from *that* model, so
+a Fable researcher can run the lean prompt while an Opus auditor in the same
+run keeps the full one. (The standalone REPL passes the run config, which is
+correct for it — one model per session.)
+
+**Measured saving**, `advanced` vs `standard`, across all 25 shipped
+philosophy x framework combinations:
+
+| framework | tokens saved per agent turn |
+|---|---|
+| `oversight` | ~1,055 |
+| `audit` | ~1,136 |
+| `reporter` | ~1,553 |
+| `staged` (shipped default) | ~1,956 |
+| `worker_staged` | ~2,033 |
+
+The figure depends on the framework, not the philosophy: what `lean` drops is
+the per-stage enumerations, so a framework with more stages saves more.
 
 See `docs/soft-guidance.md` for what may and may not thin, and why.
 
@@ -486,18 +520,28 @@ still run, and all still spend.
 | | `loop.max_cost_usd` | `usage_allowance` |
 |---|---|---|
 | When checked | cycle boundary | wherever spend is recorded, plus the fan-out barrier poll |
-| Overshoot | up to one cycle | up to one agent turn, or one barrier poll during fan-out |
+| Overshoot | up to one cycle | up to one agent turn; during a fan-out, one barrier poll plus the 10 s grace |
 | End-of-run pipeline | **runs** | **skipped** |
 | Fan-out clones | invisible until barrier collapse | summed live from each clone's `output/usage_summary.json` |
 | Exit code | 0 | **3** |
 | Artifacts | normal | plus `output/killed_spend_limit.json` |
 | Status file | `completed` / `stopped` | `killed_spend_limit` |
 
-On a kill: the next agent turn does not start, clone process groups are
-SIGTERM/SIGKILL swept, the end-of-run pipeline is skipped, state is still
-saved (so raising the limit and resuming works), the marker is written, and
-the process exits 3 from `launch`, `start`, `resume` and
-`python -m long_exposure.exploration` alike.
+On a kill: the next agent turn does not start, the end-of-run pipeline is
+skipped, state is still saved (so raising the limit and resuming works), the
+marker is written, and the process exits 3 from `launch`, `start`, `resume`
+and `python -m long_exposure.exploration` alike. A marker left by an earlier
+killed run is cleared at run start, so a resume that finishes cleanly does
+not still look killed.
+
+If a fan-out is in flight, the barrier writes each running clone's stop file,
+waits `fanout.SPEND_KILL_GRACE_SECONDS` (10 s) for a merge report already
+mid-write, then **terminates the clone's process group** — SIGTERM, 5 s, then
+SIGKILL. The stop file alone would not do: a clone honours it at its next
+cycle boundary, so one in the middle of a long agent turn would keep spending
+until it finished, up to the 10 h `FANOUT_CAP_SECONDS`. A branch terminated
+this way gets a `killed_spend_limit` outcome and a placeholder merge report
+noting that whatever it wrote to the shared workspace is intact.
 
 #### Enforcement lives at the root
 
@@ -875,7 +919,7 @@ violation, log a reason, fall back to the fixed flow, never raise.
 
 | Rule | On violation |
 |---|---|
-| Every `agent` must be a key of `score.agents` | reject |
+| Every `agent` must be a member of the score's `flow` | reject |
 | `researcher` is not permitted (it has already run) | reject |
 | At most `max_worker_chain` worker turns | reject (not truncate — truncating would run a plan the researcher did not write) |
 | At most one `auditor` turn | reject |
@@ -884,6 +928,14 @@ violation, log a reason, fall back to the fixed flow, never raise.
 | Block absent, empty or malformed | fixed flow, no health event for "absent" |
 
 A rejection emits the `cycle_plan_rejected` health event.
+
+Note the first rule: the score's **`flow`**, not every agent it defines. The
+cycle loop populates inputs only for flow members, so a plan naming
+`final_auditor`, `final_reporter`, `curator` or `reporter` would run that
+agent with `[UNAVAILABLE: stage]`, `[UNAVAILABLE: expected_file]` and so on —
+a full turn spent producing something unusable, and two of those roles set
+`agent_teams: true`. A score with a wider flow can schedule its own extra
+roles; validation follows the flow, not a hard-coded list.
 
 ### Bounds the agent cannot waive
 
@@ -905,8 +957,14 @@ The researcher plans *before* seeing this cycle's work, so it predicts
 whether an audit will be needed rather than observing it. The worker covers
 that: with `worker_may_request_audit`, a worker that hits something
 surprising emits `[[REQUEST_AUDIT]]` on a line of its own and the auditor is
-re-inserted into the cycle, the audit-floor streak resets, and
-`cycle_plan_audit_requested` is logged. The event matters as much as the fix
+appended **at the end of the cycle**, the audit-floor streak resets, and
+`cycle_plan_audit_requested` is logged.
+
+At the end, not immediately after the escalating worker: if worker 1 of a
+chain escalates, auditing before worker 2 would leave `audit_report` and the
+memoir describing only part of the cycle, and the next cycle's researcher
+would read that partial verdict as the cycle's. It would also contradict the
+rule above that an auditor turn is always moved last. The event matters as much as the fix
 — a run escalating every cycle is telling you the planning is wrong, not
 that the work is surprising. Like `[[BRANCH_COMPLETE]]`, the token is matched
 anchored to its own line, so a worker merely *discussing* it does not trigger

@@ -296,16 +296,32 @@ typo must not silently thin a prompt.
 
 `agent_models` routes each role to its own provider and model, so a run can
 have a Fable researcher and an Opus auditor. The profile is resolved inside
-`assemble_system_prompt`, which is always handed a **per-agent** config from
-`build_agent_config` whose `model` key is already that role's routed model.
-So per-agent tiering falls out of the existing call graph with no extra
-argument, and resolution stays a pure function of the config — which is what
-keeps two roles on the same model from splitting the prompt cache.
+`assemble_system_prompt` rather than by its callers.
+
+On the **conductor** paths — the cycle loop and the out-of-cycle agents —
+that function is handed a per-agent config from `build_agent_config`, whose
+`model` key is already the model `agent_models` routed that role to. So
+per-agent tiering falls out of the existing call graph with no extra
+argument. The standalone REPL (`python -m long_exposure.orchestrator`) passes
+the run-level config instead, which is the right thing there: a REPL session
+runs one model, and `config["model"]` is it.
+
+Either way the resolution is a pure function of the config it is given, which
+is what keeps two roles on the same model from splitting the prompt cache.
 
 With `enabled: false` (the default) or `profile: standard`, nothing is
-applied and the prompt is byte-identical to the pre-feature output for every
-routed role. `tests/test_model_profiles.py` asserts that rather than
-asserting about it.
+applied. That was checked against the commit before the feature existed
+rather than inferred: with the block present-but-disabled, deleted entirely,
+disabled-with-an-advanced-model-id, and enabled-at-`standard`, all nine
+assembled prompts (eight routed roles plus the no-role REPL prompt) are
+byte-identical to the pre-feature output — the only textual difference being
+`harness_root`, which is derived from the code's own directory and so differs
+between any two checkouts.
+
+`tests/test_model_profiles.py` is the standing regression guard: it asserts
+the three off-modes produce identical prompts to each other for every routed
+role, which is the part that can regress without a second checkout to compare
+against.
 
 ---
 

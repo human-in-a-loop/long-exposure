@@ -714,3 +714,51 @@ neither worth a decision in the abstract:
 - Whether the exhaustion detector's per-cycle output floor needs adjusting
   once worker chains raise peak observed output (§1.6) — a question for the
   first live run, not for the design.
+
+---
+
+## 7. Post-implementation audit
+
+Seven defects found by stress and live testing after all five stages were
+green. Recorded because each one was invisible to the unit tests that
+already passed.
+
+| # | Defect | Why it mattered | Found by |
+|---|---|---|---|
+| 1 | On a spend trip the fan-out barrier only wrote **stop files**, which a clone honours at its *next* cycle boundary | A clone mid-agent-turn kept spending until it finished — up to the 10 h `FANOUT_CAP_SECONDS` — while the root waited in the barrier. For a limit whose purpose is to stop spending, the opposite of the documented kill. Measured: 61 s of waiting, and the clones ran to completion | A live barrier with real `sleep 60` subprocesses |
+| 2 | The escalated auditor was inserted **immediately after** the escalating worker | Worker 1 of a chain escalating ran the audit before worker 2, so `audit_report` and the memoir described only part of the cycle and the next researcher read that partial verdict as the cycle's. Also contradicted the parser's own auditor-last rule | Reading the seam adversarially; a test I had written asserted the buggy behaviour |
+| 3 | A plan could schedule `final_auditor`, `final_reporter`, `curator`, `reporter` | `parse` validated against `score.agents`, but the cycle loop populates inputs only for **flow** members. Those agents would have run with `[UNAVAILABLE: stage]` and `[UNAVAILABLE: expected_file]` — a full turn for nothing, and two of them set `agent_teams: true` | Same |
+| 4 | `enabled: "false"` in YAML read as **truthy** | A run the operator believed was uncapped got killed; a flow they believed was fixed started being planned. Quoted booleans happen by accident constantly (a template, a `sed`, an editor) | An adversarial value sweep over the config parsers |
+| 5 | The spend tripwire had **no lock** | `UsageLedger` documents that spend is recorded from the cycle loop *and* the manager poller thread (`manager.py` → `_call_agent_with_rotation` → `_record_usage` → `check`), so two threads could both build a trip record | Reading the ledger's own threading note, then a 16-thread race |
+| 6 | A marker from a killed run **survived a clean resume** | A wrapper checking for `killed_spend_limit.json` would report a successful resume as killed — exactly the question the marker exists to answer | A kill-then-resume cycle |
+| 7 | Lean mode emitted the `<exit-gate-policy>` block for a framework with **no stages** | The block points at `<purpose>` and `<required-output>` elements not in the prompt — the incoherence the block was added to prevent | Sweeping all 25 philosophy x framework combinations |
+
+Also fixed as cosmetics, because they mislead an operator reading the
+artifacts: a cycle plan logged for a cycle the spend limit had just killed,
+and two differently-worded `**Status:**` lines in the status file.
+
+### What the testing actually covered
+
+| Exercise | Result |
+|---|---|
+| 200,000 fuzzed `<cycle_plan>` inputs (structured, fragment-shuffled, random) | 24,272 accepted; **0** exceptions, **0** invariant breaks (agent outside the flow, planner self-scheduled, chain over cap, two auditors, auditor not last, over the turn cap) |
+| 3,200 concurrent registry appends across 16 threads | 3,200 lines, **0** torn; the menu deduped to 1 entry per state path |
+| 16 threads racing the spend tripwire, 8,000 calls | exactly **1** distinct trip record |
+| 40-cycle run mixing planned chains, audit-free cycles, malformed plans, worker failures and simulated rate limits, under a stack-dumping watchdog | 118 agent turns, **0** invariant breaks across all 40 cycles |
+| Same run with the cap lowered | killed at cycle 12, marker written, end-of-run skipped, state resumable |
+| Kill, raise the cap, resume | resumed at the right cycle with prior spend carried forward |
+| Live fan-out barrier, real subprocesses, clone-only spend | tripped on clone spend alone (root $0.50 of a $10 cap), stop files written, process groups terminated, barrier 61 s → 15 s |
+| All 25 philosophy x framework combinations | **0** problems; saving 1,055–2,033 tokens/turn by framework |
+| Every gate entry path (`start`, `resume`, `--no-gate`, flagged, unflagged, bad workspace, missing resume target) | correct exit codes; `start`/`resume` never ask |
+| Profiles-off prompt vs the commit before the feature existed, 4 off-modes x 9 roles | byte-identical, modulo `harness_root` (derived from the code's own directory) |
+
+### What remains untested
+
+- **No live model has emitted a `<cycle_plan>` block.** Everything above
+  used a stubbed provider. Two unknowns follow: whether a real model emits
+  well-formed blocks, and whether its scheduling judgement is any good.
+  `docs/rcb-benchmark-plan.md` §2 gap 5 carries this, and §9 carries the
+  kill criterion.
+- **The interactive Claude transport** was not exercised with any of these
+  features.
+- **Multi-account pooling** was left untouched by design and not tested.
