@@ -93,7 +93,7 @@ is a hardening of existing prompt guidance, never a replacement for it.
 
 ---
 
-## 2. Worktrees: four candidate levels, three noes
+## 2. Worktrees: four candidate levels, four noes
 
 ### 2.1 Fan-out clones (2–3 branches) — **no, and not merely as overkill**
 
@@ -148,8 +148,11 @@ A worktree per member gives each a private checkout sharing one object store
 conventions to `git merge`, which is a tool actually designed for N-way
 convergence.
 
-**Verdict: yes, but only as part of a swarm build (§4), gated on a
-threshold, and never for the 2–3 case.**
+**Verdict: superseded — no.** This was written when scaling meant many
+members on one machine. Under the federation model (§4) each operator runs
+their own 2–3 branch fan-out on their own machine, so the local tree never
+has 10–20 writers and the contention this section describes never arises.
+Worktrees have no place in long-exposure at any level.
 
 ### 2.4 The harness's own repository — **no**
 
@@ -192,125 +195,146 @@ kind the harness already has four of.
 
 ---
 
-## 4. Swarms, reframed: the constraint is redundancy, not cost
+## 4. Swarms, reframed twice: a federation over the repo, not a local swarm
 
-**Revised.** The first version of this section argued swarms were
-cost-gated: ~$280 per clone allowed to run to the 10 h cap, so a 20-branch
-fork ran into thousands of dollars. The operator's correction is decisive —
-the harness bills to a fixed-cost subscription, so those dollars are an
-accounting figure, not an invoice. Removing cost does not make the swarm
-question easy; it makes it a **different** question, and a more interesting
-one.
+This section has been wrong twice, and the operator corrected it both times.
+Worth recording, because the third framing is much better than the first two
+and it removes most of the work the earlier ones implied.
 
-With spend free but tokens still not to be wasted, the binding constraint
-becomes: **does agent number 14 learn anything agents 1–13 did not?**
+- **Draft 1** argued swarms were cost-gated: ~$280 per clone at the 10 h cap,
+  so 20 branches ran to thousands of dollars. Wrong premise — the harness
+  bills to a fixed-cost subscription, so those dollars are an accounting
+  figure, not an invoice.
+- **Draft 2** removed cost and concluded the binding constraint was
+  *redundancy*: twenty agents on one directive duplicate each other, so a
+  swarm is a coverage problem needing a tree, a queue, depth > 1 and rolling
+  collapse.
+- **Draft 3 (this one).** The operator's actual shape: *"swarming on a GitHub
+  repo where multiple independent users with independent computers have
+  long-exposure installed and they are concurrently working on the same
+  project — maybe each independent user has a few agents working on a
+  fan-out branch, but they do not necessarily have local swarms."*
 
-### 4.1 Why "more branches" is the wrong primitive
+That is a **federation**, not a swarm, and it changes the answer completely.
 
-Twenty agents pointed at one directive will substantially duplicate each
-other. Each will orient itself, survey the same ground, build the same
-scaffolding, and rediscover the same first-order facts. That is not a cost
-problem — it is an *information* problem, and it shows up as:
+### 4.1 What the federation model deletes
 
-- **Redundant tokens.** Twenty literature surveys of the same topic is the
-  precise failure mode the operator's "without burning tokens inefficiently"
-  is guarding against.
-- **A merge that degrades with N.** Three merge reports concatenate. Twenty
-  at ~15–30k each is 300–600k tokens into a single synthesis turn — inside a
-  1M window, but the synthesis quality falls off long before the window does,
-  and the reporter is the role that writes the graded deliverable.
-- **A barrier that pessimises to the slowest member.** With 3 branches a
-  straggler is tolerable. With 20, wall clock becomes
-  `max(member_duration)` and one wedged member holds nineteen results
-  hostage until the 10 h cap.
+Scale comes from *N operators × their small fan-outs*, not from raising
+`FANOUT_MAX_BRANCHES`. Each operator runs the harness they already have —
+2–3 branches, one machine, one plan. Nothing local gets bigger.
 
-So the reframe: a swarm is not "fan-out with a bigger number". It is a
-**coverage** mechanism, and its design problem is partitioning a space so
-that members do not overlap, then reducing their results without a single
-choke point.
+So from draft 2's seven-item build list:
 
-### 4.2 The four topologies, honestly compared
-
-| Topology | Shape | Good for | Cost under unlimited spend |
-|---|---|---|---|
-| **Wide fan-out** (today, scaled) | N independent full cycles, one barrier, one merge | 2–4 genuinely independent questions | Redundancy grows with N; merge and barrier both degrade |
-| **Tree / hierarchical** | coordinator → group leads → members, reduce at each level | Decomposable work with natural grouping | Needs depth > 1 and a reduce at each level; the barrier problem recurs per level but each level is small |
-| **Blackboard / queue** | members pull from a shared task queue, write to shared state, no fixed topology | Many similar independent items (a 200-item sweep with 20 workers) | Decouples agent count from task count. Needs a queue with dedupe and lease semantics |
-| **Debate / ensemble** | N members attack the *same* question, an arbiter synthesises | One hard question where disagreement is informative | Deliberately redundant — the redundancy *is* the signal. Narrow but real |
-
-My read: **tree for structure, queue for the leaves.** A coordinator
-partitions into groups; each group lead owns a queue of concrete items; leaf
-members pull from it. That gets coverage from the partition, load balancing
-from the queue, and bounded reduction from the tree. Debate stays a separate
-narrow feature — and note the harness already has a degenerate form of it,
-since the auditor is an adversarial second opinion on the worker.
-
-### 4.3 What the harness already has that a swarm needs
-
-More than I credited in the first pass:
-
-| Swarm need | Existing machinery |
+| Draft-2 item | Under federation |
 |---|---|
-| Non-overlapping member tasks | `branchial_budget.score_branches` already scores branch novelty and annotates each branch with a `novelty_class`. Today it is **advisory** — printed and logged. A swarm makes it **load-bearest**: reject or re-partition a branch set that scores as redundant |
-| Agent-decided decomposition | The researcher already owns fan-out, and now owns cycle planning. Partitioning is the same kind of decision, expressed as a bigger block |
-| Distinctness enforcement | The fan-out parser already rejects colliding `output_artifact` paths. That is a coverage check in embryo — it enforces distinct *outputs*, and a swarm needs distinct *questions* |
-| Straggler handling | Graceful barrier preemption exists (two triggers, capacity-gated) |
-| Per-member accounting | The usage ledger already folds clone rows via `merge()` |
-| Bounded reduction | `merge_synthesis_min_branches: 4` already switches concat → reporter synthesis. Tree reduction is the generalisation |
+| Concurrency governor | **Already exists, per operator.** `_fanout_branch_cap()` clamps to that operator's own pool capacity. No global governor, because there is no global scheduler |
+| Cheap worker-only member shapes | **Not needed.** Each operator runs normal three-role cycles |
+| Rolling collapse instead of a barrier | **Not needed.** There is no cross-operator barrier to pessimise |
+| Tree reduction | **Not needed.** Reduction is `git merge` and pull requests — a tool built for N-way convergence by people who are not in the same process |
+| Depth > 1 | **Not needed.** The depth-1 cap can stay exactly as it is, and every question `docs/parallelism.md` "Why depth=1" settled stays settled |
+| Worktree isolation per member | **Not needed.** Each operator has their own machine, so the local tree never has 20 writers. This makes §2.3's "conditionally yes" a **definitive no** — worktrees have no place in long-exposure at any level |
+| Novelty-gated partitioning | **Still needed, but relocated.** The question is no longer "do these 3 branches overlap" but "are operator A and operator B working the same thing" — which is a claim problem, not a scoring problem |
 
-### 4.4 What actually has to be built
+The whole of draft 2's architecture collapses into one thing the harness
+already lacks and needs anyway: **the git sync layer of §3.** The federation
+*is* that layer, used by more than one operator.
 
-In dependency order. Note that worktrees are last, and cost control is *not
-on the list at all* — which is the substantive change from the first draft.
+### 4.2 Git as the coordination substrate
 
-1. **Concurrency governance replaces cost governance.** The scarce resource
-   on a fixed-cost plan is *rate limit and concurrency*, not dollars. This
-   already half-exists: `_fanout_branch_cap()` clamps branches to live pool
-   capacity. A swarm needs that to become the explicit governing dial — a
-   semaphore sized to plan capacity, with members queued rather than
-   rejected when it is full.
-2. **Cheap member shapes.** A coverage probe does not need
-   researcher → worker → auditor. A **worker-only member** producing one
-   artifact against one question is the right leaf primitive and does not
-   exist today. This is the main token-efficiency lever that survives
-   unlimited spend, and it is independently useful: it is also what the
-   post-merge cycle already does (`flow_this_cycle = [worker]`), so the
-   shape is proven.
-3. **Novelty-gated partitioning.** Promote `branchial_budget` from advisory
-   to a gate: a proposed member set whose questions score as redundant gets
-   sent back for re-partition rather than spawned. This is the direct answer
-   to "unlimited spend without burning tokens inefficiently".
-4. **Rolling collapse instead of a barrier.** Merge members as they finish.
-   Removes the `max(member_duration)` wall-clock behaviour and makes a
-   wedged member cost one member's worth of coverage rather than the whole
-   fork's latency.
-5. **Tree reduction.** Merge in groups, then merge the merges. Generalises
-   the existing `merge_synthesis_min_branches` switch.
-6. **Depth > 1.** The structural blocker, enforced in two places today
-   (`_parse_fanout_block`'s `_is_clone()` short-circuit and
-   `cycle_planning.allow_in_clones: false`). A tree needs it. Lifting it
-   re-opens every question `docs/parallelism.md` "Why depth=1" closed, so it
-   should be lifted deliberately and with a depth cap, not removed.
-7. **Worktree isolation per member** (§2.3), once N is large enough that
-   shared-workspace contention is the real failure mode.
+The repo becomes the blackboard, and each operator's long-exposure is an
+autonomous participant working a claimed slice of it. Four primitives, three
+of which reuse machinery that already exists.
 
-### 4.5 The experiment that should come first
+**1. Branch per run, namespaced by operator.**
+`long-exposure/<operator>/<run_id>`. `run_id` already exists in state, the
+run registry and telemetry. Namespacing by operator keeps two runs from
+colliding on a branch name without any central allocator.
 
-Under unlimited spend the question "does a swarm beat three branches?" stops
-being expensive to answer and starts being *cheap* — which makes it
-inexcusable not to answer before building six of the seven items above.
+**2. Claims live IN the repo, and git's push rejection is the lock.**
+A lease on operator A's local disk is invisible to operator B, so the claim
+registry has to be committed: `.long-exposure/claims/<slice>.json`, holding
+slice, operator, run_id, timestamp, expiry.
 
-The measurement: run the same directive at **K = 1, 3, 8** and compare the
-deliverables. The harness can nearly do this today — K=1 and K=3 need no new
-code, and K=8 needs only the branch cap raised. What is missing is not
-capability but a comparison surface: the same directive, the same wall-clock
-bound, and a judge or rubric applied to the three outputs.
+The race resolves itself for free. Two operators claiming the same slice both
+commit and push; the second push is rejected as non-fast-forward; the loser
+re-fetches, sees the existing claim, and picks a different slice. **No
+server, no daemon, no consensus protocol** — just the property that a git
+remote accepts exactly one of two conflicting pushes. That is the single most
+important design point here, and it is why this shape is tractable where a
+local swarm scheduler was not.
 
-That is worth doing first for a reason beyond frugality: if K=8 does not
-clearly beat K=3, the right swarm design is probably the **queue** shape
-against many small items rather than the **wide** shape against one
-directive, and building the tree first would have been building the wrong
-thing.
+**3. The promise ledger federates for free; the memoir needs the shadow
+pattern.** These are opposite cases and the difference matters:
+
+- The **promise ledger is append-only JSONL**. Two operators appending
+  different events produce a textbook union merge. One line in
+  `.gitattributes` — `promise_ledger.jsonl merge=union` — and ledger
+  convergence is automatic and correct. This is the harness's biggest
+  existing asset for federation and it is already the right shape by
+  accident.
+- The **memoir is a single file rewritten every cycle** — the worst possible
+  merge shape, and it would conflict on essentially every sync. But the
+  harness already solved this exact problem for fan-out: per-clone **shadow
+  memoirs** plus a `branch_memoirs` fold at the collapse. The same pattern
+  applies one level up: `MEMOIR.<operator>.md` per operator, folded for
+  reading, never merged. The work is a rename and a re-scope of a mechanism
+  that already exists and is already tested.
+
+**4. `sessions.db` stays local and must never be committed.** SQLite with
+WAL, per-operator, binary — nothing good comes of putting it in git. Each
+operator's session history is theirs; the shared surfaces are the ledger,
+the claims, the memoirs and the artifacts. Worth an explicit `.gitignore`
+entry and a doc line, because committing it once would be unpleasant to
+undo.
+
+### 4.3 What a participating operator's cycle looks like
+
+Every one of these is at a cycle boundary, which is already the harness's
+transaction point:
+
+1. `fetch`; `rebase` onto the shared branch. A conflict is surfaced to the
+   next researcher as an input (operator decision, §7).
+2. Read the claims registry. If this run's slice is claimed by someone else
+   with a live lease, the researcher is told so and picks differently.
+3. Run the cycle — unchanged, including a local 2–3 branch fan-out if the
+   researcher asks for one.
+4. Commit (harness-authored, never agent-authored — operator decision, §7),
+   push. A rejected push means someone else got there first: re-fetch and
+   let the next cycle see the new state.
+
+### 4.4 What is genuinely hard about this
+
+Not the mechanics — the *research* coordination:
+
+- **Two operators can invalidate each other's premises.** A claim registry
+  stops them editing the same files; it does not stop operator B proving
+  false the assumption operator A's last four cycles were built on. The
+  honest answer is that this is what the shared promise ledger is for, and
+  that surfacing a conflicting *finding* to the other operator's researcher
+  is a strictly harder problem than surfacing a file conflict. Worth naming
+  now rather than discovering later.
+- **Slice granularity is the whole ballgame.** Too coarse and operators
+  block each other; too fine and the claims registry churns. It probably
+  wants to be a directive-level or topic-level concept rather than a path,
+  which means it belongs in `plan_of_record.md` — the one shared file that
+  is neither append-only nor per-operator.
+- **Divergent harness versions.** Operator A on this branch and operator B
+  on `main` write different prompt text and different state-file fields. A
+  federated run needs a version handshake, or at minimum the run registry to
+  record the harness commit so a mismatch is visible in the artifacts.
+
+### 4.5 The experiment that should still come first
+
+Two operators, one repo, one small shared directive, both on this branch, no
+claims registry — just branch-per-run and cycle-boundary commits. Run it and
+count: how many pushes are rejected, how many rebases conflict, what
+conflicts on, and whether the two runs produce complementary or duplicated
+work.
+
+That answers the slice-granularity question with data instead of design, and
+it needs only §3's git sync layer, which is the first thing on the build list
+anyway. The K = 1/3/8 branch-count experiment from draft 2 is **withdrawn**:
+under federation, local branch count is not the scaling dial.
 
 ## 5. Hooks worth adopting, ranked by what they actually fix
 
@@ -411,30 +435,39 @@ ledger could attribute rather than folding into the lead's row.
 4. **`Stop` output-envelope enforcement** (§5.2). Prevents a bug class with
    a known incident history.
 5. **`PostToolUse` validators** (§5.3). Nice-to-have.
-6. **The K = 1 / 3 / 8 coverage experiment** (§4.5). Cheap on a fixed-cost
-   plan, and it decides which swarm shape is worth building.
-7. **Swarm build** — after that experiment, starting with concurrency
-   governance and cheap member shapes (§4.4), not with worktrees.
+6. **The two-operator federation experiment** (§4.5) — which needs only
+   item 1, and answers the slice-granularity question with data.
+7. **Claims registry, union-merged ledger, per-operator memoirs** (§4.2),
+   once that experiment says what a slice should be.
 
-Worktrees appear nowhere in that list, which is the honest answer to "where
-should they be applied": **nowhere yet** — and late inside a swarm build,
-after the six things that matter more.
+Worktrees appear nowhere in that list, and under the federation model they
+never will. The honest answer to "where should they be applied" is
+**nowhere**: the scaling unit is an operator with their own machine, not a
+member with a checkout.
 
 ---
 
-## 7. Open questions
+## 7. Decisions taken
 
-1. **Git sync cadence.** Commit every cycle (readable history, many commits)
-   or every N cycles / on report boundaries (tidier history, coarser
-   recovery)?
-2. **Conflict posture.** Surface a conflict to the next researcher as an
-   input and let the run reason about it, or hard-stop the run and wait for a
-   human?
-3. **Who may commit.** Harness-only (my recommendation), or allow an agent
-   to commit within its leased subtree?
-4. **Hook install surface.** Extend `long-exposure cli-install` to write hook
-   configs, or ship them as a separate opt-in `long-exposure hooks-install`
-   so an operator can adopt the harness without adopting hooks?
-5. **Hook failure posture.** If a hook script is missing or errors, should
-   the harness refuse to start a run (fail closed — the fence is why it
-   exists) or warn and continue (fail open)?
+| Question | Decision |
+|---|---|
+| **Which hooks first** | The `PreToolUse` Bash **path fence**, the `Stop` **`[OUTPUT: x]` envelope** check, and **`PreCompact`/`PostCompact`** observability. `PostToolUse` validators are **not** in the first cut |
+| **Hook install surface** | A **separate `long-exposure hooks-install`**. Adopting the harness must never silently edit an operator's `~/.claude/settings.json` or `~/.codex/hooks.json` |
+| **Hook failure posture** | **Fail closed for the path fence only.** If the fence is configured but not functioning, refuse to start — an unattended permission-skipping run with no fence is exactly what the fence is for. Every other hook warns and continues |
+| **Git commit cadence** | **Every cycle boundary** — already the harness's transaction point, so every commit is a coherent cycle and `git log` reads as run history |
+| **Conflict posture** | **Surface it to the next researcher as an input**, the way `live_guidance` works. A conflict is a run event, not an error; keeps an autonomous run autonomous |
+| **Commit authority** | **Harness only.** Deterministic cycle-boundary commits keep history independent of prompt adherence, matching the existing split where the harness owns bookkeeping and the agent owns content |
+| **Swarm shape** | **A federation over a GitHub repo** (§4): independent operators on independent machines, each with a small local fan-out. Not a local swarm |
+| **Governor** | **A concurrency semaphore sized to plan capacity** — which under federation is per operator, and already half-exists as `_fanout_branch_cap()` |
+| **Worktrees** | **Nowhere.** Four candidate levels, four noes (§2) |
+
+### Still open, deliberately
+
+- **Slice granularity** for the claims registry — path, topic or directive.
+  §4.5's two-operator experiment is meant to answer this with data rather
+  than design.
+- **Cross-operator finding conflicts** (§4.4): a claims registry stops two
+  operators editing the same file, not one invalidating the other's
+  premise. The shared promise ledger is the likely home; the mechanism is
+  not designed.
+- **Harness version skew** between federated operators (§4.4).
