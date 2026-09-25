@@ -81,6 +81,112 @@ pre-edited score, but you'll usually want to pass the directive inline.
 
 ---
 
+## The startup gate (opt-in)
+
+Off by default. When `startup_gate.enabled` is true in config.yaml,
+`long-exposure launch` asks four questions before the run begins, so the
+expensive choices are made deliberately instead of inherited from whatever
+config.yaml happens to say:
+
+```
+Q1. Which model should this run use?
+  1) opus  (current)
+  2) fable
+  3) sonnet
+  4) other (type a value)
+  choice: 2
+
+Q2. Which workspace directory should the run work in?
+  ...
+Q3. Resume a previous run, or start fresh?
+  1) start a new run
+  2) run-2026-09-24T2153Z — cycle 12 — "study the widget"
+  ...
+Q4. What share of your declared weekly allowance ($400.00) may this run use?
+    This is a delta on top of what you have already used, and it KILLS the
+    run when reached.
+  percent (1-100): 20
+```
+
+Q4 appears only when `usage_allowance.enabled` is true.
+
+Then it prints what your answers did, including the resolved per-agent
+routing table, before any spend happens:
+
+```
+[gate] Run configuration
+  model:            fable
+  roles retargeted: researcher, worker, auditor, reporter, ...
+  workspace:        /work/widget
+  run:              new run
+  spend limit:      $80.00 total (20% of a declared $400.00 weekly
+                    allowance; operator-declared proxy)
+
+[gate] Resolved per-agent routing
+  role            provider  model                 effort  profile
+  --------------  --------  --------------------  ------  --------
+  researcher      claude    fable                 high    advanced
+  worker          codex     gpt-5.5               high    standard
+  ...
+```
+
+That table is worth reading. Q1 rewrites the global `model` **and** every
+`agent_models` entry that still pointed at the old global default, leaving a
+deliberately different routing (a Codex worker, a Sonnet reporter) alone — so
+one answer can have a non-obvious effect, and the table is how you see it.
+
+### It only runs under `launch`
+
+`start`, `resume` and `python -m long_exposure.exploration` are never
+interactive. That is deliberate: cron jobs, the fan-out clone spawn and the
+benchmark adapter all go through those, and a clone that stopped to ask a
+human which model to use would hang the fan-out barrier until the 10 h cap.
+
+### Answers persist; `resume` never re-asks
+
+Answers are written to `<instance_dir>/gate_answers.json` and re-applied when
+the run resumes, so a stop/resume or a crash-restart keeps the model and caps
+you chose. A copy also lands in the run's `output/` as provenance — which is
+what lets a report state the model and caps the run *actually used* rather
+than what config.yaml says now.
+
+### Headless use
+
+Every question has a flag, so a fully-flagged `launch` never blocks:
+
+```bash
+long-exposure launch "directive" \
+  --gate-model fable \
+  --gate-workspace /work/widget \
+  --gate-resume fresh \
+  --gate-usage-pct 20
+```
+
+`--gate-resume` takes either `fresh` or a state-file path from the Q3 list.
+`--no-gate` skips the gate entirely.
+
+If a question has no flag and stdin is not a TTY, `launch` **exits 4 and
+names the missing flag** rather than guessing. A wrong model is expensive to
+discover three hours into a run.
+
+### Where Q3's list comes from
+
+An append-only registry at `startup_gate.registry_path` (default
+`~/.long-exposure/runs.jsonl`), one line per run start. Fan-out clones are
+never registered — a branch is not a resumable run. If the registry is
+missing or empty, the gate falls back to scanning
+`startup_gate.instances_root` for `*/exploration_state.json`, which is what
+makes it useful against runs that predate the registry.
+
+A run whose state file has since been deleted is shown as a tombstone rather
+than hidden, and both the menu and `--gate-resume` refuse it: accepting a
+vanished path would start a *fresh* run there and silently lose the intent to
+resume.
+
+See `docs/configuration-reference.md` for the full key reference.
+
+---
+
 ## Daily Controls
 
 ### Start

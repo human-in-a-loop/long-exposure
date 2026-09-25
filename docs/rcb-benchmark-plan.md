@@ -139,14 +139,19 @@ must travel with the number:
    spends one to two orders of magnitude more tokens than Claude Code's
    single call. A win is a win *at the harness's own operating point*, not
    at equal spend.
-5. **Cycle planning has never run against a real model.** It is covered by
-   unit tests, 200k fuzzed blocks and multi-cycle runs against a stubbed
-   provider, but no live model has yet emitted a `<cycle_plan>` block. Two
-   distinct unknowns follow: whether the model emits well-formed blocks at
-   all (a high `cycle_plan_rejected` count would mean the guidance is not
-   landing), and whether its scheduling judgement is good (if the audit
-   floor and worker escalations supply most of the audits, it is not). A
-   smoke task must be inspected for both before the full pass — see §9.
+5. **Cycle planning has one live sample, and in it the researcher declined
+   to plan.** A 2026-09-25 smoke run (one cycle, killed by a deliberate $6
+   spend cap) confirmed the `<cycle_plan_guidance>` block reaches the
+   researcher's prompt, and that the researcher emitted no plan — no block,
+   no mention of one, in an 11,825-character brief. That is permitted
+   behaviour ("omitting it is always valid") and was arguably right there:
+   the brief scheduled a single build step, which is the default shape. But
+   the sample is one cycle, and the cycle least likely to need a chain. So
+   the open question narrows rather than closes: the plumbing works; the
+   planner's *judgement* is unmeasured. If the researcher never plans across
+   40 tasks, this run measures stock-plus-fixes and the feature contributes
+   nothing — which is a reportable null result, not a failure. See §9's kill
+   criterion and §7.6's counters.
 
 Four sentences are therefore pre-registered for the conclusions, so they
 cannot be dropped when the numbers arrive:
@@ -158,9 +163,11 @@ cannot be dropped when the numbers arrive:
    conditions gap above is unquantified.
 3. There was **no compute-matched control**, so any advantage is
    confounded with spending far more tokens.
-4. The run used **researcher-planned cycle tails, a configuration with no
-   prior live mileage**, and the guidance stack was **not** thinned
-   (`model_profiles` is inert on this model).
+4. The run used **researcher-planned cycle tails, a configuration with a
+   single prior live cycle in which the researcher declined to plan**, and
+   the guidance stack was **not** thinned (`model_profiles` is inert on this
+   model). If the planned-cycle count comes back at or near zero, say so:
+   the number then describes stock-plus-fixes, not agent-planned scheduling.
 
 An in-house baseline — RCB's Claude Code preset on `claude-opus-4-6`, 40
 runs, roughly $80–$200 notional — is what would close gap 1 and 2 and turn
@@ -292,6 +299,17 @@ source file; `result.json` has non-zero cost, tool calls and turns; the
 call hit the idle watchdog; the retrieval log is being captured; and the
 resolved capability profile is `standard` (it must be — §5.5; an
 `advanced` here means the family list was edited by accident).
+
+**The served-model assertion is the one that has already caught something.**
+A 2026-09-25 smoke run whose config used `model: opus` silently served
+`claude-opus-5-5`. Assert the exact id against what the envelope reports,
+per agent, and fail the gate on a mismatch — not just at `model` but across
+every `agent_models` entry.
+
+**Also capture the per-cycle cost here** (§8): read `usage_summary.json`
+after the smoke cycles and re-derive §8's per-task range on the actual
+benchmark model before the main pass. The one measured cycle available so
+far was on the wrong model and suggests the current range is optimistic.
 
 Then, read by a human from the artifacts:
 
@@ -723,6 +741,44 @@ bounded only by the 10 h stop — half the Fable estimate.
 Notional agent total **$430–$3,060**; judge $300–$800. The judge is the
 only real-cash line and needs an OpenAI-compatible key.
 
+### One measured cycle, and why it makes the table above look optimistic
+
+The 2026-09-25 smoke run gives a real per-cycle figure for the first time.
+**Caveat first: it ran on Opus 5.5, not Opus 4.6** — the smoke config used
+the `opus` alias, which is exactly the trap §9 warns about, so the dollar
+figures are not on this plan's pricing basis and must not be copied into the
+table.
+
+What does transfer is the *shape*:
+
+| Observation | Measured | What the table above assumes |
+|---|---|---|
+| Calls per cycle | **3** (researcher, worker, one compaction) | 3–4 — confirmed |
+| Cost per cycle | $7.81 (Opus 5.5 basis) | implies $10–$75 per task at 6–15 cycles |
+| Wall clock per cycle | **990 s** with zero cooldown | not modelled per cycle |
+| Worker turn | 760 s, 74,712 output tokens, 48 tool calls | — |
+
+The wall-clock number is the one that should change expectations, because it
+is pricing-independent. At 990 s per cycle plus main's 400 s cooldown —
+about 23 minutes — a task that runs to the 10 h stop completes roughly **26
+cycles**, not the 6–15 the table models. Whatever the per-cycle cost turns
+out to be on Opus 4.6, the per-task multiplier is plausibly **2–4x** the
+modelled range, and the total is bounded by the 10 h stop rather than by the
+cycle count assumed here.
+
+Two things follow, neither of which is "rewrite the numbers from one sample":
+
+1. **Measure per-cycle cost on the actual benchmark model during the smoke
+   test**, from `usage_summary.json`, and re-derive §8 from that before the
+   main pass. The smoke test already has to run; it should now also produce
+   this number.
+2. **Decide whether the main pass needs a spend cap.** The plan currently
+   keeps main's unlimited budget on the grounds that a cap is a deviation.
+   If the re-derived estimate lands near the top of a 2–4x range, an
+   explicit `usage_allowance` becomes the cheaper deviation to disclose —
+   and it now has a live-verified kill path. Set it with the overshoot in
+   mind: the smoke run's $6 cap stopped at $7.81.
+
 **Wall clock is the binding constraint, not money.** With the 10 h
 per-task stop, the pass is up to 400 hours serial — over two weeks
 continuous. Parallel containers are what make it a few days, and per-task
@@ -740,7 +796,7 @@ net.
 | Risk | Detection | Response |
 |---|---|---|
 | `claude-opus-4-6` no longer served | §4 item 0, one call | Pre-decided fallback ladder in §3; 4.7 is a weaker experiment, so decide before building |
-| The `opus` alias left anywhere in the config | Smoke test asserts the served model | Exact IDs only — the alias would silently run a current model and void §1 |
+| The `opus` alias left anywhere in the config | Smoke test asserts the served model | Exact IDs only — the alias would silently run a current model and void §1. **Observed live 2026-09-25:** a smoke config using `model: opus` served `claude-opus-5-5`, silently and with no warning. This row is not hypothetical; the assertion is load-bearing |
 | No gradeable report (final reporter off) | Smoke test asserts provenance | Fix the fallback chain — highest-probability mechanical failure here |
 | Report reads as a process log, not findings | §4 item 4 report-shape read | Report it as a property of this configuration; do not tune mid-campaign |
 | Target paper retrieved despite the denylist | §7.3 egress block + post-hoc detection | Disqualify and re-run once; report the count |

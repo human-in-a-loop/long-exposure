@@ -499,6 +499,12 @@ and `weekly_allowance_usd: 0` all mean unlimited, which is the default;
 `run_pct` above 100 clamps to the allowance. Garbage values (a string, a
 negative, NaN, infinity) read as unlimited rather than raising.
 
+**Set the cap with the overshoot in mind.** The check fires *after* a turn's
+cost lands, so the run stops at cap-plus-one-turn. On expensive turns that is
+not a rounding error: a live run with a $6.00 cap stopped at **$7.81 — 130%
+of the cap** — because the turn that crossed it was a $3.45 compaction call.
+Size the cap for the spend you will accept, not the spend you want.
+
 **The allowance is a declared proxy, not a meter reading.** The harness
 cannot read subscription usage: the `claude` CLI exposes no `usage`
 subcommand, `/usage` is interactive-only, and the `-p` envelope carries only
@@ -521,6 +527,7 @@ still run, and all still spend.
 |---|---|---|
 | When checked | cycle boundary | wherever spend is recorded, plus the fan-out barrier poll |
 | Overshoot | up to one cycle | up to one agent turn; during a fan-out, one barrier poll plus the 10 s grace |
+| Measured overshoot | — | **130% of the cap** in a live run: a $6.00 cap stopped at $7.81, because the turn that crossed it was a $3.45 compaction call |
 | End-of-run pipeline | **runs** | **skipped** |
 | Fan-out clones | invisible until barrier collapse | summed live from each clone's `output/usage_summary.json` |
 | Exit code | 0 | **3** |

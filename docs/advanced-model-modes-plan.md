@@ -752,13 +752,60 @@ and two differently-worded `**Status:**` lines in the status file.
 | Every gate entry path (`start`, `resume`, `--no-gate`, flagged, unflagged, bad workspace, missing resume target) | correct exit codes; `start`/`resume` never ask |
 | Profiles-off prompt vs the commit before the feature existed, 4 off-modes x 9 roles | byte-identical, modulo `harness_root` (derived from the code's own directory) |
 
+### The live smoke test (2026-09-25)
+
+One real run against `claude -p`: the shipped score and roles, cycle
+planning on, fan-out and end-of-run off, a $6 spend cap as a hard bound,
+under a 40-minute watchdog. It ran **one** cycle in 990 s and was then killed
+by the spend limit. Four findings, in descending order of usefulness:
+
+1. **The spend limit works end to end against a real provider.** Tripped at
+   `agent:worker#compaction`, wrote the marker, skipped the end-of-run
+   pipeline, wrote `killed_spend_limit` to the status file, exited 3, and
+   left the state resumable. Previously verified only against a stub.
+
+2. **The overshoot is real and can be large.** $7.81 against a $6.00 cap —
+   130%. The docs already said "up to one agent turn"; the live magnitude
+   says that turn can be a third of the cap again. Now stated concretely in
+   configuration-reference.md so an operator sizes the cap accordingly.
+
+3. **Cycle planning: the guidance landed and the researcher declined to use
+   it.** Verified from the researcher's own session transcript that
+   `<cycle_plan_guidance>` was in its prompt, and from its captured
+   11,825-character brief that it emitted no block and never mentioned one.
+   That is *permitted* — the guidance says "omitting it is always valid" —
+   and arguably correct here: the brief scheduled a single build step, which
+   is exactly the default one-worker-then-audit shape. But it is **one
+   sample**, on the cycle least likely to need a chain. The cap killed the
+   run before cycles 2-4, where a sweep-then-fit dependency would have been
+   the natural chain case. The planner's judgement remains unmeasured.
+
+4. **The `opus` alias silently served `claude-opus-5-5`.** The smoke config
+   used `model: opus` rather than an exact id, and the transcripts show the
+   turns ran on Opus 5.5. That is precisely the trap
+   `docs/rcb-benchmark-plan.md` §9 names — "the alias would silently run a
+   current model and void §1" — reproduced live, which validates both that
+   risk row and the smoke-test assertion the plan requires. It also means
+   the cost figures here are Opus 5.5's, not Opus 4.6's.
+
+Measured, for the record (Opus 5.5, one cycle, three calls):
+
+| agent | calls | cost | out tokens | tool calls | wall |
+|---|---|---|---|---|---|
+| researcher | 1 | $1.06 | 18,771 | 15 | 180 s |
+| worker | 1 | $3.30 | 74,712 | 48 | 760 s |
+| worker#compaction | 1 | $3.45 | 2,797 | 0 | — |
+| **total** | **3** | **$7.81** | **96,280** | **63** | **990 s** |
+
+The harness itself behaved well: 31 workspace files, real scripts, a figure,
+CSV data, the memoir created, no errors, and one `compaction_xml_invalid`
+health event handled by existing machinery.
+
 ### What remains untested
 
-- **No live model has emitted a `<cycle_plan>` block.** Everything above
-  used a stubbed provider. Two unknowns follow: whether a real model emits
-  well-formed blocks, and whether its scheduling judgement is any good.
-  `docs/rcb-benchmark-plan.md` §2 gap 5 carries this, and §9 carries the
-  kill criterion.
+- **Whether a real model's cycle-scheduling judgement is any good.** One
+  sample, and it declined to schedule. `docs/rcb-benchmark-plan.md` §2 gap 5
+  carries this, and §9 carries the kill criterion.
 - **The interactive Claude transport** was not exercised with any of these
   features.
 - **Multi-account pooling** was left untouched by design and not tested.
