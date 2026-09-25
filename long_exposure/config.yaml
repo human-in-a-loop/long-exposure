@@ -232,6 +232,55 @@ model_profiles:
     advanced: [fable, astra] # case-insensitive substring match on the model id
   overrides: {}              # e.g. {anti_patterns_enabled: true} to re-add one
 
+# === Vendor lifecycle hooks (opt-in) ===
+# Claude Code and Codex are wire-compatible for the eleven lifecycle events
+# they share, so ONE script per concern serves both; only the config file
+# that points at it differs. Gemini CLI renames the events (BeforeTool /
+# AfterTool) and lacks four of them, so hooks it cannot fire are skipped.
+#
+# Install them with:  long-exposure hooks-install [--target claude|codex|all]
+# Nothing here installs anything — this block only says how the harness
+# should behave once they are installed.
+#
+# The rule these obey: a hook may HARDEN a rule the prompt already states,
+# never be the only place a rule exists. Gemini lacks events, Claude has
+# --bare, and Codex requires operator review of non-managed hooks, so a
+# behaviour living only in a hook would silently vanish somewhere.
+hooks:
+  # PreToolUse. Turns the operating protocol's "off limits" paths from prose
+  # into a denial — including the harness's own source tree, which is on
+  # every agent's PYTHONPATH and therefore writable from Bash.
+  #
+  # THREAT MODEL: this stops mistakes, not adversaries. It matches paths
+  # against the literal command text, so a path built from shell variables
+  # or encoded would pass. Real isolation is a container boundary.
+  fence:
+    # turn   — enforce only inside a long-exposure agent turn (default).
+    # always — enforce on every invocation of that CLI, including your own
+    #          interactive sessions. Note `always` denies YOU access to the
+    #          harness source tree, which is where you develop it.
+    scope: turn
+    # true  — refuse to start a run when the fence is installed but not
+    #         responding (verified by exercising it, not by reading config).
+    #         An unattended run with pre-granted tools and no fence is
+    #         exactly what the fence exists for.
+    # false — warn and continue.
+    required: false
+  # Stop. Checks the final message carries a complete [OUTPUT: x] block and,
+  # if not, returns decision:block — which means "continue the turn" on both
+  # Claude and Codex — so the agent re-emits it. Prevention for the bug class
+  # in docs/gaps.md where a reporter's trailing cover note was captured
+  # instead of the report body. Capped at max_nudges to avoid a loop.
+  envelope:
+    enabled: true
+    max_nudges: 1
+  # PreCompact / PostCompact. Pure instrumentation: one health_events row per
+  # PROVIDER-side compaction, which the harness cannot otherwise see. In the
+  # live smoke run the compaction call was both the most expensive turn of
+  # the cycle and the one with no record.
+  compaction:
+    enabled: true
+
 # === Startup gate (opt-in) ===
 # Four questions asked ONCE, before a run begins, so the expensive choices
 # are made deliberately instead of inherited from whatever this file says.

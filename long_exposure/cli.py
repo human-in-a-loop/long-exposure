@@ -23,6 +23,7 @@ from long_exposure.manager import (
     run_manager_poll,
 )
 from long_exposure.orchestrator import load_config, resolve_instance_dir
+from long_exposure import hooks_install as _hooks
 from long_exposure import startup_gate as _gate
 from long_exposure.tools.setup_env import doctor_main
 
@@ -436,6 +437,49 @@ Manager notices are surfaced through `long-exposure status` from
     return 0
 
 
+def _hooks_install(args: argparse.Namespace) -> int:
+    """Install (or remove, or verify) the vendor lifecycle hooks."""
+    targets = (
+        _hooks.VENDORS if args.target == "all" else (args.target,)
+    )
+    directory = Path(args.directory).expanduser() if args.directory else None
+    hooks = tuple(args.hooks) if args.hooks else ("fence", "envelope", "compaction")
+
+    if args.uninstall:
+        for vendor in targets:
+            res = _hooks.uninstall(vendor, directory)
+            print(f"[hooks] {vendor}: removed from "
+                  f"{', '.join(res['events']) or 'nothing'}")
+            for shim in res["shims"]:
+                print(f"  removed {shim}")
+        return 0
+
+    if args.verify:
+        rc = 0
+        for vendor in targets:
+            ok, detail = _hooks.verify_fence(vendor, directory)
+            print(f"[hooks] {vendor}: {'OK' if ok else 'FAILED'} — {detail}")
+            if not ok:
+                rc = 1
+        return rc
+
+    for vendor in targets:
+        res = _hooks.install(vendor, hooks, directory, dry_run=args.dry_run)
+        print(_hooks.render_summary(res))
+        if args.dry_run:
+            print("  (dry run — nothing written)")
+    if not args.dry_run and "fence" in hooks:
+        for vendor in targets:
+            if not _hooks.HOOK_EVENTS["fence"].get(vendor):
+                continue
+            ok, detail = _hooks.verify_fence(vendor, directory)
+            print(f"[hooks] {vendor} fence self-test: "
+                  f"{'OK' if ok else 'FAILED'} — {detail}")
+            if not ok:
+                return 1
+    return 0
+
+
 def _telemetry_summarize(args: argparse.Namespace) -> int:
     instance_dir = resolve_instance_dir(args.instance_dir)
     config = load_config(Path(args.config) if args.config else None)
@@ -528,6 +572,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_install.add_argument("--directory", default=".", help="Project directory to install adapter files into")
     p_install.add_argument("--force", action="store_true", help="Overwrite adapter files after writing backups")
 
+    p_hooks = sub.add_parser(
+        "hooks-install",
+        help="Install the vendor lifecycle hooks (Claude / Codex / Gemini)",
+        description=(
+            "Write long-exposure's lifecycle hooks into a CLI's config. "
+            "Separate from cli-install because this touches files you own "
+            "(~/.claude/settings.json, ~/.codex/hooks.json): adopting the "
+            "harness should never edit those silently. Existing entries are "
+            "preserved; only long-exposure's own are replaced."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_hooks.add_argument("--target", choices=(*_hooks.VENDORS, "all"), default="all")
+    p_hooks.add_argument(
+        "--directory", default=None,
+        help="Install project-locally under <dir>/.claude etc. "
+             "Omit for the operator's home config (applies to every run).",
+    )
+    p_hooks.add_argument(
+        "--hooks", nargs="+", choices=tuple(_hooks.HOOK_EVENTS),
+        default=None, help="Which hooks to install (default: all three)",
+    )
+    p_hooks.add_argument("--dry-run", action="store_true",
+                         help="Print what would be written and stop")
+    p_hooks.add_argument("--uninstall", action="store_true",
+                         help="Remove only long-exposure's hook entries and shims")
+    p_hooks.add_argument("--verify", action="store_true",
+                         help="Exercise the installed fence and report whether "
+                              "it actually denies (exit 1 if not)")
+
     p_telem = sub.add_parser("telemetry", help="Telemetry utilities")
     telem_sub = p_telem.add_subparsers(dest="telemetry_command", required=True)
     p_telem_sum = telem_sub.add_parser(
@@ -593,6 +667,8 @@ def main(argv: list[str] | None = None) -> int:
         return _manager_poll(args)
     if args.command == "cli-install":
         return _cli_install(args)
+    if args.command == "hooks-install":
+        return _hooks_install(args)
     if args.command == "telemetry" and args.telemetry_command == "summarize":
         return _telemetry_summarize(args)
     parser.error(f"unknown command: {args.command}")

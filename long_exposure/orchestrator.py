@@ -3419,6 +3419,59 @@ def _add_repo_to_pythonpath(env: dict) -> None:
         env["PYTHONPATH"] = os.pathsep.join([repo_root, *parts])
 
 
+# Env vars the vendor hooks read. Set on every agent turn the harness
+# spawns, so a hook can tell a harness turn from an operator's own session.
+# See long_exposure/hooks/__init__.py for why that distinction matters.
+HOOK_ENV_ACTIVE = "LONG_EXPOSURE_HOOK_ACTIVE"
+HOOK_ENV_AGENT = "LONG_EXPOSURE_HOOK_AGENT"
+HOOK_ENV_CYCLE = "LONG_EXPOSURE_HOOK_CYCLE"
+HOOK_ENV_STATE_DIR = "LONG_EXPOSURE_HOOK_STATE_DIR"
+HOOK_ENV_EXPECTED_OUTPUT = "LONG_EXPOSURE_EXPECTED_OUTPUT"
+HOOK_ENV_HARNESS_ROOT = "LONG_EXPOSURE_HARNESS_ROOT"
+HOOK_ENV_GIT_HARNESS_ONLY = "LONG_EXPOSURE_GIT_HARNESS_ONLY"
+HOOK_ENV_FENCE_SCOPE = "LONG_EXPOSURE_FENCE_SCOPE"
+
+
+def _add_hook_env(
+    env: dict,
+    config: dict | None = None,
+    *,
+    agent_name: str | None = None,
+    cycle: int | None = None,
+    state_dir: str | None = None,
+    expected_output: str | None = None,
+) -> None:
+    """Tell the vendor hooks that this subprocess is a harness agent turn.
+
+    Unconditional and cheap: setting these costs nothing when no hooks are
+    installed, and gating it on a config flag would mean a run whose
+    operator installed hooks after starting it silently had none of them
+    apply. The hooks themselves decide what to do with the information.
+
+    `harness_root` is passed explicitly rather than derived inside the hook,
+    because the hook shim may have been generated against a different
+    checkout than the one running this turn.
+    """
+    env[HOOK_ENV_ACTIVE] = "1"
+    env[HOOK_ENV_HARNESS_ROOT] = str(SCRIPT_DIR.parent)
+    if agent_name:
+        env[HOOK_ENV_AGENT] = str(agent_name)
+    if cycle is not None:
+        env[HOOK_ENV_CYCLE] = str(cycle)
+    if state_dir:
+        env[HOOK_ENV_STATE_DIR] = str(state_dir)
+    if expected_output:
+        env[HOOK_ENV_EXPECTED_OUTPUT] = str(expected_output)
+    cfg = config or {}
+    hooks_cfg = cfg.get("hooks") if isinstance(cfg.get("hooks"), dict) else {}
+    scope = str((hooks_cfg.get("fence") or {}).get("scope") or "").strip().lower()
+    if scope in ("turn", "always"):
+        env[HOOK_ENV_FENCE_SCOPE] = scope
+    git_cfg = cfg.get("git_sync") if isinstance(cfg.get("git_sync"), dict) else {}
+    if git_cfg.get("harness_commits_only"):
+        env[HOOK_ENV_GIT_HARNESS_ONLY] = "1"
+
+
 def _local_base_url(config: dict | None = None) -> str:
     raw = (config or {}).get("local_base_url") or os.environ.get("LONG_EXPOSURE_LOCAL_BASE_URL")
     return (raw or "http://127.0.0.1:18080/v1").rstrip("/")
@@ -3532,6 +3585,14 @@ def _invoke_claude(
     env = (env_base if env_base is not None else os.environ).copy()
     env.pop("CLAUDECODE", None)
     _add_repo_to_pythonpath(env)
+    _add_hook_env(
+        env,
+        config,
+        agent_name=(config or {}).get("_hook_agent"),
+        cycle=(config or {}).get("_hook_cycle"),
+        state_dir=(config or {}).get("_hook_state_dir"),
+        expected_output=(config or {}).get("_hook_expected_output"),
+    )
     acct_dir = _active_account_dir()
     if acct_dir:
         env[_provider.child_config_env()] = acct_dir
