@@ -23,86 +23,119 @@ REPO = Path(__file__).resolve().parent.parent
 DOC = REPO / "docs" / "git-federation.md"
 
 
-# git subcommands the harness may invoke. Everything here either reads, or —
-# in `fetch`'s single case — writes only remote-tracking refs and no working
-# file. A subcommand that is not on this list is a write to the operator's
-# workspace, and adding one is a decision, not a refactor.
+# The harness invokes git from exactly one function, `gitcmd.run`, called by
+# exactly two modules. Each has a policy:
+#
+#   conflict_radar  READ-ONLY. It runs on the cycle path against the operator's
+#                   live workspace and must never write. `fetch` is the one
+#                   exception: it updates remote-tracking refs, no working file.
+#   git_sync        MAY WRITE (add, commit, push, merge, stash, switch) but
+#                   never DESTROY: no reset, clean, rebase, checkout of paths,
+#                   no force-push, no --no-verify.
+#
+# This replaced a blanket "the harness never writes git" test when git_sync
+# landed. That test fired exactly as intended — its job was to force an
+# explicit decision the day a write appeared — and this is the decision.
+
 READ_ONLY_GIT = {
-    "rev-parse", "merge-base", "merge-tree", "diff", "status", "log",
-    "show", "cat-file", "ls-files", "ls-remote", "ls-tree", "for-each-ref",
-    "describe", "config",
-    # The documented exception: updates refs/remotes/*, touches no file.
-    "fetch",
+    "rev-parse", "merge-base", "merge-tree", "diff", "status", "log", "show",
+    "cat-file", "ls-files", "ls-remote", "ls-tree", "for-each-ref",
+    "describe", "config", "check-ref-format",
+    "fetch",   # the documented exception
 }
-
-FORBIDDEN_GIT = {
-    "commit", "push", "rebase", "merge", "checkout", "switch", "reset",
-    "clean", "rm", "mv", "restore", "stash", "apply", "am", "cherry-pick",
-    "revert", "tag", "branch", "worktree", "gc", "prune", "filter-branch",
-    "update-ref", "symbolic-ref", "init", "clone", "add",
+WRITE_GIT = {"add", "commit", "push", "merge", "stash", "switch"}
+DESTRUCTIVE_GIT = {
+    "reset", "clean", "rebase", "checkout", "restore", "rm", "mv",
+    "filter-branch", "filter-repo", "update-ref", "symbolic-ref", "gc",
+    "prune", "reflog", "cherry-pick", "revert", "am", "apply", "worktree",
+    "branch", "tag", "init", "clone", "notes", "replace",
 }
+FORCE_FLAGS = {"--force", "-f", "--force-with-lease", "--force-if-includes",
+               "--no-verify", "--hard", "-D", "--delete"}
+KNOWN_GIT = READ_ONLY_GIT | WRITE_GIT | DESTRUCTIVE_GIT
 
 
-class GitIsReadOnlyTests(unittest.TestCase):
-    """The harness reads git. It must never write to the operator's tree."""
+def _git_argvs(text: str) -> list[tuple[int, str, list[str]]]:
+    """Every list literal in `text` that is a git argv: (line, subcommand,
+    all string constants in it). A list counts when its first string constant
+    that is not a flag is a known git subcommand, so an unrelated list or a
+    `-c user.name=...` identity prefix is ignored. Reads the AST, not text,
+    so a MESSAGE like "git add failed" is not mistaken for an invocation —
+    which is exactly what the string scan this replaced got wrong."""
+    import ast
+
+    out = []
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(node, ast.List):
+            continue
+        consts = [e.value for e in node.elts
+                  if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        sub = next((c for c in consts if not c.startswith("-")), None)
+        if sub in KNOWN_GIT:
+            out.append((node.lineno, sub, consts))
+    return out
+
+
+class GitPolicyTests(unittest.TestCase):
+    """Who may run git, and what each may do."""
+
+    def _module(self, name):
+        return (REPO / "long_exposure" / name).read_text()
 
     def test_git_is_invoked_from_exactly_one_place(self):
-        """Every git call funnels through `conflict_radar._git`.
-
-        This is what makes the rest of this class checkable: one function with
-        one timeout and one never-raises contract, instead of git calls
-        scattered across the package.
-        """
         files = set()
         for path in (REPO / "long_exposure").rglob("*.py"):
             if re.search(r"""\[\s*["']git["']\s*[,\]]""", path.read_text()):
                 files.add(str(path.relative_to(REPO)))
-        self.assertEqual(files, {"long_exposure/conflict_radar.py"}, files)
+        self.assertEqual(files, {"long_exposure/gitcmd.py"}, files)
 
-    def test_only_read_only_subcommands_are_invoked(self):
-        """The real call shape is `_git(["<sub>", ...])`, so check that.
-
-        An earlier version of this test only matched `["git", "<sub>"`, which
-        every call in this package sidesteps — `_git` supplies the "git" itself.
-        It would have passed a `_git(["commit", ...])` without complaint.
-        """
-        text = (REPO / "long_exposure" / "conflict_radar.py").read_text()
-        subs = set()
-        for m in re.finditer(r"""_git\(\s*\[\s*["']([\w-]+)["']""", text):
-            subs.add(m.group(1))
-        self.assertTrue(subs, "found no _git call sites; did the shape change?")
-        self.assertEqual(subs - READ_ONLY_GIT, set(),
-                         f"non-read-only subcommand invoked: {subs - READ_ONLY_GIT}")
-        self.assertEqual(subs & FORBIDDEN_GIT, set())
-
-    def test_the_guard_would_actually_catch_a_write(self):
-        """A test that cannot fail is not a test. Prove the pattern bites."""
-        sample = '_git(["commit", "-m", "x"], workspace)'
-        found = set(re.findall(r"""_git\(\s*\[\s*["']([\w-]+)["']""", sample))
-        self.assertEqual(found, {"commit"})
-        self.assertTrue(found & FORBIDDEN_GIT)
-
-    def test_no_forbidden_subcommand_appears_anywhere_in_the_package(self):
-        """Belt and braces: catch a write built by string concatenation too."""
-        offenders = []
+    def test_only_the_two_policy_modules_use_the_chokepoint(self):
+        users = set()
         for path in (REPO / "long_exposure").rglob("*.py"):
-            for i, line in enumerate(path.read_text().splitlines(), 1):
-                for m in re.finditer(r"""["']git\s+([a-z-]+)""", line):
-                    if m.group(1) in FORBIDDEN_GIT:
-                        offenders.append(f"{path.relative_to(REPO)}:{i} {m.group(1)}")
-        self.assertEqual(offenders, [], f"git write found: {offenders}")
+            if path.name == "gitcmd.py":
+                continue
+            if re.search(r"import gitcmd|gitcmd import", path.read_text()):
+                users.add(path.name)
+        self.assertEqual(users, {"conflict_radar.py", "git_sync.py"}, users)
+
+    def test_the_radar_is_read_only(self):
+        argvs = _git_argvs(self._module("conflict_radar.py"))
+        self.assertTrue(argvs, "found no git argv in the radar; did the shape change?")
+        bad = [(ln, sub) for ln, sub, _ in argvs if sub not in READ_ONLY_GIT]
+        self.assertEqual(bad, [], f"the radar writes git: {bad}")
+
+    def test_git_sync_never_destroys(self):
+        argvs = _git_argvs(self._module("git_sync.py"))
+        self.assertTrue(argvs)
+        destructive = [(ln, sub) for ln, sub, _ in argvs if sub in DESTRUCTIVE_GIT]
+        self.assertEqual(destructive, [], f"destructive git in git_sync: {destructive}")
+        forced = [(ln, c) for ln, _, consts in argvs for c in consts
+                  if c in FORCE_FLAGS]
+        self.assertEqual(forced, [], f"force/bypass flags in git_sync: {forced}")
+        plus = [(ln, c) for ln, sub, consts in argvs if sub == "push"
+                for c in consts if c.startswith("+")]
+        self.assertEqual(plus, [], f"a forced (+) refspec: {plus}")
+
+    def test_git_sync_actually_writes_what_it_says(self):
+        """Guards against the policy passing because the module went empty."""
+        subs = {sub for _, sub, _ in _git_argvs(self._module("git_sync.py"))}
+        self.assertTrue({"add", "commit", "push", "merge", "stash"} <= subs, subs)
+
+    def test_the_policy_bites(self):
+        """A test that cannot fail is not a test."""
+        sample = ('_git(state, ["reset", "--hard"])\n'
+                  '_git(state, ["push", "--force", "origin", "x"])\n'
+                  'msg = "git add failed"\n')
+        argvs = _git_argvs(sample)
+        self.assertEqual({sub for _, sub, _ in argvs}, {"reset", "push"},
+                         "a message string must not count as an invocation")
+        self.assertTrue(any(sub in DESTRUCTIVE_GIT for _, sub, _ in argvs))
+        self.assertTrue(any(c in FORCE_FLAGS for _, _, cs in argvs for c in cs))
 
     def test_the_radar_declares_itself_read_only(self):
         from long_exposure import conflict_radar
 
         self.assertIn("read-only", (conflict_radar.__doc__ or "").lower())
-
-    def test_the_sync_layer_is_still_unbuilt(self):
-        """The radar reads. Nothing fetches-rebases-commits-pushes a cycle,
-        and the doc still says so."""
-        text = DOC.read_text().lower()
-        self.assertIn("not built", text)
-        self.assertIn("read-only", text)
 
 
 class StorageZoneTests(unittest.TestCase):
@@ -277,8 +310,9 @@ class GuidanceSeamTests(unittest.TestCase):
     def test_the_live_guidance_parts_list_is_where_the_doc_says(self):
         """The radar's block joins this list rather than adding a stage."""
         text = (REPO / "long_exposure" / "exploration.py").read_text()
-        self.assertIn("p for p in (fanout_guide, sibling_block, anti_patterns_block,", text)
-        self.assertIn("conflict_block, guidance)", text)
+        flat = re.sub(r"\s+", " ", text)
+        self.assertIn("(fanout_guide, sibling_block, anti_patterns_block, "
+                      "conflict_block, sync_block, guidance)", flat)
 
     def test_the_cycle_boundary_transaction_point_still_exists(self):
         text = (REPO / "long_exposure" / "exploration.py").read_text()

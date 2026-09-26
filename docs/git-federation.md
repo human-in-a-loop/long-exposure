@@ -1,26 +1,33 @@
 # Git federation: many long-exposure instances, one repository
 
-**Status: the sync layer is not built. Two pieces of it are.**
+**Status: the sync layer is built. The claims registry is not, deliberately.**
 
 | Piece | State |
 |---|---|
 | Operator identity on the ledger (§7.1) | **Built.** `long_exposure/federation.py` |
-| Conflict radar (§4.3) | **Built**, off by default. `long_exposure/conflict_radar.py` — **read-only git** |
-| Slice-name canonicalisation (§6.2) | **Built**, no consumer yet — the claims registry it is for is not built |
-| Fetch / rebase / commit / push at cycle boundaries (§4.1, §4.2) | **Not built.** No design change, just unwritten |
+| Conflict radar (§4.3) | **Built**, off by default. `long_exposure/conflict_radar.py` — **read-only** |
+| Per-cycle commits, integration, push (§4.1, §4.2) | **Built**, off by default. `long_exposure/git_sync.py` |
+| Crash recovery (§4.4) | **Built**, part of git_sync. Not in the original design |
+| Slice-name canonicalisation (§6.2) | **Built**, no consumer yet |
 | Claims registry (§6) | **Not built**, deliberately — §8 says run the experiment first |
 | Per-operator memoirs (§5.2) | **Not built** |
 
-So the harness now runs git, and it only ever **reads**: `rev-parse`,
-`merge-base`, `merge-tree`, `diff`, `status`, plus `fetch`, which updates
-remote-tracking refs and no working file. It does not commit, push, rebase,
-checkout, reset or stash, and
-`tests/test_git_federation_doc.py::GitIsReadOnlyTests` fails the build if a
-write ever appears. That invariant matters because the radar runs on the cycle
-path against the operator's live workspace.
+**The harness now writes git**, from exactly one function (`gitcmd.run`)
+called by exactly two modules, each under a policy the build enforces
+(`tests/test_git_federation_doc.py::GitPolicyTests`):
 
-Sections describing unbuilt parts say so inline. The git mechanics in §9 were
-verified against real repositories rather than reasoned about.
+- `conflict_radar` is **read-only** — `fetch` is the only exception, and it
+  touches remote-tracking refs, not files;
+- `git_sync` may add, commit, push, merge, stash and switch, but **never
+  destroys**: no reset, clean, rebase, checkout of paths, force-push or
+  `--no-verify`.
+
+The policy is checked twice: statically over every git argv literal in each
+module, and at runtime by a spy that records every subcommand actually
+executed through a crash, a recovery, a conflict, a merge and a push.
+
+The git mechanics in §9 were verified against real repositories rather than
+reasoned about.
 
 The decisions this rests on were taken in
 `docs/worktrees-hooks-swarms-plan.md` §3, §4 and §7. This document is the
@@ -131,64 +138,125 @@ use it rather than reinvent a reduction step (plan §4.1).
 Two new seams. Both sit exactly where the harness already has a transaction
 point, so neither invents a lifecycle stage.
 
-### 4.1 Before the roles run — `exploration.py` ~4251, after `cycle += 1`
+### 4.1 Before the roles run — BUILT
 
-*Steps 1–3 are **not built**. Step 4's seam exists and the radar already uses it.*
+`git_sync.before_cycle`, called at the top of every root cycle, before
+`_assemble_cycle_inputs` (both extracted from `run_exploration` so this had
+somewhere clean to attach):
 
 ```
-1.  git fetch origin
-2.  git rebase origin/<shared-branch>       # or merge; never --strategy=ours
-3.  read .long-exposure/claims/*.json
-4.  build a <federation> block
+1.  write the in-progress marker {run_id, cycle}
+2.  git fetch <remote> <shared_branch>
+3.  git merge --no-edit <remote>/<shared_branch>     # into this run's branch
+4.  on conflict: collect the files, git merge --abort, tell the researcher
+5.  return a <git_sync> block if there is anything to say
 ```
 
-The block joins the list already assembled at `exploration.py:4358`:
+**Merge, not rebase** — a departure from the original design, which said
+"rebase (or merge)". The run branch is pushed every cycle, so rebasing it would
+rewrite published history and force every later push. Merging never does, which
+is what lets `git_sync` promise it never force-pushes.
+
+The block joins the live-guidance parts list beside the radar's:
 
 ```python
 parts = [p for p in (fanout_guide, sibling_block, anti_patterns_block,
-                     conflict_block, guidance) if p]
-base_live_guidance = "\n\n".join(parts) if parts else "[No live guidance this cycle.]"
+                     conflict_block, sync_block, guidance) if p]
 ```
 
-`conflict_block` is the radar of §4.3, already in that list. A claims block
-would slot in beside it for the same reason: pointer-shaped cross-process
-visibility, gated to the cycles where it can be acted on. The researcher reads
-that another run holds `spectral-theory` with a claim 40 minutes old, and picks
-something else.
+A merge conflict is surfaced here, as an input, not raised as an error (plan
+§7), and **never auto-resolved**. The merge is aborted, so the workspace is left
+with no conflict markers and no merge in progress; the researcher is told which
+files conflict. Conflicts on generated artifacts are usually "keep both";
+conflicts in source are a research disagreement between two runs, and a
+strategy flag is the wrong instrument for a disagreement.
 
-A rebase conflict is surfaced *here*, as an input, not raised as an error
-(plan §7). The harness never auto-resolves it. Conflicts on generated
-artifacts are usually "both are fine, keep both"; conflicts in source are a
-research disagreement between two runs, and a strategy flag is the wrong
-instrument for a disagreement.
+An unreachable remote, a dirty tree, or an unrelated history is a notice, not a
+failure. The cycle always runs.
 
-### 4.2 After the roles run — `exploration.py` ~5270, the "Status file + state" block
+### 4.2 After the roles run — BUILT
 
-***Not built.** The seam is identified; nothing writes to it.*
+`git_sync.after_cycle`, called immediately after the cycle-end
+`_persist_state()`:
 
 ```
-5.  git add <workspace paths only>
-6.  git commit -m "cycle <n>: <topic>  [run_id, operator, harness commit]"
-7.  git push origin HEAD:long-exposure/<operator>/<run_id>
-8.  on rejection: fetch, and let the NEXT cycle's step 1–4 see the new state
+6.  git add -A -- . ':(exclude)<harness-private paths>'
+7.  git commit    "long-exposure cycle <n>: <topic>"
+                  + trailers  Long-Exposure-Run / -Operator / -Harness
+8.  git push <remote> HEAD:refs/heads/long-exposure/<operator>/<run_id>
+9.  clear the in-progress marker — always, even if the commit failed
 ```
 
-This lands immediately after `save_state(...)` and before the `cycle_end`
-telemetry event, which is where the cycle already becomes durable: state
-written, status file updated, memoir archived. Committing there means every
-commit is one coherent cycle and `git log` is a readable run history.
+**After** the state is saved, so a commit never records a cycle the state does
+not know about. A cycle with no changes makes no commit. The
+`Long-Exposure-Harness` trailer records the harness commit, which makes version
+drift between operators (§7) visible in the history rather than inferred.
 
-**The harness commits; the agent does not** (plan §7). Deterministic,
-harness-authored commits at cycle boundaries are auditable and reproducible.
-Letting agents run `git commit` would put provenance under model control and
-make history a function of prompt adherence. This is carried by prompt
-guidance and by the harness being the thing that runs `git` — not by a hook
-that blocks `git commit`, which went when the `PreToolUse` fence did.
+Two further commits bracket a run: `workspace state at run start` for anything
+uncommitted when the run begins (an operator's edits, a fresh workspace's
+bootstrap files), and `end of run` for the closing report and final reports,
+which are written after the last cycle's commit and would otherwise be swept
+into the *next* run's baseline and attributed to the wrong run.
 
-A rejected push is not an error either. It means someone else got there
-first; the next cycle's fetch will see it.
+**The harness commits; the agent does not** (plan §7). Harness-authored commits
+at cycle boundaries are auditable and reproducible; agent-authored ones would
+put provenance under prompt adherence.
 
----
+The operator's own **pre-commit hooks apply**. A hook that fails blocks the
+commit, the work stays in the workspace, and the next cycle's commit carries
+it. `--no-verify` would be the harness overriding the operator's policy, so
+the build forbids it.
+
+A rejected push is never forced. Each run has its own branch, so a rejection
+means something outside the harness moved it — and overwriting that would be
+the harness destroying someone's work.
+
+### 4.4 Crash recovery — BUILT, and the strongest reason to turn this on
+
+This was not in the original design, and it turns out to be the case that
+matters even with **one** operator.
+
+The harness saves its state at cycle boundaries, not per agent turn. Before
+git_sync, a process that died twelve minutes into a thirteen-minute worker turn
+lost the cycle *and* left that dead turn's half-finished edits in a workspace
+that no longer matched the saved state. The resumed researcher then read a
+workspace describing work its state said had never happened.
+
+The in-progress marker, compared with the state's last completed cycle, tells
+three situations apart:
+
+| Marker | vs. last completed cycle | What happened | What git_sync does |
+|---|---|---|---|
+| absent | — | a clean stop | nothing to recover |
+| cycle N | N > last completed | died **during** cycle N — the edits are partial | **stash** them, recoverably, and tell the researcher |
+| cycle N | N = last completed | died after the save, before the commit — the edits are **complete** | **commit** them as `recovered commit` |
+| another run's | — | a reused instance dir | ignore it; stashing would take the new run's bootstrap files |
+
+Stash, never reset: the edits might have been worth keeping, and only a person
+or the researcher can judge that. The researcher is told the stash's name and
+how to restore it. Harness-private paths are excluded from the stash — an
+earlier design would have stashed the very run state the resume was reading.
+
+**Verified with a real crash**, not a simulated one
+(`tests/test_git_sync_crash.py`): a subprocess runs real cycles, its cycle-2
+worker writes a partial edit and hangs, and the test SIGKILLs the process group
+— no signal handler, no `finally`, like an OOM kill. A fresh process resumes.
+Checked: the partial edit (and an untracked scratch file) are in a stash named
+for the crashed cycle; the run state is not; the resumed researcher's guidance
+names the stash and `git stash pop`; the redone cycle is committed; the partial
+edit is in no commit; the shared branch was never touched. And `git stash pop`
+afterwards hits a conflict with the redone cycle's version of the same file —
+so git keeps the stash rather than silently overwrite either side, which is the
+right outcome.
+
+**Mutation-tested.** Seven deliberate breakages of the module — ignore the
+marker's run_id, treat a completed cycle as a crash, stash without the
+exclusions, force-push, leave a conflicted merge in place, forget to clear the
+marker, bypass the pre-commit hook — are each caught by a named test. The first
+pass caught six. The seventh survived because the test for it cleared an old
+run's residue with `git stash -u`, which also stashed the marker it meant to
+exercise; that test now places the marker directly and asserts it is present
+before the code runs.
 
 ### 4.3 The conflict radar — BUILT, read-only
 
@@ -223,12 +291,13 @@ remote moved data/spectral.py; workspace holds an uncommitted edit to it
 merge-tree HEAD origin/main   ->  CLEAN
 ```
 
-Because the harness does not commit, HEAD sits wherever a human last left it
-while all of the cycle's work is uncommitted. So there are two signals:
+Without git_sync the harness does not commit, so HEAD sits wherever a human
+last left it while all of the cycle's work is uncommitted — and even with it,
+every cycle is uncommitted until its end. So there are two signals:
 
 | Signal | Question | Fires today? |
 |---|---|---|
-| `merge_tree_conflicts` | Would the *committed* state conflict with the shared branch? | Only once something commits — forward-looking, for when §4.2 lands |
+| `merge_tree_conflicts` | Would the *committed* state conflict with the shared branch? | With git_sync on, yes — against the previous cycles' commits |
 | `dirty_overlap` | Which paths has the shared branch changed since the merge base that are **also** locally modified, staged or untracked? | **Yes.** This is the one that works on a normal run |
 
 The block names the overlapping paths, groups them into regions via §6.2's
@@ -541,46 +610,46 @@ clean.
 
 ## 8. Build order
 
-1. ~~**Ledger identity** (§7.1)~~ — **DONE.** Small, no git involved, and
-   required for anything downstream to be readable.
-2. ~~**Conflict radar** (§4.3)~~ — **DONE**, off by default. Read-only, so it
-   could ship ahead of the sync layer, and it is the piece that pays for itself
-   soonest: it converts a 41.7% cross-agent conflict rate from a merge-time
-   surprise into a pre-cycle input.
-3. **The sync layer**: one module, one config block, the two cycle-boundary
-   seams of §4.1 and §4.2. Branch-per-run and cycle-boundary commits only — no
-   claims, no leases. **This is the next thing.**
+1. ~~**Ledger identity** (§7.1)~~ — **DONE.**
+2. ~~**Conflict radar** (§4.3)~~ — **DONE**, off by default.
+3. ~~**The sync layer** (§4.1, §4.2)~~ — **DONE**, off by default, with crash
+   recovery (§4.4) added on the way. It shipped with a first decomposition of
+   `run_exploration`, which created the seams it attaches to and surfaced a
+   persistence bug on the way (`audit_free_streak` reached 3 of 7 save sites).
 4. **The experiment** (plan §4.5). Two operators, one repo, one small shared
    directive, both on the same harness commit, *no claims registry*. Count: how
-   many pushes are rejected, how many rebases conflict, what they conflict on,
-   and whether the two runs produce complementary or duplicated work. The radar
-   makes this experiment much better instrumented than it would have been —
-   every predicted overlap can be compared against what actually conflicted.
+   many merges conflict, what they conflict on, and whether the two runs
+   produce complementary or duplicated work. The radar's forecasts can now be
+   checked against what actually conflicted, and the `Long-Exposure-*`
+   trailers make every commit attributable. **This is the next thing.**
 5. **Then** decide the claims registry's shape from §6.2 with data, and
-   `MEMOIR.<operator>.md` if the experiment shows memoir conflicts actually
-   dominate.
+   `MEMOIR.<operator>.md` if the experiment shows memoir conflicts dominate.
 
-Steps 4 and 5 are in that order on purpose. The claims registry is the part of
+Steps 4 and 5 stay in that order on purpose. The claims registry is the part of
 this design with the most guesswork in it, and the experiment is cheap.
 
-The config block for what is built (`long_exposure/config.yaml`), which is real
-and read, unlike the `git_sync:` sketch this section used to carry:
+The config, all of it read (`long_exposure/config.yaml`):
 
 ```yaml
 federation:
   operator: ""              # blank derives from the hostname
+  remote: "origin"          # shared by the radar and git_sync
+  shared_branch: "main"
   conflict_radar:
     enabled: false
-    remote: "origin"
-    shared_branch: "main"
-    fetch: true             # false = forecast from local refs, no network
+    fetch: true
     timeout_seconds: 30
     max_paths: 20
+  git_sync:
+    enabled: false
+    push: true              # false = local commits only
+    integrate: true         # merge the shared branch in before each cycle
+    timeout_seconds: 60
 ```
 
-`federation.operator` applies whether or not the radar is on: the ledger stamp
-is unconditional, because a ledger that is federation-ready by default costs
-nothing on a single-operator run.
+`remote` and `shared_branch` moved up from `conflict_radar` when git_sync
+arrived: two copies could have pointed the radar at one branch while sync
+integrated another.
 
 ## 9. The git mechanics, verified
 

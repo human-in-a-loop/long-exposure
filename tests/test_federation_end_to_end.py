@@ -127,10 +127,10 @@ class TwoOperatorsOneRepoTests(unittest.TestCase):
             "checkpoint_format: standard\nrequire_checkpoint_first: false\n"
             "user_gate_approval: false\nanti_patterns_enabled: true\n"
             "telemetry:\n  enabled: false\n"
-            f"federation:\n  operator: \"{operator}\"\n"
+            f"federation:\n  operator: \"{operator}\"\n  shared_branch: main\n"
             "  conflict_radar:\n"
             f"    enabled: {'true' if radar else 'false'}\n"
-            "    shared_branch: main\n    fetch: true\n    timeout_seconds: 20\n")
+            "    fetch: true\n    timeout_seconds: 20\n")
         captured = []
         # A real run resolves identity from config; nothing pre-set.
         os.environ.pop("LONG_EXPOSURE_OPERATOR", None)

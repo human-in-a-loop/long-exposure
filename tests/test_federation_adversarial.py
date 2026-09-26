@@ -49,7 +49,7 @@ from long_exposure import conflict_radar as cr
 from long_exposure import federation as fed
 from long_exposure import workspace_bootstrap as wb
 
-ON = {"federation": {"conflict_radar": {"enabled": True, "shared_branch": "main"}}}
+ON = {"federation": {"conflict_radar": {"enabled": True}}}
 
 
 def git(*args, cwd):
@@ -398,8 +398,8 @@ class ArgvInjectionTests(RadarTestCase):
         try:
             for value in self.OPTION_SHAPED:
                 for key in ("shared_branch", "remote"):
-                    cfg = {"federation": {"conflict_radar":
-                                          {"enabled": True, key: value}}}
+                    cfg = {"federation": {key: value,
+                                          "conflict_radar": {"enabled": True}}}
                     radar = cr.scan(self.A, cfg)
                     self.assertFalse(radar.available, f"{key}={value!r}")
                     self.assertIn("git would read as an option", radar.reason)
@@ -411,8 +411,8 @@ class ArgvInjectionTests(RadarTestCase):
         """A blank setting means "unset", so it takes the default — it is not
         an attack. The guard only answers the option-shaped question."""
         for value in ("", "   "):
-            cfg = {"federation": {"conflict_radar":
-                                  {"enabled": True, "shared_branch": value}}}
+            cfg = {"federation": {"shared_branch": value,
+                                  "conflict_radar": {"enabled": True}}}
             radar = cr.scan(self.A, cfg)
             self.assertTrue(radar.available, repr(value))
             self.assertEqual(radar.shared_ref, "origin/main")
@@ -435,9 +435,8 @@ class ArgvInjectionTests(RadarTestCase):
         marker = Path("/tmp/le-pwned-shell")
         marker.unlink(missing_ok=True)
         try:
-            cfg = {"federation": {"conflict_radar":
-                                  {"enabled": True,
-                                   "shared_branch": f"main;touch {marker}"}}}
+            cfg = {"federation": {"shared_branch": f"main;touch {marker}",
+                                  "conflict_radar": {"enabled": True}}}
             cr.scan(self.A, cfg)
             self.assertFalse(marker.exists())
         finally:
@@ -448,8 +447,8 @@ class ArgvInjectionTests(RadarTestCase):
         for name in ("main", "develop", "release/1.2", "feature_x", "v2.0"):
             self.assertFalse(fed.slugify(name) == "" and name != "",
                              name)
-            cfg = {"federation": {"conflict_radar":
-                                  {"enabled": True, "shared_branch": name}}}
+            cfg = {"federation": {"shared_branch": name,
+                                  "conflict_radar": {"enabled": True}}}
             radar = cr.scan(self.A, cfg)
             self.assertNotIn("git would read as an option", radar.reason, name)
 
@@ -467,7 +466,7 @@ class TimeoutBoundsTests(RadarTestCase):
         try:
             started = time.monotonic()
             radar = cr.scan(self.A, {"federation": {"conflict_radar": {
-                "enabled": True, "shared_branch": "main", "timeout_seconds": 2}}})
+                "enabled": True, "timeout_seconds": 2}}})
             elapsed = time.monotonic() - started
         finally:
             os.environ["PATH"] = saved

@@ -19,10 +19,8 @@ from tempfile import TemporaryDirectory
 
 from long_exposure import conflict_radar as cr
 
-ON = {"federation": {"conflict_radar": {"enabled": True,
-                                        "shared_branch": "main"}}}
+ON = {"federation": {"conflict_radar": {"enabled": True}}}
 NO_FETCH = {"federation": {"conflict_radar": {"enabled": True,
-                                              "shared_branch": "main",
                                               "fetch": False}}}
 
 
@@ -183,8 +181,8 @@ class DegradationTests(RadarTestCase):
         self.assertIn("not a directory", r.reason)
 
     def test_no_such_shared_branch(self):
-        cfg = {"federation": {"conflict_radar":
-                              {"enabled": True, "shared_branch": "nope"}}}
+        cfg = {"federation": {"shared_branch": "nope",
+                              "conflict_radar": {"enabled": True}}}
         r = cr.scan(self.A, cfg)
         self.assertFalse(r.available)
         self.assertIn("no such ref", r.reason)
@@ -197,7 +195,7 @@ class DegradationTests(RadarTestCase):
             cwd=self.A)
         (self.A / "data/spectral.py").write_text("A's work\n")
         cfg = {"federation": {"conflict_radar":
-                              {"enabled": True, "shared_branch": "main",
+                              {"enabled": True,
                                "timeout_seconds": 5}}}
         r = cr.scan(self.A, cfg)
         self.assertTrue(r.available)
@@ -230,7 +228,7 @@ class DegradationTests(RadarTestCase):
     def test_a_bad_timeout_value_falls_back_instead_of_crashing(self):
         for bad in ("lots", None, 0, -5, [1]):
             cfg = {"federation": {"conflict_radar":
-                                  {"enabled": True, "shared_branch": "main",
+                                  {"enabled": True,
                                    "timeout_seconds": bad}}}
             self.assertIsInstance(cr.scan(self.A, cfg), cr.Radar)
 
@@ -245,7 +243,7 @@ class BoundsTests(RadarTestCase):
         for i in range(30):
             (self.A / f"data/f{i}.py").write_text("from A\n")
         cfg = {"federation": {"conflict_radar":
-                              {"enabled": True, "shared_branch": "main",
+                              {"enabled": True,
                                "max_paths": 5}}}
         r = cr.scan(self.A, cfg)
         self.assertEqual(len(r.dirty_overlap), 5)
@@ -329,7 +327,7 @@ class WiringTests(RadarTestCase):
         # the block was extracted from run_exploration).
         import re
         flat = re.sub(r"\s+", " ", src)
-        self.assertIn("anti_patterns_block, conflict_block, guidance", flat)
+        self.assertIn("anti_patterns_block, conflict_block, sync_block, guidance", flat)
 
 
 if __name__ == "__main__":

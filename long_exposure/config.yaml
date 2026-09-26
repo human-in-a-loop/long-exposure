@@ -274,50 +274,68 @@ hooks:
   compaction:
     enabled: true
 
-# === Federation (multi-operator over one repository) ===
-# For the shape in docs/git-federation.md: several operators on separate
-# machines, each running their own long-exposure against one shared repo.
+# === Federation and per-cycle commits (git) ===
+# docs/git-federation.md. Two features, both OFF by default, sharing one
+# remote and one shared branch so they can never point at different places.
 #
 # `operator` is this machine's name. It is stamped onto every promise-ledger
-# event and is what lets a shared ledger tell two operators' findings apart.
-# Leave it blank and it derives from the hostname, which is why federation
-# works before anyone edits this file. It costs nothing on a single-operator
-# run: when only one operator appears on a ledger, the summary renders no
+# event, is the middle segment of the run branch, and is what lets a shared
+# ledger tell two operators' findings apart. Blank derives from the hostname,
+# which is why this works before anyone edits the file. It costs nothing on a
+# single-operator run: with one operator on a ledger, the summary shows no
 # operator column and reads exactly as it did before the field existed.
-#
-# WHAT IS NOT HERE: the git sync layer. The harness runs no git command of its
-# own — it does not fetch, commit, rebase or push, and nothing below makes it
-# start. The conflict radar READS git and never writes (its only side effect
-# is an optional `git fetch`, which touches remote-tracking refs and no file).
 federation:
   operator: ""
+  remote: "origin"
+  shared_branch: "main"
 
   # A forecast, at the start of each researcher cycle, of overlap between this
-  # workspace and the shared branch. Motivation, from a published study of
-  # 33,596 agent-authored PRs (not our own numbers): cross-agent pairs conflict
-  # at 41.7% versus 19.8% for same-agent pairs, and ~42% of those conflicts are
-  # structural (modify/delete or add/add) — the kind no merge driver resolves.
-  # All of it is normally discovered at merge time, the most expensive moment.
-  # See docs/git-federation.md §4.3 for the citation.
+  # workspace and the shared branch. READ-ONLY: its only side effect is an
+  # optional `git fetch`, which updates remote-tracking refs and no file.
   #
-  # Two signals, because one is not enough. `git merge-tree` predicts a merge
-  # of COMMITTED state, and the harness does not commit, so on its own it
-  # reports clean while a real overlap sits uncommitted in the workspace. The
-  # second signal — paths the shared branch changed that are also locally
-  # modified — is the one that fires on a normal run.
+  # Motivation, from a published study of 33,596 agent-authored PRs (not our
+  # own numbers): cross-agent pairs conflict at 41.7% versus 19.8% for
+  # same-agent pairs, and ~42% of those conflicts are structural
+  # (modify/delete or add/add) — the kind no merge driver resolves. See
+  # docs/git-federation.md §4.3 for the citation.
   #
-  # Root process only, and only on cycles with a researcher: fan-out clones
-  # share the root's workspace and never plan, so a per-clone scan would be N
-  # identical fetches whose answer nobody can act on. Emits nothing when there
-  # is no overlap, so it is not per-cycle prompt weight.
+  # Two signals. `git merge-tree` predicts a merge of COMMITTED state; the
+  # other — paths the shared branch changed that are also locally modified —
+  # catches overlap in uncommitted work, which is the state of every run
+  # without git_sync and of every run mid-cycle with it.
+  #
+  # Root process only, and only on researcher cycles. Silent when there is no
+  # overlap, so it is not per-cycle prompt weight.
   conflict_radar:
-    enabled: false          # off by default; needs a real shared branch
-    remote: "origin"
-    shared_branch: "main"
+    enabled: false
     fetch: true             # false = forecast from local refs, no network
-    timeout_seconds: 30     # fetch budget; a cycle boundary must not hang
+    timeout_seconds: 30     # bounds the WHOLE scan, not just the fetch
     max_paths: 20           # per signal, so a wide conflict cannot flood the prompt
 
+  # Commit the workspace at every cycle boundary, to this run's own branch:
+  #   long-exposure/<operator>/<run_id>
+  #
+  # Crash consistency for ONE operator: state is saved per cycle, and now the
+  # workspace is snapshotted per cycle too. A process that dies mid-cycle
+  # leaves partial edits; on resume they are STASHED (never discarded) and the
+  # researcher is told how to restore them, so the run restarts from a
+  # workspace that matches its saved state.
+  #
+  # Federation for SEVERAL: before each cycle the shared branch is merged in,
+  # and after it the run branch is pushed. Each run has its own branch, so a
+  # push is never forced; reaching the shared branch is a pull request a
+  # person reviews. A merge conflict is aborted and handed to the researcher —
+  # never auto-resolved.
+  #
+  # Never destroys work: no reset, clean, rebase, force-push, or --no-verify
+  # (your own pre-commit hooks apply to its commits), enforced by
+  # tests/test_git_federation_doc.py::GitPolicyTests. Requires the workspace to
+  # be the repository's top level. Root process only.
+  git_sync:
+    enabled: false
+    push: true              # false = local commits only (crash consistency, no remote)
+    integrate: true         # merge the shared branch in before each cycle
+    timeout_seconds: 60     # fetch / merge / push budget
 
 # === Startup gate (opt-in) ===
 # Four questions asked ONCE, before a run begins, so the expensive choices

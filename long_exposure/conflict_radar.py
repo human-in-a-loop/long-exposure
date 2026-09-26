@@ -65,32 +65,18 @@ one-line reason.
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from xml.sax.saxutils import escape as _xml_escape
 
 from long_exposure import federation as _federation
+from long_exposure import gitcmd as _gitcmd
 
 def _rejects_as_option(value: str) -> bool:
-    """True if this value would be read by git as an option rather than a name.
-
-    `remote` and `shared_branch` are interpolated into git argv, and git parses
-    a leading `-` as an option wherever it appears — including in the refspec
-    slot. Found live: `git fetch --quiet origin "--upload-pack=touch /tmp/x"`
-    executes `touch /tmp/x`. The value comes from config, so an operator who
-    sets it could already run anything on their own machine, which keeps the
-    severity low; it is fixed anyway because the field is *documented as a
-    branch name*, looks inert, and is the kind of value a federation would
-    later template from a run_id or an operator name.
-
-    Validated here, once, rather than per call site: both values reach four
-    different git invocations. An empty value never arrives — `scan` defaults
-    it to `origin` / `main` first, which is what a blank setting means — so
-    this only has to answer the option-shaped question.
-    """
-    return str(value or "").startswith("-")
+    """See `gitcmd.rejects_as_option`. Shared with git_sync, which puts the same
+    values — and an operator name — into argv."""
+    return _gitcmd.rejects_as_option(value)
 
 
 # Paths in the block come from ANOTHER operator's repository, so they are
@@ -159,17 +145,8 @@ class Radar:
 
 def _git(args: list[str], cwd: Path, timeout: int = LOCAL_TIMEOUT
          ) -> tuple[int, str, str]:
-    """Run git. Never raises; a failure to launch looks like a non-zero exit."""
-    try:
-        proc = subprocess.run(
-            ["git", *args], cwd=str(cwd), capture_output=True, text=True,
-            timeout=timeout,
-        )
-        return proc.returncode, proc.stdout or "", proc.stderr or ""
-    except subprocess.TimeoutExpired:
-        return 124, "", f"timed out after {timeout}s"
-    except (OSError, subprocess.SubprocessError) as exc:
-        return 127, "", repr(exc)
+    """Run a READ-ONLY git command. See `long_exposure.gitcmd`."""
+    return _gitcmd.run(args, cwd, timeout)
 
 
 def _is_repo(workspace: Path, timeout: int = LOCAL_TIMEOUT) -> bool:
@@ -223,11 +200,8 @@ def scan(workspace: Path, config: dict | None = None) -> Radar:
     remote-tracking refs and no working file.
     """
     cfg = _federation.settings(config).get("conflict_radar") or {}
-    # Strip BEFORE defaulting. `"   "` is truthy, so `x or "main"` keeps it and
-    # `.strip()` then yields an empty ref name, which fails as "no such ref"
-    # instead of quietly taking the default a blank setting clearly means.
-    remote = str(cfg.get("remote") or "").strip() or "origin"
-    branch = str(cfg.get("shared_branch") or "").strip() or "main"
+    # Shared with git_sync so the two can never point at different branches.
+    remote, branch = _federation.remote_and_branch(config)
     timeout = _positive_int(cfg.get("timeout_seconds"), 30)
     max_paths = _positive_int(cfg.get("max_paths"), 20)
     want_fetch = bool(cfg.get("fetch", True))
@@ -238,8 +212,8 @@ def scan(workspace: Path, config: dict | None = None) -> Radar:
     for label, value in (("remote", remote), ("shared_branch", branch)):
         if _rejects_as_option(value):
             return Radar(
-                reason=f"federation.conflict_radar.{label} is empty or starts "
-                       f"with '-', which git would read as an option: {value!r}"
+                reason=f"federation.{label} starts with '-', which git would "
+                       f"read as an option: {value!r}"
             )
 
     workspace = Path(workspace)
@@ -402,7 +376,8 @@ def describe(config: dict | None = None) -> str:
     cfg = _federation.settings(config).get("conflict_radar") or {}
     if not cfg.get("enabled"):
         return "conflict radar: off"
+    remote, branch = _federation.remote_and_branch(config)
     return (
-        f"conflict radar: on ({cfg.get('remote')}/{cfg.get('shared_branch')}, "
+        f"conflict radar: on ({remote}/{branch}, "
         f"fetch={'yes' if cfg.get('fetch', True) else 'no'})"
     )

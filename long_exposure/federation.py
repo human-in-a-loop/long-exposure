@@ -54,15 +54,27 @@ import socket
 
 DEFAULTS: dict = {
     "operator": "",
+    # One remote and one shared branch for the whole feature family. They used
+    # to live inside conflict_radar; with git_sync also needing them, two copies
+    # would let the radar forecast against one branch while sync integrated
+    # another.
+    "remote": "origin",
+    "shared_branch": "main",
     "conflict_radar": {
         "enabled": False,
-        "remote": "origin",
-        "shared_branch": "main",
         "fetch": True,
         "timeout_seconds": 30,
         "max_paths": 20,
     },
+    "git_sync": {
+        "enabled": False,
+        "push": True,
+        "integrate": True,
+        "timeout_seconds": 60,
+    },
 }
+
+_NESTED = ("conflict_radar", "git_sync")
 
 # An operator name ends up in a branch name, a ledger field and a prompt
 # block, so it has to be safe in all three. Same spelling rules as a slice.
@@ -77,18 +89,35 @@ FALLBACK_OPERATOR = "local"
 
 
 def settings(config: dict | None = None) -> dict:
-    """The `federation:` block, merged over DEFAULTS. Never returns None."""
+    """The `federation:` block, merged over DEFAULTS. Never returns None.
+
+    Nested blocks merge key-by-key, so a partial `conflict_radar:` or
+    `git_sync:` keeps the defaults it does not mention. Never mutates DEFAULTS.
+    """
     block = (config or {}).get("federation")
     if not isinstance(block, dict):
         block = {}
-    merged = {k: v for k, v in DEFAULTS.items() if k != "conflict_radar"}
-    merged.update({k: v for k, v in block.items() if k != "conflict_radar"})
-    radar = dict(DEFAULTS["conflict_radar"])
-    incoming = block.get("conflict_radar")
-    if isinstance(incoming, dict):
-        radar.update(incoming)
-    merged["conflict_radar"] = radar
+    merged = {k: v for k, v in DEFAULTS.items() if k not in _NESTED}
+    merged.update({k: v for k, v in block.items() if k not in _NESTED})
+    for name in _NESTED:
+        section = dict(DEFAULTS[name])
+        incoming = block.get(name)
+        if isinstance(incoming, dict):
+            section.update(incoming)
+        merged[name] = section
     return merged
+
+
+def remote_and_branch(config: dict | None = None) -> tuple[str, str]:
+    """The shared remote and branch, blank-safe.
+
+    Strip BEFORE defaulting: `"   "` is truthy, so `x or "main"` keeps it and
+    `.strip()` then yields an empty ref name.
+    """
+    s = settings(config)
+    remote = str(s.get("remote") or "").strip() or "origin"
+    branch = str(s.get("shared_branch") or "").strip() or "main"
+    return remote, branch
 
 
 def slugify(text: str, *, max_len: int = MAX_NAME) -> str:

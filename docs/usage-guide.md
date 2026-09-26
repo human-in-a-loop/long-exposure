@@ -163,9 +163,48 @@ For the shape in [`git-federation.md`](git-federation.md): you and someone
 else, on separate machines, each running your own long-exposure against one
 shared repo.
 
-**The harness still does not commit, push, rebase or checkout anything.** It
-reads git; that is all. Bringing branches together is yours to do, with
-ordinary git and pull requests.
+**With `git_sync` off — the default — the harness never writes git.** The
+radar only reads. Turn `git_sync` on and it commits each cycle to its own
+branch; bringing that onto your shared branch is still a pull request.
+
+### Per-cycle commits — opt-in, and worth it even alone
+
+```yaml
+federation:
+  git_sync:
+    enabled: true
+    push: true              # false → commit locally, never push
+```
+
+The workspace is committed at the end of every cycle to this run's own branch,
+`long-exposure/<operator>/<run_id>`. Your `main` is never pushed to; getting
+work onto it is a pull request you review.
+
+**The reason to turn it on even with one machine is crash recovery.** Without
+it, a run that dies mid-cycle leaves that turn's half-finished edits in a
+workspace that no longer matches the saved state. With it, the resumed run
+**stashes** the partial edits — never deletes them — and tells the researcher
+the stash name. To look at or restore them yourself:
+
+```bash
+git stash list                    # "long-exposure: crashed cycle N of run-…"
+git stash show -p stash@{0}
+git stash pop                     # if they were worth keeping
+```
+
+What it will and won't do:
+
+- **Never destroys work.** No reset, clean, rebase or force-push, enforced by a
+  test the build runs.
+- **Your pre-commit hooks apply.** If one fails, the commit is skipped, the
+  work stays, and the next cycle's commit carries it.
+- **Merges, never auto-resolves.** Before each cycle the shared branch is merged
+  in; a conflict is aborted and the researcher is told which files — the
+  workspace is never left with conflict markers.
+- **Needs the workspace to be the repository's top level**, because switching
+  branches moves the whole tree. It refuses otherwise and says why.
+- Root process only; fan-out clones share the workspace and the root commits
+  their combined work after the barrier.
 
 ### Operator identity — always on, costs nothing
 

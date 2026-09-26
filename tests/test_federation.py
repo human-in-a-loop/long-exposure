@@ -305,11 +305,33 @@ class SettingsTests(unittest.TestCase):
     def test_a_partial_radar_block_keeps_the_other_defaults(self):
         s = fed.settings({"federation": {"conflict_radar": {"enabled": True}}})
         self.assertTrue(s["conflict_radar"]["enabled"])
-        self.assertEqual(s["conflict_radar"]["shared_branch"], "main")
+        self.assertEqual(s["conflict_radar"]["max_paths"], 20)
+        self.assertEqual(s["shared_branch"], "main")
+
+    def test_a_partial_git_sync_block_keeps_the_other_defaults(self):
+        s = fed.settings({"federation": {"git_sync": {"enabled": True}}})
+        self.assertTrue(s["git_sync"]["enabled"])
+        self.assertTrue(s["git_sync"]["push"])
+        self.assertTrue(s["git_sync"]["integrate"])
 
     def test_settings_never_mutates_the_defaults(self):
-        fed.settings({"federation": {"conflict_radar": {"shared_branch": "dev"}}})
-        self.assertEqual(fed.DEFAULTS["conflict_radar"]["shared_branch"], "main")
+        fed.settings({"federation": {"shared_branch": "dev",
+                                     "git_sync": {"push": False}}})
+        self.assertEqual(fed.DEFAULTS["shared_branch"], "main")
+        self.assertTrue(fed.DEFAULTS["git_sync"]["push"])
+
+    def test_the_radar_and_sync_share_one_remote_and_branch(self):
+        """They used to be separate; two copies could point at different
+        branches, so the radar forecast one while sync integrated another."""
+        cfg = {"federation": {"remote": "upstream", "shared_branch": "dev"}}
+        self.assertEqual(fed.remote_and_branch(cfg), ("upstream", "dev"))
+        self.assertNotIn("shared_branch", fed.DEFAULTS["conflict_radar"])
+        self.assertNotIn("shared_branch", fed.DEFAULTS["git_sync"])
+
+    def test_a_blank_remote_or_branch_takes_the_default(self):
+        for blank in ("", "   ", None):
+            cfg = {"federation": {"remote": blank, "shared_branch": blank}}
+            self.assertEqual(fed.remote_and_branch(cfg), ("origin", "main"))
 
 
 if __name__ == "__main__":

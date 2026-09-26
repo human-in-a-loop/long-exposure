@@ -93,6 +93,7 @@ from long_exposure import cycle_plan as _cycle_plan
 from long_exposure import spend_limit as _spend_limit
 from long_exposure import flags as _flags
 from long_exposure import federation as _federation
+from long_exposure import git_sync as _git_sync
 from long_exposure import startup_gate as _gate
 from auto_compact.db import init_db, store_session
 from long_exposure import usage_ledger as _usage_ledger_mod
@@ -3540,6 +3541,7 @@ def _finish_run(
     task,
     topic_exhausted,
     _persist_state,
+    _sync=None,
 ) -> None:
     """Everything after the main loop exits: clear, final report, end-of-run
     pipeline, shutdown. Raises SpendLimitKill last when the run was killed.
@@ -3869,6 +3871,14 @@ def _finish_run(
             print(f"\n[long-exposure] Stopped after {cycle} cycles.", flush=True)
             print("[long-exposure] State preserved. Run again to resume.", flush=True)
 
+    # Commit what the run wrote after its last cycle (closing report, final
+    # reports). Before the SpendLimitKill raise below, so a killed run commits
+    # too; otherwise these files would be swept into the next run's baseline.
+    try:
+        _git_sync.finish(_sync)
+    except Exception as _sync_err:
+        print(f"[git-sync] end-of-run commit skipped: {_sync_err!r}", flush=True)
+
     conn.close()
     print(f"[long-exposure] State: {state_path}", flush=True)
 
@@ -4017,6 +4027,7 @@ def _assemble_cycle_inputs(
     score_inputs: dict,
     fanout_enabled: bool,
     in_post_merge_cycle: bool,
+    sync_block: str | None = None,
 ) -> "CycleInputs":
     """Build this cycle's shared inputs before any agent runs.
 
@@ -4081,7 +4092,7 @@ def _assemble_cycle_inputs(
 
     parts = [
         p for p in (fanout_guide, sibling_block, anti_patterns_block,
-                    conflict_block, guidance)
+                    conflict_block, sync_block, guidance)
         if p
     ]
     base_live_guidance = (
@@ -4541,6 +4552,26 @@ def run_exploration(
         config_path=config_path, gate_answers=_gate_answers,
     )
 
+    # Per-cycle commits (federation.git_sync, off by default). Root only: fan-out
+    # clones share this workspace, and N processes committing one repository
+    # would race. `last_completed_cycle` is what lets a crash be told apart from
+    # a clean stop — see git_sync.begin. Harness-private paths are excluded so a
+    # crash-recovery stash can never stash the state the resume is reading.
+    _sync = None
+    if not _is_clone():
+        try:
+            _sync = _git_sync.begin(
+                workspace_root, config, run_id=run_id,
+                marker_dir=Path(instance_dir or data_dir),
+                last_completed_cycle=cycle,
+                exclude_paths=[p for p in (instance_dir, data_dir, output_dir,
+                                           state_path.parent,
+                                           config.get("compact_db")) if p],
+            )
+        except Exception as _sync_err:  # sync must never stop a run
+            print(f"[git-sync] off: {_sync_err!r}", flush=True)
+            _sync = None
+
 
     # ---- Interactive transport (opt-in) ----
     # When enabled, advanced features (multi-account pooling, parallel fan-out)
@@ -4958,11 +4989,16 @@ def run_exploration(
             },
         )
 
+        try:
+            _sync_block = _git_sync.before_cycle(_sync, cycle)
+        except Exception as _sync_err:
+            print(f"[git-sync] before-cycle skipped: {_sync_err!r}", flush=True)
+            _sync_block = None
         _inputs = _assemble_cycle_inputs(
             config=config, data_dir=data_dir, instance_dir=instance_dir,
             workspace_root=workspace_root, loop_cfg=loop_cfg, results=results,
             score_inputs=score_inputs, fanout_enabled=fanout_enabled,
-            in_post_merge_cycle=in_post_merge_cycle,
+            in_post_merge_cycle=in_post_merge_cycle, sync_block=_sync_block,
         )
         base_live_guidance = _inputs.live_guidance
         parts = _inputs.guidance_parts
@@ -5827,6 +5863,12 @@ def run_exploration(
         # Status file + state
         update_status_file(output_dir, cycle, "running", consecutive_failures)
         _persist_state()
+        # Commit AFTER the state is saved, so a commit never records a cycle the
+        # state does not know about. See git_sync.after_cycle.
+        try:
+            _git_sync.after_cycle(_sync, cycle, cycle_topic)
+        except Exception as _sync_err:
+            print(f"[git-sync] after-cycle skipped: {_sync_err!r}", flush=True)
 
         elapsed = time.monotonic() - cycle_start
         telemetry.emit(
@@ -6031,6 +6073,7 @@ def run_exploration(
         task=task,
         topic_exhausted=topic_exhausted,
         _persist_state=_persist_state,
+        _sync=_sync,
     )
 
 
