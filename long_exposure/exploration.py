@@ -90,6 +90,8 @@ from long_exposure import interactive_transport
 from long_exposure import agent_routing
 from long_exposure import cycle_plan as _cycle_plan
 from long_exposure import spend_limit as _spend_limit
+from long_exposure import flags as _flags
+from long_exposure import federation as _federation
 from long_exposure import startup_gate as _gate
 from auto_compact.db import init_db, store_session
 from long_exposure import usage_ledger as _usage_ledger_mod
@@ -2883,6 +2885,32 @@ def _build_anti_patterns_block(workspace: Path, config: dict) -> str | None:
         return None
 
 
+def _build_conflict_radar_block(workspace: Path, config: dict) -> str | None:
+    """Forecast overlap with a shared branch, for the researcher.
+
+    Root-only and researcher-cycle-only, for the same reason `fanout_guide`
+    is: fan-out clones inherit the root's `working_directory` (fanout.py
+    §clone spawn), so letting every clone scan would run N identical
+    `git fetch` calls against one workspace each cycle, and a clone does not
+    plan so it cannot act on the answer. The caller does that gating.
+
+    Never raises. `conflict_radar.scan` degrades every git failure to "no
+    opinion", and this adds the same posture for anything it did not
+    anticipate — a conflict forecast that could halt a cycle would be worse
+    than the conflicts it predicts.
+    """
+    try:
+        from long_exposure import conflict_radar
+        radar_cfg = _federation.settings(config).get("conflict_radar") or {}
+        if not _flags.truthy(radar_cfg.get("enabled"), False,
+                             name="federation.conflict_radar.enabled"):
+            return None
+        return conflict_radar.build_block(workspace, config) or None
+    except Exception as exc:
+        print(f"[conflict-radar] skipped: {exc!r}", flush=True)
+        return None
+
+
 def _compute_merge_frontmatter_fields(
     instance_dir: Path, config: dict | None,
 ) -> tuple[str, int, str, bool]:
@@ -4355,8 +4383,18 @@ def run_exploration(
         )
         anti_patterns_block = _build_anti_patterns_block(workspace_root, config)
 
+        # Shared-branch overlap: root only, researcher cycles only. Clones
+        # share the root's workspace and never plan, so a per-clone scan would
+        # be N identical fetches whose answer nobody can act on.
+        conflict_block = (
+            None
+            if (_is_clone() or in_post_merge_cycle)
+            else _build_conflict_radar_block(workspace_root, config)
+        )
+
         parts = [
-            p for p in (fanout_guide, sibling_block, anti_patterns_block, guidance)
+            p for p in (fanout_guide, sibling_block, anti_patterns_block,
+                        conflict_block, guidance)
             if p
         ]
         base_live_guidance = (

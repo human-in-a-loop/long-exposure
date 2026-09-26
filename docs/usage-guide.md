@@ -157,6 +157,68 @@ for.
 
 ---
 
+## Federation: several operators, one repository (opt-in)
+
+For the shape in [`git-federation.md`](git-federation.md): you and someone
+else, on separate machines, each running your own long-exposure against one
+shared repo.
+
+**The harness still does not commit, push, rebase or checkout anything.** It
+reads git; that is all. Bringing branches together is yours to do, with
+ordinary git and pull requests.
+
+### Operator identity — always on, costs nothing
+
+Every promise-ledger event is stamped with an `operator` name. Leave
+`federation.operator` blank and it derives from your hostname, so this works
+before you edit anything:
+
+```yaml
+federation:
+  operator: ""        # blank → slugified hostname
+```
+
+It matters when two operators' ledgers merge. Without it, `summarize_ledger`
+kept only the latest event per milestone, so if you and your collaborator both
+reached `spectral/bound` with confident results, **one of them vanished from
+the summary** — including a result that contradicted the other. With it, both
+appear and the summary says so.
+
+On a single-operator run nothing changes: the summary renders no operator
+column and reads exactly as it did before.
+
+### Conflict radar — opt-in, read-only
+
+At the start of each researcher cycle, forecast whether the shared branch has
+moved under work you are touching:
+
+```yaml
+federation:
+  conflict_radar:
+    enabled: true
+    shared_branch: "main"
+    fetch: true            # false → forecast from local refs, no network
+```
+
+When it finds overlap the researcher gets a block naming the paths and regions.
+When it finds none it says nothing, so it is not per-cycle prompt weight.
+
+Worth knowing about the two signals. The obvious one — "would a merge of my
+commits conflict?" — is nearly useless while the harness does not commit, since
+your work sits uncommitted and a merge of stale commits looks clean. The one
+that actually fires is "the shared branch changed these files, and you have
+uncommitted changes in them". Both are computed; the second is the one you will
+see.
+
+Everything degrades to silence: no repo, no remote, no such branch, unrelated
+histories, a detached HEAD. An unreachable remote still forecasts from local
+refs and marks the block stale — yesterday's refs beat nothing.
+
+It touches nothing. `git fetch` is the only side effect, and `fetch: false`
+removes even that.
+
+---
+
 ## The startup gate (opt-in)
 
 Off by default. When `startup_gate.enabled` is true in config.yaml,

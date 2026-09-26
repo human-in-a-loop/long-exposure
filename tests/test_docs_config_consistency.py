@@ -14,6 +14,7 @@ import yaml
 
 from long_exposure import (
     cycle_plan as cp,
+    federation as fd,
     hooks as hk,
     model_profiles as mp,
     spend_limit as sl,
@@ -45,11 +46,29 @@ class ShippedConfigMatchesDefaultsTests(unittest.TestCase):
             ("model_profiles", mp.DEFAULTS),
             ("usage_allowance", sl.DEFAULTS),
             ("startup_gate", g.DEFAULTS),
+            ("federation", fd.DEFAULTS),
         ):
             block = cfg.get(name)
             self.assertIsInstance(block, dict, name)
             unknown = set(block) - set(defaults)
             self.assertEqual(unknown, set(), f"{name} documents unread keys")
+
+    def test_the_federation_block_matches_the_module_schema(self):
+        """`federation:` is nested, like `hooks:`, so it needs its own walk."""
+        block = load_config().get("federation")
+        self.assertIsInstance(block, dict)
+        self.assertEqual(set(block), set(fd.DEFAULTS))
+        radar = block["conflict_radar"]
+        self.assertEqual(set(radar), set(fd.DEFAULTS["conflict_radar"]))
+        self.assertEqual(block, fd.DEFAULTS,
+                         "shipped values must equal the module defaults")
+
+    def test_the_radar_ships_off_and_the_operator_ships_derived(self):
+        block = load_config()["federation"]
+        self.assertFalse(block["conflict_radar"]["enabled"],
+                         "the radar needs a real shared branch; off by default")
+        self.assertEqual(block["operator"], "",
+                         "blank means derive from the hostname")
 
     def test_no_unknown_keys_in_the_hooks_block(self):
         """`hooks:` is nested, so it needs its own walk.

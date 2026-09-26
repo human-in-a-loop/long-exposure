@@ -1,13 +1,16 @@
 """The git-federation walkthrough must stay true to the code it cites.
 
-`docs/git-federation.md` is a design for something not yet built, which makes
-it *more* prone to rotting than a doc describing live behaviour: nothing
-breaks when it goes stale. These tests pin the claims the design actually
-rests on — the storage zones, the file shapes, and the two identity gaps —
-so a rename or a refactor surfaces here instead of in a doc nobody re-reads.
+`docs/git-federation.md` describes a sync layer that is still unbuilt, which
+makes it *more* prone to rotting than a doc describing live behaviour: nothing
+breaks when it goes stale. These tests pin the claims the design rests on —
+the storage zones, the file shapes, the identity fix — so a rename or a
+refactor surfaces here instead of in a doc nobody re-reads.
 
-They do not test any git code, because there is none. The first test asserts
-exactly that, so the doc's opening claim stays honest.
+The load-bearing one is `GitIsReadOnlyTests`. The conflict radar made the
+harness run git for the first time, and the property that makes that safe is
+that it only ever READS: no commit, no push, no rebase, no checkout, no reset.
+That invariant is worth a test with teeth, because the radar runs on the cycle
+path against the operator's live workspace, where a write would destroy work.
 """
 
 import json
@@ -20,24 +23,86 @@ REPO = Path(__file__).resolve().parent.parent
 DOC = REPO / "docs" / "git-federation.md"
 
 
-class TheDocsOpeningClaimTests(unittest.TestCase):
-    def test_the_harness_still_runs_no_git_commands(self):
-        """The doc opens by saying none of this exists. Keep that true.
+# git subcommands the harness may invoke. Everything here either reads, or —
+# in `fetch`'s single case — writes only remote-tracking refs and no working
+# file. A subcommand that is not on this list is a write to the operator's
+# workspace, and adding one is a decision, not a refactor.
+READ_ONLY_GIT = {
+    "rev-parse", "merge-base", "merge-tree", "diff", "status", "log",
+    "show", "cat-file", "ls-files", "ls-remote", "ls-tree", "for-each-ref",
+    "describe", "config",
+    # The documented exception: updates refs/remotes/*, touches no file.
+    "fetch",
+}
 
-        When git code does land, this test fails and the doc's status line
-        has to be rewritten — which is the point.
+FORBIDDEN_GIT = {
+    "commit", "push", "rebase", "merge", "checkout", "switch", "reset",
+    "clean", "rm", "mv", "restore", "stash", "apply", "am", "cherry-pick",
+    "revert", "tag", "branch", "worktree", "gc", "prune", "filter-branch",
+    "update-ref", "symbolic-ref", "init", "clone", "add",
+}
+
+
+class GitIsReadOnlyTests(unittest.TestCase):
+    """The harness reads git. It must never write to the operator's tree."""
+
+    def test_git_is_invoked_from_exactly_one_place(self):
+        """Every git call funnels through `conflict_radar._git`.
+
+        This is what makes the rest of this class checkable: one function with
+        one timeout and one never-raises contract, instead of git calls
+        scattered across the package.
         """
+        files = set()
+        for path in (REPO / "long_exposure").rglob("*.py"):
+            if re.search(r"""\[\s*["']git["']\s*[,\]]""", path.read_text()):
+                files.add(str(path.relative_to(REPO)))
+        self.assertEqual(files, {"long_exposure/conflict_radar.py"}, files)
+
+    def test_only_read_only_subcommands_are_invoked(self):
+        """The real call shape is `_git(["<sub>", ...])`, so check that.
+
+        An earlier version of this test only matched `["git", "<sub>"`, which
+        every call in this package sidesteps — `_git` supplies the "git" itself.
+        It would have passed a `_git(["commit", ...])` without complaint.
+        """
+        text = (REPO / "long_exposure" / "conflict_radar.py").read_text()
+        subs = set()
+        for m in re.finditer(r"""_git\(\s*\[\s*["']([\w-]+)["']""", text):
+            subs.add(m.group(1))
+        self.assertTrue(subs, "found no _git call sites; did the shape change?")
+        self.assertEqual(subs - READ_ONLY_GIT, set(),
+                         f"non-read-only subcommand invoked: {subs - READ_ONLY_GIT}")
+        self.assertEqual(subs & FORBIDDEN_GIT, set())
+
+    def test_the_guard_would_actually_catch_a_write(self):
+        """A test that cannot fail is not a test. Prove the pattern bites."""
+        sample = '_git(["commit", "-m", "x"], workspace)'
+        found = set(re.findall(r"""_git\(\s*\[\s*["']([\w-]+)["']""", sample))
+        self.assertEqual(found, {"commit"})
+        self.assertTrue(found & FORBIDDEN_GIT)
+
+    def test_no_forbidden_subcommand_appears_anywhere_in_the_package(self):
+        """Belt and braces: catch a write built by string concatenation too."""
         offenders = []
         for path in (REPO / "long_exposure").rglob("*.py"):
-            text = path.read_text()
-            for m in re.finditer(r"""["'](git)["']|["']git\s+(\w+)""", text):
-                line = text[:m.start()].count("\n") + 1
-                offenders.append(f"{path.relative_to(REPO)}:{line}")
-        self.assertEqual(offenders, [], "git invocation found; update the doc's status")
+            for i, line in enumerate(path.read_text().splitlines(), 1):
+                for m in re.finditer(r"""["']git\s+([a-z-]+)""", line):
+                    if m.group(1) in FORBIDDEN_GIT:
+                        offenders.append(f"{path.relative_to(REPO)}:{i} {m.group(1)}")
+        self.assertEqual(offenders, [], f"git write found: {offenders}")
 
-    def test_the_doc_is_marked_as_not_built(self):
-        head = DOC.read_text()[:400]
-        self.assertIn("designed, not built", head.lower())
+    def test_the_radar_declares_itself_read_only(self):
+        from long_exposure import conflict_radar
+
+        self.assertIn("read-only", (conflict_radar.__doc__ or "").lower())
+
+    def test_the_sync_layer_is_still_unbuilt(self):
+        """The radar reads. Nothing fetches-rebases-commits-pushes a cycle,
+        and the doc still says so."""
+        text = DOC.read_text().lower()
+        self.assertIn("not built", text)
+        self.assertIn("read-only", text)
 
 
 class StorageZoneTests(unittest.TestCase):
@@ -210,11 +275,10 @@ class GuidanceSeamTests(unittest.TestCase):
     """§4.1: the federation block would join an existing list, not a new one."""
 
     def test_the_live_guidance_parts_list_is_where_the_doc_says(self):
+        """The radar's block joins this list rather than adding a stage."""
         text = (REPO / "long_exposure" / "exploration.py").read_text()
-        self.assertIn(
-            "p for p in (fanout_guide, sibling_block, anti_patterns_block, guidance)",
-            text,
-        )
+        self.assertIn("p for p in (fanout_guide, sibling_block, anti_patterns_block,", text)
+        self.assertIn("conflict_block, guidance)", text)
 
     def test_the_cycle_boundary_transaction_point_still_exists(self):
         text = (REPO / "long_exposure" / "exploration.py").read_text()
