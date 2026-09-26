@@ -164,6 +164,12 @@ copy of the thing they must not touch.
 
 ## 3. The real multi-operator case: a git sync layer
 
+> **The full walkthrough is now [`git-federation.md`](git-federation.md)** —
+> storage zones, the two cycle-boundary seams with their code locations, how
+> each file class converges, the empirical verification of the push-rejection
+> lock, and one concrete identity gap this section did not see. Still
+> designed, not built. This section remains the decision record.
+
 The scenario — operator A on machine A and operator B on machine B, both
 running long-exposure against the same repo — needs four things, none of
 which is a worktree.
@@ -283,9 +289,15 @@ pattern.** These are opposite cases and the difference matters:
 **4. `sessions.db` stays local and must never be committed.** SQLite with
 WAL, per-operator, binary — nothing good comes of putting it in git. Each
 operator's session history is theirs; the shared surfaces are the ledger,
-the claims, the memoirs and the artifacts. Worth an explicit `.gitignore`
-entry and a doc line, because committing it once would be unpleasant to
-undo.
+the claims, the memoirs and the artifacts.
+
+*Corrected while writing the walkthrough:* this asked for an explicit
+`.gitignore` entry, which is unnecessary. `sessions.db` lives at
+`~/.local/share/auto-compact/sessions.db` (`mcp_search_server.py:215`), never
+inside `working_directory`, so it cannot be committed by accident. The same
+is true of the instance dir's run state — and `instances/` is already
+ignored. See `git-federation.md` §2: only one of the three storage zones is
+shared, which is a piece of luck the design should not spend.
 
 ### 4.3 What a participating operator's cycle looks like
 

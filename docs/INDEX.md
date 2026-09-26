@@ -62,7 +62,8 @@ long-exposure does, see the project [README](../README.md).
 | [`gaps_interactive_mode.md`](gaps_interactive_mode.md) | Opt-in interactive Claude transport: design, configuration, verification, and its own gaps table | Considering `claude_transport: interactive` |
 | [`benchmarking-plan.md`](benchmarking-plan.md) | Sept 2026 evaluation of the harness (verified code-vs-docs findings), survey of harness-labelled public benchmarks, and a phased plan to benchmark long-exposure against peer harnesses | Planning or reading a benchmark campaign |
 | [`rcb-benchmark-plan.md`](rcb-benchmark-plan.md) | Runnable pre-registration for the single primary venue (ResearchClawBench): one arm on Claude-Opus-4.6 (the only model with two published same-model harness rows) at main's stock budget, 40 tasks, one shot each, plus contamination controls, judge controls, and the exact bench config | Actually executing the benchmark |
-| [`worktrees-hooks-swarms-plan.md`](worktrees-hooks-swarms-plan.md) | Proposal: where git worktrees do and do not belong, the Claude/Codex/Gemini lifecycle-hook intersection and a vendor-neutral way to use it, a git sync layer for two operators on one repo, and why swarms are cost-gated rather than engineering-gated | Considering worktrees, hooks, or multi-operator / swarm scaling |
+| [`worktrees-hooks-swarms-plan.md`](worktrees-hooks-swarms-plan.md) | Proposal and decision log: where git worktrees do and do not belong (nowhere, in the end), the Claude/Codex/Gemini lifecycle-hook intersection and the two hooks built from it, and swarms reframed twice — landing on a federation over one repo rather than a local swarm | Considering worktrees, hooks, or multi-operator / swarm scaling |
+| [`git-federation.md`](git-federation.md) | **Designed, not built.** Walkthrough of many long-exposure instances on separate machines committing to one repo: which of the three storage zones is shared, the two cycle-boundary git seams, how each file class converges (union-merged ledger, per-operator memoirs), git's push rejection as the lock and exactly where it stops working, and the ledger-identity gap to fix first | Designing or building the multi-operator sync layer |
 | [`advanced-model-modes-plan.md`](advanced-model-modes-plan.md) | Design and decision log for the four opt-in features for more capable models: researcher-planned cycle tails, model capability profiles, the startup gate, and the total spend limit. Includes the researcher-vs-auditor planner comparison and the defects found auditing the implementation | Implementing or reviewing the advanced-model features |
 | [`tiered-memory-plan.md`](tiered-memory-plan.md) | Design for the run memoir (L1) over existing L2 reports and L3 compaction rows: auditor-written, minimal-edit, injected into researcher and worker only, archived per cycle; fixed skeleton, guardrails, integration seams | Implementing or reviewing the tiered narrative memory |
 
@@ -85,6 +86,7 @@ long-exposure does, see the project [README](../README.md).
 | `local-setup.md` | ~210 | New contributor |
 | `configuration-reference.md` | ~1,100 | Operator + contributor |
 | `parallelism.md` | ~590 | Contributor |
+| `git-federation.md` | ~400 | Contributor (design) |
 | `multi-account-pool.md` | ~360 | Operator + contributor |
 | `persistence-and-gems.md` | ~320 | Contributor |
 | `end-of-run-pipeline.md` | ~620 | Contributor |
