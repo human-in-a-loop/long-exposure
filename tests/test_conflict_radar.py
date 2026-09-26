@@ -324,7 +324,12 @@ class WiringTests(RadarTestCase):
     def test_it_joins_the_existing_live_guidance_parts_list(self):
         src = (Path(__file__).resolve().parent.parent
                / "long_exposure" / "exploration.py").read_text()
-        self.assertIn("anti_patterns_block,\n                        conflict_block, guidance", src)
+        # Whitespace-insensitive: this pins the ORDER of the guidance parts,
+        # not the indentation of the function they live in (which moved when
+        # the block was extracted from run_exploration).
+        import re
+        flat = re.sub(r"\s+", " ", src)
+        self.assertIn("anti_patterns_block, conflict_block, guidance", flat)
 
 
 if __name__ == "__main__":

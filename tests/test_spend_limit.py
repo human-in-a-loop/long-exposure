@@ -259,12 +259,19 @@ class WiringTests(unittest.TestCase):
         self.assertIn("should_run_final = False", window)
 
     def test_kill_raises_after_state_is_saved(self):
-        """A kill must not cost the run its resumability."""
-        save = self.exp.rindex("save_state(state_path, cycle, results")
-        raise_at = self.exp.index("raise SpendLimitKill(_trip, _marker)")
-        self.assertLess(save, raise_at)
-        close = self.exp.rindex("conn.close()")
-        self.assertLess(close, raise_at)
+        """A kill must not cost the run its resumability.
+
+        Scoped to `_finish_run`, which owns the shutdown sequence since it was
+        extracted from run_exploration. The previous version compared offsets
+        across the whole file, so moving the function above run_exploration
+        flipped the text order while the runtime order was unchanged.
+        """
+        start = self.exp.index("def _finish_run(")
+        end = self.exp.index("\ndef ", start + 1)
+        fin = self.exp[start:end]
+        raise_at = fin.index("raise SpendLimitKill(_trip, _marker)")
+        self.assertLess(fin.rindex("_persist_state(", 0, raise_at), raise_at)
+        self.assertLess(fin.rindex("conn.close()", 0, raise_at), raise_at)
 
     def test_barrier_signals_and_terminates_on_a_trip(self):
         """Behaviour is proven in FanOutKillTests; this guards the structure.

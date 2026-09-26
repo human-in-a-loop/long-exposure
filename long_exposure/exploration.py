@@ -19,6 +19,7 @@ Control:
 """
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import re as _re
@@ -3512,6 +3513,649 @@ def _run_reporter(
 # ---------------------------------------------------------------------------
 
 
+def _finish_run(
+    *,
+    agent_sessions,
+    agent_summaries,
+    agents,
+    budget_exhausted,
+    compact_at,
+    config,
+    conn,
+    consecutive_failures,
+    context_window,
+    cycle,
+    cycle_session_log,
+    cycles_since_last_report,
+    data_dir,
+    last_session_id,
+    loop_cfg,
+    max_cycles_reached,
+    output_dir,
+    reporter_def,
+    results,
+    score_inputs,
+    spend_limit_killed,
+    state_path,
+    task,
+    topic_exhausted,
+    _persist_state,
+) -> None:
+    """Everything after the main loop exits: clear, final report, end-of-run
+    pipeline, shutdown. Raises SpendLimitKill last when the run was killed.
+
+    Extracted from `run_exploration`, where it was the final 326 lines. Terminal
+    by construction — nothing runs after it — so it has no outputs, which is
+    what made it the safest large extraction available.
+
+    The parameter list is long on purpose. These twenty-five values are what
+    the terminal phase actually depends on; inline, that coupling was implicit
+    and invisible. A `RunState` bundle is the obvious next step and a larger
+    change than this one. `_persist_state` is passed in because it is a closure
+    over the loop's locals.
+
+    Behaviour-preserving: the body is the original block, moved.
+    """
+    # --- Stopped or Cleared ---
+    if _clear_requested:
+        # Archive old state before clearing
+        _archive_state(state_path)
+        _archive_local_session_logs(state_path.parent)
+        # Clear: save empty state (sessions.db records preserved). Stamp
+        # last_daily_sync_at to now so a subsequent resume from this
+        # cleared state doesn't fire the daily sync on cycle 1 (with
+        # last_daily_sync_at=None, _daily_sync_due returns True).
+        # A cleared run starts over: reset the ledger and persist an empty
+        # one, otherwise the next start/resume would inherit this run's
+        # spend and could trip a budget cap before its first cycle.
+        _usage.load({})
+        save_state(state_path, 0, {}, {name: 0 for name in agents},
+                   None, {}, {},
+                   last_daily_sync_at=datetime.now(timezone.utc).isoformat(),
+                   daily_sync_count=0,
+                   daily_sync_in_progress=False,
+                   usage_totals={})
+        update_status_file(output_dir, cycle, "cleared", consecutive_failures)
+        telemetry.emit(
+            "run_end",
+            phase="run",
+            cycle=cycle,
+            provider=config.get("llm_provider"),
+            model=config.get("model"),
+            status="cleared",
+            data={
+                "topic_exhausted": topic_exhausted,
+                "stop_requested": _stop_requested,
+                "clear_requested": _clear_requested,
+                "failures": consecutive_failures,
+            },
+        )
+        print(f"\n[long-exposure] Cleared after {cycle} cycles.", flush=True)
+        print("[long-exposure] Context reset. Sessions.db history preserved.", flush=True)
+        # Clone robustness: the root conductor's barrier is polling for
+        # merge_report.md. Even on clear, write a placeholder so the barrier
+        # does not block indefinitely on a cleared clone.
+        if _is_clone():
+            try:
+                _write_merge_report(
+                    _merge_report_path(state_path.parent),
+                    f"# Merge Report (clone cleared)\n\n"
+                    f"Clone was cleared after {cycle} cycles.\n",
+                    config,
+                    f"cycles 1-{cycle} [cleared]",
+                    verdict="halted",
+                )
+            except OSError:
+                pass
+    else:
+        # Run standard report if there are unreported cycles
+        if reporter_def and cycles_since_last_report > 0:
+            range_start = cycle - cycles_since_last_report + 1
+            last_session_id = _run_reporter(
+                reporter_def, task, config, results, score_inputs,
+                agent_sessions, agent_summaries,
+                conn, cycle, last_session_id,
+                range_start, cycle,
+                cycle_session_log,
+                context_window, compact_at,
+            )
+
+        # Save state after standard reporter, before final reporter
+        _persist_state(last_session_id=last_session_id)
+
+        # Clone exit path: skip final_reporter and curator. Run reporter
+        # in merge mode to produce the merge_report.md the root conductor's
+        # barrier is watching for. This is the load-bearing invariant — it
+        # must fire on ANY clone exit path (exhaustion, stop, timeout, etc.)
+        # so the barrier never blocks forever.
+        if _is_clone():
+            # Provenance: enumerate workspace files this clone touched (mtime
+            # >= start). Written BEFORE merge_report so downstream aggregators
+            # see a complete picture. Best-effort — zero count on any failure.
+            try:
+                _start_ts = float(os.environ.get("AGENT_CLONE_START_TS", "0"))
+            except ValueError:
+                _start_ts = 0.0
+            _ws = config.get("working_directory")
+            _write_files_touched(
+                state_path.parent,
+                Path(_ws) if _ws else None,
+                _start_ts,
+            )
+            # Plan H: per-clone authorship from shadow ledger.
+            # Returns 0 silently when the shadow ledger is missing
+            # (non-fanout runs, or clones that crashed before any ledger
+            # activity). Curator falls back to the fork-scoped file.
+            _write_clone_artifacts(state_path.parent)
+
+            if reporter_def:
+                range_start = max(1, cycle - cycles_since_last_report)
+                merge_path = _merge_report_path(state_path.parent)
+                try:
+                    last_session_id = _run_reporter(
+                        reporter_def, task, config, results, score_inputs,
+                        agent_sessions, agent_summaries,
+                        conn, cycle, last_session_id,
+                        range_start, max(cycle, range_start),
+                        cycle_session_log,
+                        context_window, compact_at,
+                        reporter_mode="merge",
+                        merge_report_path=merge_path,
+                    )
+                except Exception as _merge_err:
+                    # Best-effort placeholder so the barrier still observes
+                    # a file — unblocks the root conductor.
+                    print(
+                        f"[long-exposure] merge reporter crashed: "
+                        f"{_merge_err}; writing placeholder.",
+                        flush=True,
+                    )
+                    try:
+                        _write_merge_report(
+                            _merge_report_path(state_path.parent),
+                            f"# Merge Report (reporter crashed)\n\n"
+                            f"{_merge_err}\n",
+                            config,
+                            f"cycles 1-{cycle} [crashed]",
+                            verdict="halted",
+                        )
+                    except OSError:
+                        pass
+            else:
+                # No reporter defined in score — still unblock the barrier.
+                try:
+                    _write_merge_report(
+                        _merge_report_path(state_path.parent),
+                        "# Merge Report\n\n"
+                        "(No reporter agent defined in score.)\n",
+                        config,
+                        f"cycles 1-{cycle} [no-reporter]",
+                        verdict="unknown",
+                    )
+                except OSError:
+                    pass
+        else:
+            # Root path — final auditor + final synthesis + curator. The
+            # _should_run_final_synthesis predicate is shared so the auditor
+            # and reporter never desynchronize (docs/end-of-run-pipeline.md).
+            operator_stop_requested = _stop_requested
+            operator_clear_requested = _clear_requested
+            should_run_final = _should_run_final_synthesis(
+                topic_exhausted=topic_exhausted,
+                # A budget cap is a natural end-of-run, same as max_cycles.
+                max_cycles_reached=max_cycles_reached or budget_exhausted,
+                stop_requested=operator_stop_requested,
+                clear_requested=operator_clear_requested,
+            )
+            # A spend-limit kill overrides every other reason to run the
+            # end-of-run pipeline. Those three stages cost money, and
+            # spending past the cap to write a report about hitting the cap
+            # is incoherent. This is the one difference that makes the limit
+            # a kill rather than the graceful loop.max_cost_usd stop.
+            if spend_limit_killed:
+                should_run_final = False
+                print(
+                    "[long-exposure] End-of-run pipeline skipped: the total "
+                    "spend limit killed the run.",
+                    flush=True,
+                )
+            for _stage in _END_OF_RUN_STAGES:
+                if should_run_final and agents.get(_stage) and not _end_of_run_enabled(loop_cfg, _stage):
+                    print(
+                        f"[long-exposure] End-of-run: {_stage} skipped "
+                        f"(disabled by loop.end_of_run).",
+                        flush=True,
+                    )
+            stop_suppressed_for_final = _clear_stop_flag_for_final_synthesis(
+                should_run_final=should_run_final,
+                stop_requested=operator_stop_requested,
+                clear_requested=operator_clear_requested,
+            )
+            if stop_suppressed_for_final:
+                print(
+                    "[long-exposure] Stop acknowledged; running final "
+                    "auditor/reporter/curator before exit.",
+                    flush=True,
+                )
+
+            # 1. Final auditor (if defined) — runs BEFORE the reporter so the
+            #    reporter can ingest final_audit_summary.json structurally.
+            #    Graceful absence: missing agent definition skips this stage.
+            final_auditor_def = agents.get("final_auditor")
+            if (should_run_final and final_auditor_def
+                    and _end_of_run_enabled(loop_cfg, "final_auditor")):
+                try:
+                    from long_exposure.auditing import _run_final_auditor
+                    last_session_id = _run_final_auditor(
+                        final_auditor_def, task, config, results, score_inputs,
+                        conn, cycle, last_session_id,
+                        context_window, compact_at,
+                        data_dir=data_dir,
+                        agent_sessions=agent_sessions,
+                        agent_summaries=agent_summaries,
+                    )
+                except Exception as _aud_err:
+                    consecutive_failures["final_auditor"] = (
+                        consecutive_failures.get("final_auditor", 0) + 1
+                    )
+                    # Final auditor failure must not block the reporter or
+                    # curator — the run still ships a final report. Surface
+                    # the error and continue.
+                    print(
+                        f"[long-exposure] Final auditor crashed: {_aud_err!r} — "
+                        f"continuing to final reporter without audit summary.",
+                        flush=True,
+                    )
+
+            final_reporter_def = agents.get("final_reporter")
+            if (should_run_final and final_reporter_def
+                    and _end_of_run_enabled(loop_cfg, "final_reporter")):
+                try:
+                    last_session_id = _run_final_reporter(
+                        final_reporter_def, task, config, results, score_inputs,
+                        conn, cycle, last_session_id,
+                        context_window, compact_at,
+                        data_dir=data_dir,
+                        agent_sessions=agent_sessions,
+                        agent_summaries=agent_summaries,
+                    )
+                except Exception as _rep_err:
+                    consecutive_failures["final_reporter"] = (
+                        consecutive_failures.get("final_reporter", 0) + 1
+                    )
+                    print(
+                        f"[long-exposure] Final reporter crashed: {_rep_err!r} — "
+                        f"continuing to curator with available artifacts.",
+                        flush=True,
+                    )
+
+            curator_def = agents.get("curator")
+            if (should_run_final and curator_def
+                    and _end_of_run_enabled(loop_cfg, "curator")):
+                try:
+                    last_session_id = _run_curator(
+                        curator_def, task, config, results, score_inputs,
+                        conn, cycle, last_session_id,
+                        agent_sessions=agent_sessions,
+                        agent_summaries=agent_summaries,
+                    )
+                except Exception as _cur_err:
+                    consecutive_failures["curator"] = (
+                        consecutive_failures.get("curator", 0) + 1
+                    )
+                    print(
+                        f"[long-exposure] Curator crashed: {_cur_err!r} — "
+                        f"saving state and final-stage failure counters.",
+                        flush=True,
+                    )
+
+        # Stop: save current state for resume
+        _persist_state(last_session_id=last_session_id)
+        final_status = (
+            "killed_spend_limit" if spend_limit_killed
+            else "cleared" if _clear_requested
+            else "completed" if (
+                "should_run_final" in locals() and should_run_final
+            )
+            else "stopped"
+        )
+        update_status_file(output_dir, cycle, final_status, consecutive_failures)
+        telemetry.emit(
+            "run_end",
+            phase="run",
+            cycle=cycle,
+            provider=config.get("llm_provider"),
+            model=config.get("model"),
+            status=final_status,
+            data={
+                "topic_exhausted": topic_exhausted,
+                "max_cycles_reached": (
+                    max_cycles_reached
+                    if "max_cycles_reached" in locals()
+                    else False
+                ),
+                "budget_exhausted": (
+                    budget_exhausted if "budget_exhausted" in locals() else False
+                ),
+                "spend_limit_killed": spend_limit_killed,
+                "spend_limit_trip": _spend_limit.tripped(),
+                "usage_totals": _usage.totals(),
+                "stop_requested": (
+                    operator_stop_requested
+                    if "operator_stop_requested" in locals()
+                    else _stop_requested
+                ),
+                "clear_requested": _clear_requested,
+                "final_synthesis_requested": (
+                    should_run_final if "should_run_final" in locals() else False
+                ),
+                "failures": consecutive_failures,
+            },
+        )
+        if final_status == "completed":
+            print(
+                f"\n[long-exposure] Completed after {cycle} cycles.",
+                flush=True,
+            )
+            print("[long-exposure] Final artifacts written.", flush=True)
+        elif spend_limit_killed:
+            print(
+                f"\n[long-exposure] KILLED after {cycle} cycles: total spend "
+                "limit reached.",
+                flush=True,
+            )
+            print("[long-exposure] State preserved. Raise the limit to resume.", flush=True)
+        else:
+            print(f"\n[long-exposure] Stopped after {cycle} cycles.", flush=True)
+            print("[long-exposure] State preserved. Run again to resume.", flush=True)
+
+    conn.close()
+    print(f"[long-exposure] State: {state_path}", flush=True)
+
+    # Raised LAST, after state is saved, the status file is written and the
+    # DB is closed — a kill must not cost the run its resumability. A
+    # dedicated exception rather than a return value so no intermediate
+    # `return` on the way out can swallow it; callers map it to exit code 3.
+    if spend_limit_killed:
+        _trip = _spend_limit.tripped() or {}
+        _marker = _spend_limit.write_marker(output_dir, _trip, cycle=cycle)
+        if _marker:
+            print(f"[long-exposure] Spend-limit marker: {_marker}", flush=True)
+        raise SpendLimitKill(_trip, _marker)
+
+
+def _start_run(
+    *,
+    config: dict,
+    state: dict | None,
+    task: str,
+    flow: list,
+    cycle: int,
+    results: dict,
+    data_dir: Path,
+    instance_dir: Path | None,
+    output_dir: Path,
+    state_path: Path,
+    score_path,
+    config_path,
+    gate_answers: dict | None,
+) -> tuple[str, Path]:
+    """Establish the run's identity and its workspace. Returns (run_id, root).
+
+    Extracted from `run_exploration`. Everything that has to happen once, after
+    config and state are loaded and before the first cycle: resolve the
+    workspace, derive or restore the run_id, configure telemetry, register the
+    run for the startup gate, write gate provenance, emit run_start/run_resume,
+    and bootstrap a fresh workspace. It is also the seam the git sync layer
+    attaches to, since that needs exactly this: a known run_id and a workspace
+    that exists.
+
+    Mutates `config["working_directory"]` and `results["run_id"]` in place, as
+    the inline block did. Behaviour-preserving: the body is the original block.
+    """
+    _gate_answers = gate_answers
+    # ---- Workspace bootstrap (Plan 1 + Plan 3) ----
+    # Lay down the standard folder skeleton + plan_of_record.md +
+    # STRUCTURE.md + a `_run/start` ledger event ON FRESH START ONLY.
+    # Resumes (cycle > 1) and workspaces with an existing plan are no-ops
+    # by design (docs/workspace-conventions.md). Clones inherit parent state
+    # and skip bootstrap (the parent already ran it).
+    workspace_root = paths.workspace_root(config.get("working_directory") or os.getcwd())
+    config["working_directory"] = str(workspace_root)
+    paths.ensure_layout(config)
+    run_id = state.get("run_id") if state else None
+    if not run_id:
+        run_id = derive_run_id()
+    telemetry.configure(config, data_dir, run_id)
+    # Register the run so a later startup gate can offer to resume it. The
+    # registry is the gate's primary run list (an instances-root scan is the
+    # fallback for runs that predate it). Clones are excluded inside
+    # register_run: a fork is not a resumable run. Best-effort by design —
+    # a registry problem must never stop a run from starting.
+    _gate.register_run(
+        config,
+        run_id=run_id,
+        instance_dir=instance_dir,
+        state_path=state_path,
+        task=task,
+    )
+    # Provenance: a copy of the gate answers beside the run's artifacts, so
+    # a report (or a benchmark appendix) can state the exact model, workspace
+    # and caps the run actually used rather than what config.yaml says now.
+    if _gate_answers:
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / _gate.ANSWERS_FILENAME).write_text(
+                json.dumps(_gate_answers, indent=2, sort_keys=True) + "\n"
+            )
+        except OSError as _e:
+            print(f"[long-exposure] Gate-answer provenance copy skipped: {_e}", flush=True)
+    # The final auditor/reporter/curator read run_id from `results` (ledger
+    # cycle counts and reconciliation uuid5 event-ids are keyed on it). It is
+    # not an agent input, so it never reaches a prompt; persisting it inside
+    # `results` also serves run_final_reporter.py, which restores results
+    # from saved state.
+    results["run_id"] = run_id
+    telemetry.emit(
+        "run_resume" if state else "run_start",
+        phase="run",
+        cycle=cycle,
+        provider=config.get("llm_provider"),
+        model=config.get("model"),
+        status="ok",
+        data={
+            "score_path": str(score_path),
+            "config_path": str(config_path) if config_path else None,
+            "state_path": str(state_path),
+            "output_dir": str(output_dir),
+            "task_hash": telemetry.hash_value(task),
+            "flow": flow,
+            "is_clone": _is_clone(),
+        },
+    )
+    if not _is_clone():
+        try:
+            _bs = bootstrap_workspace(
+                workspace_root, task, run_id, cycle=max(1, cycle or 1)
+            )
+            if _bs["ran"]:
+                print(
+                    f"[long-exposure] Workspace bootstrapped: "
+                    f"folders={_bs['folders_created']} "
+                    f"plan={_bs['wrote_plan']} structure={_bs['wrote_structure']}",
+                    flush=True,
+                )
+        except Exception as _bs_err:  # bootstrap is best-effort; never block the cycle
+            print(f"[long-exposure] Bootstrap warning: {_bs_err}", flush=True)
+
+    # Agent-teams residue sweep at startup. When the master switch is on
+    # AND cleanup_residue is true, collect any orphaned tasks/<team>/
+    # mailbox dirs left behind by prior crashed runs (the per-turn mtime
+    # sweep cannot catch these — their mtime pre-dates any future turn's
+    # t0). Safe here because no team subprocess is running yet.
+    _team_defaults = (config.get("agent_teams_defaults") or {})
+    if _team_defaults.get("enabled", False) and _team_defaults.get("cleanup_residue", True):
+        _startup_removed = _sweep_team_tasks(since_ts=None)
+        if _startup_removed:
+            print(
+                f"[long-exposure] Swept {_startup_removed} orphan tasks/ dir(s) "
+                f"at startup",
+                flush=True,
+            )
+
+    return run_id, workspace_root
+
+
+def _assemble_cycle_inputs(
+    *,
+    config: dict,
+    data_dir: Path,
+    instance_dir: Path | None,
+    workspace_root: Path,
+    loop_cfg: dict,
+    results: dict,
+    score_inputs: dict,
+    fanout_enabled: bool,
+    in_post_merge_cycle: bool,
+) -> "CycleInputs":
+    """Build this cycle's shared inputs before any agent runs.
+
+    Extracted from `run_exploration`, where it was 104 lines of the main loop.
+    It is the seam every piece of pre-cycle guidance attaches to — fan-out,
+    cycle planning, sibling pointers, anti-patterns, the conflict radar, the
+    operator's guide file — plus the plan-of-record, ledger summary and memoir
+    inputs. Features kept being wired into this block by hand; as a function
+    it has one interface to get right instead of a region of a 2,370-line one.
+
+    Mutates `results` and `score_inputs` in place (the inputs every agent
+    reads), exactly as the inline block did. Returns the four values the rest
+    of the cycle consumes. Behaviour-preserving: the body is the original
+    block, moved.
+    """
+    # Check for live guidance from user
+    guidance = _consume_guide_file(data_dir)
+
+    # Inject fan-out guidance into live_guidance at root only, and only
+    # when researcher is in the flow this cycle. Clones don't fan out
+    # (parser short-circuits) and post-merge cycles skip the researcher,
+    # so injection would be ~120 bytes of dead weight in both cases.
+    # Use the dynamic (pool-aware) guidance so the researcher sees the
+    # current branch cap; falls back to the legacy constant when the
+    # pool is inactive.
+    fanout_guide = (
+        None
+        if (_is_clone() or in_post_merge_cycle or not fanout_enabled)
+        else get_fanout_guidance()
+    )
+
+    # Cycle-planning guidance: same gating as the fan-out block, for the
+    # same reason — a clone never plans, and a post-merge cycle has no
+    # researcher to read it, so injecting it would be dead prompt weight.
+    _planning_active = (
+        _cycle_plan.enabled(loop_cfg, is_clone=_is_clone())
+        and not in_post_merge_cycle
+    )
+    cycle_plan_guide = (
+        _cycle_plan.guidance(loop_cfg) if _planning_active else None
+    )
+
+    # Sibling visibility: clones only, researcher-cycle only. Reads each
+    # sibling's latest_report_pointer.md and formats a <sibling_reports>
+    # block. Pointer-only (not content). Researcher role's
+    # <sibling-awareness> block explains how to use them.
+    sibling_block = (
+        _collect_sibling_pointers(data_dir)
+        if (_is_clone() and not in_post_merge_cycle)
+        else None
+    )
+    anti_patterns_block = _build_anti_patterns_block(workspace_root, config)
+
+    # Shared-branch overlap: root only, researcher cycles only. Clones
+    # share the root's workspace and never plan, so a per-clone scan would
+    # be N identical fetches whose answer nobody can act on.
+    conflict_block = (
+        None
+        if (_is_clone() or in_post_merge_cycle)
+        else _build_conflict_radar_block(workspace_root, config)
+    )
+
+    parts = [
+        p for p in (fanout_guide, sibling_block, anti_patterns_block,
+                    conflict_block, guidance)
+        if p
+    ]
+    base_live_guidance = (
+        "\n\n".join(parts) if parts else "[No live guidance this cycle.]"
+    )
+    results["live_guidance"] = base_live_guidance
+    if guidance:
+        print(
+            f"[long-exposure] Live guidance received ({len(guidance)} chars)",
+            flush=True,
+        )
+
+    # ---- Inject plan + ledger summary as cycle inputs (Plan 1 §5) ----
+    # Best-effort, token-bounded. Removing this block reverts the harness
+    # to today's behaviour (graceful absence per Plan 1 principle #5).
+    try:
+        _plan_path = workspace_root / "plan_of_record.md"
+        results["plan_of_record"] = (
+            _plan_path.read_text() if _plan_path.exists()
+            else "[No plan_of_record.md found in workspace.]"
+        )
+    except OSError as _e:
+        results["plan_of_record"] = f"[Plan read error: {_e}]"
+    try:
+        results["promise_ledger_summary"] = summarize_ledger(workspace_root)
+    except Exception as _e:  # never crash the cycle
+        results["promise_ledger_summary"] = f"[Ledger summary error: {_e}]"
+
+    # ---- Run memoir (L1 narrative memory) as cycle inputs ----
+    # Contents go to the researcher and worker in-window; the auditor
+    # gets only the path (read-only note in a fan-out clone). Advisory:
+    # plan and ledger win on conflict. docs/tiered-memory-plan.md.
+    if _memoir.enabled(config):
+        try:
+            results["run_memory"] = _memoir.read_for_injection(workspace_root, config)
+            # The path this process may WRITE: a clone's own shadow, the
+            # root memoir otherwise. One writer per file, so the auditor's
+            # "edit the memoir at this path" guidance holds everywhere.
+            score_inputs["memoir_path"] = _memoir.path_input_value(workspace_root)
+            # Collapsed fan-out branch memoirs, for the root auditor to
+            # fold. Empty in a clone and whenever no fork has collapsed
+            # since the root memoir was last edited.
+            results["branch_memoirs"] = (
+                _memoir.branch_memoirs_for_injection(
+                    workspace_root,
+                    None if _is_clone() else (instance_dir or data_dir),
+                    config,
+                )
+            )
+        except Exception as _e:  # never crash the cycle
+            results["run_memory"] = f"[Run memoir error: {_e}]"
+            score_inputs["memoir_path"] = "[Run memoir unavailable this cycle.]"
+            results["branch_memoirs"] = "[Branch memoirs unavailable this cycle.]"
+
+    return CycleInputs(
+        live_guidance=base_live_guidance,
+        guidance_parts=parts,
+        planning_active=_planning_active,
+        cycle_plan_guide=cycle_plan_guide,
+    )
+
+
+@dataclass
+class CycleInputs:
+    """What `_assemble_cycle_inputs` hands back to the cycle loop."""
+
+    live_guidance: str
+    # The individual guidance blocks. Only its truthiness is read downstream
+    # (whether any shared guidance exists); kept as the list for fidelity.
+    guidance_parts: list
+    planning_active: bool
+    cycle_plan_guide: str | None
+
+
 def run_exploration(
     score_path: str,
     config_path: str | None = None,
@@ -3890,94 +4534,13 @@ def run_exploration(
     # otherwise shadow the current one in agent prompts.
     results["directive"] = task
 
-    # ---- Workspace bootstrap (Plan 1 + Plan 3) ----
-    # Lay down the standard folder skeleton + plan_of_record.md +
-    # STRUCTURE.md + a `_run/start` ledger event ON FRESH START ONLY.
-    # Resumes (cycle > 1) and workspaces with an existing plan are no-ops
-    # by design (docs/workspace-conventions.md). Clones inherit parent state
-    # and skip bootstrap (the parent already ran it).
-    workspace_root = paths.workspace_root(config.get("working_directory") or os.getcwd())
-    config["working_directory"] = str(workspace_root)
-    paths.ensure_layout(config)
-    run_id = state.get("run_id") if state else None
-    if not run_id:
-        run_id = derive_run_id()
-    telemetry.configure(config, data_dir, run_id)
-    # Register the run so a later startup gate can offer to resume it. The
-    # registry is the gate's primary run list (an instances-root scan is the
-    # fallback for runs that predate it). Clones are excluded inside
-    # register_run: a fork is not a resumable run. Best-effort by design —
-    # a registry problem must never stop a run from starting.
-    _gate.register_run(
-        config,
-        run_id=run_id,
-        instance_dir=instance_dir,
-        state_path=state_path,
-        task=task,
+    run_id, workspace_root = _start_run(
+        config=config, state=state, task=task, flow=flow, cycle=cycle,
+        results=results, data_dir=data_dir, instance_dir=instance_dir,
+        output_dir=output_dir, state_path=state_path, score_path=score_path,
+        config_path=config_path, gate_answers=_gate_answers,
     )
-    # Provenance: a copy of the gate answers beside the run's artifacts, so
-    # a report (or a benchmark appendix) can state the exact model, workspace
-    # and caps the run actually used rather than what config.yaml says now.
-    if _gate_answers:
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / _gate.ANSWERS_FILENAME).write_text(
-                json.dumps(_gate_answers, indent=2, sort_keys=True) + "\n"
-            )
-        except OSError as _e:
-            print(f"[long-exposure] Gate-answer provenance copy skipped: {_e}", flush=True)
-    # The final auditor/reporter/curator read run_id from `results` (ledger
-    # cycle counts and reconciliation uuid5 event-ids are keyed on it). It is
-    # not an agent input, so it never reaches a prompt; persisting it inside
-    # `results` also serves run_final_reporter.py, which restores results
-    # from saved state.
-    results["run_id"] = run_id
-    telemetry.emit(
-        "run_resume" if state else "run_start",
-        phase="run",
-        cycle=cycle,
-        provider=config.get("llm_provider"),
-        model=config.get("model"),
-        status="ok",
-        data={
-            "score_path": str(score_path),
-            "config_path": str(config_path) if config_path else None,
-            "state_path": str(state_path),
-            "output_dir": str(output_dir),
-            "task_hash": telemetry.hash_value(task),
-            "flow": flow,
-            "is_clone": _is_clone(),
-        },
-    )
-    if not _is_clone():
-        try:
-            _bs = bootstrap_workspace(
-                workspace_root, task, run_id, cycle=max(1, cycle or 1)
-            )
-            if _bs["ran"]:
-                print(
-                    f"[long-exposure] Workspace bootstrapped: "
-                    f"folders={_bs['folders_created']} "
-                    f"plan={_bs['wrote_plan']} structure={_bs['wrote_structure']}",
-                    flush=True,
-                )
-        except Exception as _bs_err:  # bootstrap is best-effort; never block the cycle
-            print(f"[long-exposure] Bootstrap warning: {_bs_err}", flush=True)
 
-    # Agent-teams residue sweep at startup. When the master switch is on
-    # AND cleanup_residue is true, collect any orphaned tasks/<team>/
-    # mailbox dirs left behind by prior crashed runs (the per-turn mtime
-    # sweep cannot catch these — their mtime pre-dates any future turn's
-    # t0). Safe here because no team subprocess is running yet.
-    _team_defaults = (config.get("agent_teams_defaults") or {})
-    if _team_defaults.get("enabled", False) and _team_defaults.get("cleanup_residue", True):
-        _startup_removed = _sweep_team_tasks(since_ts=None)
-        if _startup_removed:
-            print(
-                f"[long-exposure] Swept {_startup_removed} orphan tasks/ dir(s) "
-                f"at startup",
-                flush=True,
-            )
 
     # ---- Interactive transport (opt-in) ----
     # When enabled, advanced features (multi-account pooling, parallel fan-out)
@@ -4204,6 +4767,49 @@ def run_exploration(
         )
         topic_exhausted = True
 
+    def _persist_state(**overrides) -> None:
+        """Save the run state with every field, at every call site.
+
+        There used to be six hand-maintained copies of this 18-argument call,
+        and they drifted: `audit_free_streak` reached only three of them. The
+        daily-sync and periodic-report paths save AFTER the cycle-end save, so
+        on any cycle that ran either one, the last write persisted the default
+        of 0 and a resumed run restarted the cycle-planning audit floor from
+        zero — allowing more audit-free cycles than `audit_floor_cycles`
+        permits. Found by computing each save site's arguments while
+        decomposing this function, not by a test.
+
+        A closure rather than a module function because it reads roughly a
+        dozen locals of this function at CALL time, which is exactly the
+        behaviour the six copies had. `overrides` is for the one field a
+        caller legitimately varies (`daily_sync_in_progress`).
+
+        The clear path does NOT use this: it resets the run on purpose and
+        passes its own explicit values, and routing it through here would hide
+        that it is different.
+        """
+        fields = dict(
+            post_merge_pending=post_merge_pending, task=task, run_id=run_id,
+            last_daily_sync_at=last_daily_sync_at,
+            daily_sync_count=daily_sync_count,
+            reanchor_emitted=reanchor_emitted,
+            agent_context_tokens=agent_context_tokens,
+            peak_cycle_output=peak_cycle_output,
+            low_output_streak=low_output_streak,
+            audit_free_streak=audit_free_streak,
+            usage_basis=_usage_basis_arg,
+        )
+        # `last_session_id` is positional in save_state but a caller may hold a
+        # newer value than this closure can see: `_finish_run` rebinds its own
+        # copy after the final reporter runs. Without this override the state
+        # would persist the pre-report session id — a stale resume point
+        # introduced by extracting that block, caught by checking which
+        # parameters the extracted function reassigns.
+        session_id = overrides.pop("last_session_id", last_session_id)
+        fields.update(overrides)
+        save_state(state_path, cycle, results, consecutive_failures,
+                   session_id, agent_sessions, agent_summaries, **fields)
+
     # --- Main loop ---
     while not _stop_requested and not _force_final_report:
         # Check for signal files at cycle boundary
@@ -4352,109 +4958,16 @@ def run_exploration(
             },
         )
 
-        # Check for live guidance from user
-        guidance = _consume_guide_file(data_dir)
-
-        # Inject fan-out guidance into live_guidance at root only, and only
-        # when researcher is in the flow this cycle. Clones don't fan out
-        # (parser short-circuits) and post-merge cycles skip the researcher,
-        # so injection would be ~120 bytes of dead weight in both cases.
-        # Use the dynamic (pool-aware) guidance so the researcher sees the
-        # current branch cap; falls back to the legacy constant when the
-        # pool is inactive.
-        fanout_guide = (
-            None
-            if (_is_clone() or in_post_merge_cycle or not fanout_enabled)
-            else get_fanout_guidance()
+        _inputs = _assemble_cycle_inputs(
+            config=config, data_dir=data_dir, instance_dir=instance_dir,
+            workspace_root=workspace_root, loop_cfg=loop_cfg, results=results,
+            score_inputs=score_inputs, fanout_enabled=fanout_enabled,
+            in_post_merge_cycle=in_post_merge_cycle,
         )
-
-        # Cycle-planning guidance: same gating as the fan-out block, for the
-        # same reason — a clone never plans, and a post-merge cycle has no
-        # researcher to read it, so injecting it would be dead prompt weight.
-        _planning_active = (
-            _cycle_plan.enabled(loop_cfg, is_clone=_is_clone())
-            and not in_post_merge_cycle
-        )
-        cycle_plan_guide = (
-            _cycle_plan.guidance(loop_cfg) if _planning_active else None
-        )
-
-        # Sibling visibility: clones only, researcher-cycle only. Reads each
-        # sibling's latest_report_pointer.md and formats a <sibling_reports>
-        # block. Pointer-only (not content). Researcher role's
-        # <sibling-awareness> block explains how to use them.
-        sibling_block = (
-            _collect_sibling_pointers(data_dir)
-            if (_is_clone() and not in_post_merge_cycle)
-            else None
-        )
-        anti_patterns_block = _build_anti_patterns_block(workspace_root, config)
-
-        # Shared-branch overlap: root only, researcher cycles only. Clones
-        # share the root's workspace and never plan, so a per-clone scan would
-        # be N identical fetches whose answer nobody can act on.
-        conflict_block = (
-            None
-            if (_is_clone() or in_post_merge_cycle)
-            else _build_conflict_radar_block(workspace_root, config)
-        )
-
-        parts = [
-            p for p in (fanout_guide, sibling_block, anti_patterns_block,
-                        conflict_block, guidance)
-            if p
-        ]
-        base_live_guidance = (
-            "\n\n".join(parts) if parts else "[No live guidance this cycle.]"
-        )
-        results["live_guidance"] = base_live_guidance
-        if guidance:
-            print(
-                f"[long-exposure] Live guidance received ({len(guidance)} chars)",
-                flush=True,
-            )
-
-        # ---- Inject plan + ledger summary as cycle inputs (Plan 1 §5) ----
-        # Best-effort, token-bounded. Removing this block reverts the harness
-        # to today's behaviour (graceful absence per Plan 1 principle #5).
-        try:
-            _plan_path = workspace_root / "plan_of_record.md"
-            results["plan_of_record"] = (
-                _plan_path.read_text() if _plan_path.exists()
-                else "[No plan_of_record.md found in workspace.]"
-            )
-        except OSError as _e:
-            results["plan_of_record"] = f"[Plan read error: {_e}]"
-        try:
-            results["promise_ledger_summary"] = summarize_ledger(workspace_root)
-        except Exception as _e:  # never crash the cycle
-            results["promise_ledger_summary"] = f"[Ledger summary error: {_e}]"
-
-        # ---- Run memoir (L1 narrative memory) as cycle inputs ----
-        # Contents go to the researcher and worker in-window; the auditor
-        # gets only the path (read-only note in a fan-out clone). Advisory:
-        # plan and ledger win on conflict. docs/tiered-memory-plan.md.
-        if _memoir.enabled(config):
-            try:
-                results["run_memory"] = _memoir.read_for_injection(workspace_root, config)
-                # The path this process may WRITE: a clone's own shadow, the
-                # root memoir otherwise. One writer per file, so the auditor's
-                # "edit the memoir at this path" guidance holds everywhere.
-                score_inputs["memoir_path"] = _memoir.path_input_value(workspace_root)
-                # Collapsed fan-out branch memoirs, for the root auditor to
-                # fold. Empty in a clone and whenever no fork has collapsed
-                # since the root memoir was last edited.
-                results["branch_memoirs"] = (
-                    _memoir.branch_memoirs_for_injection(
-                        workspace_root,
-                        None if _is_clone() else (instance_dir or data_dir),
-                        config,
-                    )
-                )
-            except Exception as _e:  # never crash the cycle
-                results["run_memory"] = f"[Run memoir error: {_e}]"
-                score_inputs["memoir_path"] = "[Run memoir unavailable this cycle.]"
-                results["branch_memoirs"] = "[Branch memoirs unavailable this cycle.]"
+        base_live_guidance = _inputs.live_guidance
+        parts = _inputs.guidance_parts
+        _planning_active = _inputs.planning_active
+        cycle_plan_guide = _inputs.cycle_plan_guide
 
         # Cycle number and the health-events directory, for the vendor
         # lifecycle hooks (orchestrator._add_hook_env reads these off the
@@ -5313,18 +5826,7 @@ def run_exploration(
 
         # Status file + state
         update_status_file(output_dir, cycle, "running", consecutive_failures)
-        save_state(state_path, cycle, results, consecutive_failures,
-                   last_session_id, agent_sessions, agent_summaries,
-                   post_merge_pending=post_merge_pending, task=task,
-                   run_id=run_id,
-                   last_daily_sync_at=last_daily_sync_at,
-                   daily_sync_count=daily_sync_count,
-                   reanchor_emitted=reanchor_emitted,
-                   agent_context_tokens=agent_context_tokens,
-                   peak_cycle_output=peak_cycle_output,
-                   low_output_streak=low_output_streak,
-                   audit_free_streak=audit_free_streak,
-                   usage_basis=_usage_basis_arg)
+        _persist_state()
 
         elapsed = time.monotonic() - cycle_start
         telemetry.emit(
@@ -5356,18 +5858,7 @@ def run_exploration(
                 and _daily_sync_due(last_daily_sync_at, _daily_interval)):
             # Persist in-progress flag so a crash mid-sync is recoverable
             # (load_state clears the flag on resume; see §5.3).
-            save_state(state_path, cycle, results, consecutive_failures,
-                       last_session_id, agent_sessions, agent_summaries,
-                       post_merge_pending=post_merge_pending, task=task,
-                       run_id=run_id,
-                       last_daily_sync_at=last_daily_sync_at,
-                       daily_sync_count=daily_sync_count,
-                       daily_sync_in_progress=True,
-                       reanchor_emitted=reanchor_emitted,
-                       agent_context_tokens=agent_context_tokens,
-                       peak_cycle_output=peak_cycle_output,
-                       low_output_streak=low_output_streak,
-                       usage_basis=_usage_basis_arg)
+            _persist_state(daily_sync_in_progress=True)
             try:
                 last_session_id = _run_daily_sync(
                     agents=agents,
@@ -5390,18 +5881,7 @@ def run_exploration(
                 # never "retry every cycle until success."
                 last_daily_sync_at = datetime.now(timezone.utc).isoformat()
                 daily_sync_count += 1
-                save_state(state_path, cycle, results, consecutive_failures,
-                           last_session_id, agent_sessions, agent_summaries,
-                           post_merge_pending=post_merge_pending, task=task,
-                           run_id=run_id,
-                           last_daily_sync_at=last_daily_sync_at,
-                           daily_sync_count=daily_sync_count,
-                           daily_sync_in_progress=False,
-                           reanchor_emitted=reanchor_emitted,
-                           agent_context_tokens=agent_context_tokens,
-                           peak_cycle_output=peak_cycle_output,
-                           low_output_streak=low_output_streak,
-                           usage_basis=_usage_basis_arg)
+                _persist_state(daily_sync_in_progress=False)
 
                 # Plan B: planned 24h rotation. Fires AFTER the
                 # daily-sync agents complete, but only when no rotation has
@@ -5517,17 +5997,7 @@ def run_exploration(
             )
             cycles_since_last_report = 0
             cycle_session_log = []
-            save_state(state_path, cycle, results, consecutive_failures,
-                       last_session_id, agent_sessions, agent_summaries,
-                       post_merge_pending=post_merge_pending, task=task,
-                       run_id=run_id,
-                       last_daily_sync_at=last_daily_sync_at,
-                       daily_sync_count=daily_sync_count,
-                       reanchor_emitted=reanchor_emitted,
-                       agent_context_tokens=agent_context_tokens,
-                       peak_cycle_output=peak_cycle_output,
-                       low_output_streak=low_output_streak,
-                       usage_basis=_usage_basis_arg)
+            _persist_state()
 
         # Cooldown
         cooldown = adaptive_cooldown(base_cooldown, total_failure_streak)
@@ -5535,354 +6005,33 @@ def run_exploration(
             print(f"[long-exposure] Cooldown: {cooldown}s", flush=True)
             _sleep_interruptible(cooldown, data_dir)
 
-    # --- Stopped or Cleared ---
-    if _clear_requested:
-        # Archive old state before clearing
-        _archive_state(state_path)
-        _archive_local_session_logs(state_path.parent)
-        # Clear: save empty state (sessions.db records preserved). Stamp
-        # last_daily_sync_at to now so a subsequent resume from this
-        # cleared state doesn't fire the daily sync on cycle 1 (with
-        # last_daily_sync_at=None, _daily_sync_due returns True).
-        # A cleared run starts over: reset the ledger and persist an empty
-        # one, otherwise the next start/resume would inherit this run's
-        # spend and could trip a budget cap before its first cycle.
-        _usage.load({})
-        save_state(state_path, 0, {}, {name: 0 for name in agents},
-                   None, {}, {},
-                   last_daily_sync_at=datetime.now(timezone.utc).isoformat(),
-                   daily_sync_count=0,
-                   daily_sync_in_progress=False,
-                   usage_totals={})
-        update_status_file(output_dir, cycle, "cleared", consecutive_failures)
-        telemetry.emit(
-            "run_end",
-            phase="run",
-            cycle=cycle,
-            provider=config.get("llm_provider"),
-            model=config.get("model"),
-            status="cleared",
-            data={
-                "topic_exhausted": topic_exhausted,
-                "stop_requested": _stop_requested,
-                "clear_requested": _clear_requested,
-                "failures": consecutive_failures,
-            },
-        )
-        print(f"\n[long-exposure] Cleared after {cycle} cycles.", flush=True)
-        print("[long-exposure] Context reset. Sessions.db history preserved.", flush=True)
-        # Clone robustness: the root conductor's barrier is polling for
-        # merge_report.md. Even on clear, write a placeholder so the barrier
-        # does not block indefinitely on a cleared clone.
-        if _is_clone():
-            try:
-                _write_merge_report(
-                    _merge_report_path(state_path.parent),
-                    f"# Merge Report (clone cleared)\n\n"
-                    f"Clone was cleared after {cycle} cycles.\n",
-                    config,
-                    f"cycles 1-{cycle} [cleared]",
-                    verdict="halted",
-                )
-            except OSError:
-                pass
-    else:
-        # Run standard report if there are unreported cycles
-        if reporter_def and cycles_since_last_report > 0:
-            range_start = cycle - cycles_since_last_report + 1
-            last_session_id = _run_reporter(
-                reporter_def, task, config, results, score_inputs,
-                agent_sessions, agent_summaries,
-                conn, cycle, last_session_id,
-                range_start, cycle,
-                cycle_session_log,
-                context_window, compact_at,
-            )
-
-        # Save state after standard reporter, before final reporter
-        save_state(state_path, cycle, results, consecutive_failures,
-                   last_session_id, agent_sessions, agent_summaries,
-                   post_merge_pending=post_merge_pending, task=task,
-                   run_id=run_id,
-                   last_daily_sync_at=last_daily_sync_at,
-                   daily_sync_count=daily_sync_count,
-                   reanchor_emitted=reanchor_emitted,
-                   agent_context_tokens=agent_context_tokens,
-                   peak_cycle_output=peak_cycle_output,
-                   low_output_streak=low_output_streak,
-                   audit_free_streak=audit_free_streak,
-                   usage_basis=_usage_basis_arg)
-
-        # Clone exit path: skip final_reporter and curator. Run reporter
-        # in merge mode to produce the merge_report.md the root conductor's
-        # barrier is watching for. This is the load-bearing invariant — it
-        # must fire on ANY clone exit path (exhaustion, stop, timeout, etc.)
-        # so the barrier never blocks forever.
-        if _is_clone():
-            # Provenance: enumerate workspace files this clone touched (mtime
-            # >= start). Written BEFORE merge_report so downstream aggregators
-            # see a complete picture. Best-effort — zero count on any failure.
-            try:
-                _start_ts = float(os.environ.get("AGENT_CLONE_START_TS", "0"))
-            except ValueError:
-                _start_ts = 0.0
-            _ws = config.get("working_directory")
-            _write_files_touched(
-                state_path.parent,
-                Path(_ws) if _ws else None,
-                _start_ts,
-            )
-            # Plan H: per-clone authorship from shadow ledger.
-            # Returns 0 silently when the shadow ledger is missing
-            # (non-fanout runs, or clones that crashed before any ledger
-            # activity). Curator falls back to the fork-scoped file.
-            _write_clone_artifacts(state_path.parent)
-
-            if reporter_def:
-                range_start = max(1, cycle - cycles_since_last_report)
-                merge_path = _merge_report_path(state_path.parent)
-                try:
-                    last_session_id = _run_reporter(
-                        reporter_def, task, config, results, score_inputs,
-                        agent_sessions, agent_summaries,
-                        conn, cycle, last_session_id,
-                        range_start, max(cycle, range_start),
-                        cycle_session_log,
-                        context_window, compact_at,
-                        reporter_mode="merge",
-                        merge_report_path=merge_path,
-                    )
-                except Exception as _merge_err:
-                    # Best-effort placeholder so the barrier still observes
-                    # a file — unblocks the root conductor.
-                    print(
-                        f"[long-exposure] merge reporter crashed: "
-                        f"{_merge_err}; writing placeholder.",
-                        flush=True,
-                    )
-                    try:
-                        _write_merge_report(
-                            _merge_report_path(state_path.parent),
-                            f"# Merge Report (reporter crashed)\n\n"
-                            f"{_merge_err}\n",
-                            config,
-                            f"cycles 1-{cycle} [crashed]",
-                            verdict="halted",
-                        )
-                    except OSError:
-                        pass
-            else:
-                # No reporter defined in score — still unblock the barrier.
-                try:
-                    _write_merge_report(
-                        _merge_report_path(state_path.parent),
-                        "# Merge Report\n\n"
-                        "(No reporter agent defined in score.)\n",
-                        config,
-                        f"cycles 1-{cycle} [no-reporter]",
-                        verdict="unknown",
-                    )
-                except OSError:
-                    pass
-        else:
-            # Root path — final auditor + final synthesis + curator. The
-            # _should_run_final_synthesis predicate is shared so the auditor
-            # and reporter never desynchronize (docs/end-of-run-pipeline.md).
-            operator_stop_requested = _stop_requested
-            operator_clear_requested = _clear_requested
-            should_run_final = _should_run_final_synthesis(
-                topic_exhausted=topic_exhausted,
-                # A budget cap is a natural end-of-run, same as max_cycles.
-                max_cycles_reached=max_cycles_reached or budget_exhausted,
-                stop_requested=operator_stop_requested,
-                clear_requested=operator_clear_requested,
-            )
-            # A spend-limit kill overrides every other reason to run the
-            # end-of-run pipeline. Those three stages cost money, and
-            # spending past the cap to write a report about hitting the cap
-            # is incoherent. This is the one difference that makes the limit
-            # a kill rather than the graceful loop.max_cost_usd stop.
-            if spend_limit_killed:
-                should_run_final = False
-                print(
-                    "[long-exposure] End-of-run pipeline skipped: the total "
-                    "spend limit killed the run.",
-                    flush=True,
-                )
-            for _stage in _END_OF_RUN_STAGES:
-                if should_run_final and agents.get(_stage) and not _end_of_run_enabled(loop_cfg, _stage):
-                    print(
-                        f"[long-exposure] End-of-run: {_stage} skipped "
-                        f"(disabled by loop.end_of_run).",
-                        flush=True,
-                    )
-            stop_suppressed_for_final = _clear_stop_flag_for_final_synthesis(
-                should_run_final=should_run_final,
-                stop_requested=operator_stop_requested,
-                clear_requested=operator_clear_requested,
-            )
-            if stop_suppressed_for_final:
-                print(
-                    "[long-exposure] Stop acknowledged; running final "
-                    "auditor/reporter/curator before exit.",
-                    flush=True,
-                )
-
-            # 1. Final auditor (if defined) — runs BEFORE the reporter so the
-            #    reporter can ingest final_audit_summary.json structurally.
-            #    Graceful absence: missing agent definition skips this stage.
-            final_auditor_def = agents.get("final_auditor")
-            if (should_run_final and final_auditor_def
-                    and _end_of_run_enabled(loop_cfg, "final_auditor")):
-                try:
-                    from long_exposure.auditing import _run_final_auditor
-                    last_session_id = _run_final_auditor(
-                        final_auditor_def, task, config, results, score_inputs,
-                        conn, cycle, last_session_id,
-                        context_window, compact_at,
-                        data_dir=data_dir,
-                        agent_sessions=agent_sessions,
-                        agent_summaries=agent_summaries,
-                    )
-                except Exception as _aud_err:
-                    consecutive_failures["final_auditor"] = (
-                        consecutive_failures.get("final_auditor", 0) + 1
-                    )
-                    # Final auditor failure must not block the reporter or
-                    # curator — the run still ships a final report. Surface
-                    # the error and continue.
-                    print(
-                        f"[long-exposure] Final auditor crashed: {_aud_err!r} — "
-                        f"continuing to final reporter without audit summary.",
-                        flush=True,
-                    )
-
-            final_reporter_def = agents.get("final_reporter")
-            if (should_run_final and final_reporter_def
-                    and _end_of_run_enabled(loop_cfg, "final_reporter")):
-                try:
-                    last_session_id = _run_final_reporter(
-                        final_reporter_def, task, config, results, score_inputs,
-                        conn, cycle, last_session_id,
-                        context_window, compact_at,
-                        data_dir=data_dir,
-                        agent_sessions=agent_sessions,
-                        agent_summaries=agent_summaries,
-                    )
-                except Exception as _rep_err:
-                    consecutive_failures["final_reporter"] = (
-                        consecutive_failures.get("final_reporter", 0) + 1
-                    )
-                    print(
-                        f"[long-exposure] Final reporter crashed: {_rep_err!r} — "
-                        f"continuing to curator with available artifacts.",
-                        flush=True,
-                    )
-
-            curator_def = agents.get("curator")
-            if (should_run_final and curator_def
-                    and _end_of_run_enabled(loop_cfg, "curator")):
-                try:
-                    last_session_id = _run_curator(
-                        curator_def, task, config, results, score_inputs,
-                        conn, cycle, last_session_id,
-                        agent_sessions=agent_sessions,
-                        agent_summaries=agent_summaries,
-                    )
-                except Exception as _cur_err:
-                    consecutive_failures["curator"] = (
-                        consecutive_failures.get("curator", 0) + 1
-                    )
-                    print(
-                        f"[long-exposure] Curator crashed: {_cur_err!r} — "
-                        f"saving state and final-stage failure counters.",
-                        flush=True,
-                    )
-
-        # Stop: save current state for resume
-        save_state(state_path, cycle, results, consecutive_failures,
-                   last_session_id, agent_sessions, agent_summaries,
-                   post_merge_pending=post_merge_pending, task=task,
-                   run_id=run_id,
-                   last_daily_sync_at=last_daily_sync_at,
-                   daily_sync_count=daily_sync_count,
-                   reanchor_emitted=reanchor_emitted,
-                   agent_context_tokens=agent_context_tokens,
-                   peak_cycle_output=peak_cycle_output,
-                   low_output_streak=low_output_streak,
-                   audit_free_streak=audit_free_streak,
-                   usage_basis=_usage_basis_arg)
-        final_status = (
-            "killed_spend_limit" if spend_limit_killed
-            else "cleared" if _clear_requested
-            else "completed" if (
-                "should_run_final" in locals() and should_run_final
-            )
-            else "stopped"
-        )
-        update_status_file(output_dir, cycle, final_status, consecutive_failures)
-        telemetry.emit(
-            "run_end",
-            phase="run",
-            cycle=cycle,
-            provider=config.get("llm_provider"),
-            model=config.get("model"),
-            status=final_status,
-            data={
-                "topic_exhausted": topic_exhausted,
-                "max_cycles_reached": (
-                    max_cycles_reached
-                    if "max_cycles_reached" in locals()
-                    else False
-                ),
-                "budget_exhausted": (
-                    budget_exhausted if "budget_exhausted" in locals() else False
-                ),
-                "spend_limit_killed": spend_limit_killed,
-                "spend_limit_trip": _spend_limit.tripped(),
-                "usage_totals": _usage.totals(),
-                "stop_requested": (
-                    operator_stop_requested
-                    if "operator_stop_requested" in locals()
-                    else _stop_requested
-                ),
-                "clear_requested": _clear_requested,
-                "final_synthesis_requested": (
-                    should_run_final if "should_run_final" in locals() else False
-                ),
-                "failures": consecutive_failures,
-            },
-        )
-        if final_status == "completed":
-            print(
-                f"\n[long-exposure] Completed after {cycle} cycles.",
-                flush=True,
-            )
-            print("[long-exposure] Final artifacts written.", flush=True)
-        elif spend_limit_killed:
-            print(
-                f"\n[long-exposure] KILLED after {cycle} cycles: total spend "
-                "limit reached.",
-                flush=True,
-            )
-            print("[long-exposure] State preserved. Raise the limit to resume.", flush=True)
-        else:
-            print(f"\n[long-exposure] Stopped after {cycle} cycles.", flush=True)
-            print("[long-exposure] State preserved. Run again to resume.", flush=True)
-
-    conn.close()
-    print(f"[long-exposure] State: {state_path}", flush=True)
-
-    # Raised LAST, after state is saved, the status file is written and the
-    # DB is closed — a kill must not cost the run its resumability. A
-    # dedicated exception rather than a return value so no intermediate
-    # `return` on the way out can swallow it; callers map it to exit code 3.
-    if spend_limit_killed:
-        _trip = _spend_limit.tripped() or {}
-        _marker = _spend_limit.write_marker(output_dir, _trip, cycle=cycle)
-        if _marker:
-            print(f"[long-exposure] Spend-limit marker: {_marker}", flush=True)
-        raise SpendLimitKill(_trip, _marker)
+    _finish_run(
+        agent_sessions=agent_sessions,
+        agent_summaries=agent_summaries,
+        agents=agents,
+        budget_exhausted=budget_exhausted,
+        compact_at=compact_at,
+        config=config,
+        conn=conn,
+        consecutive_failures=consecutive_failures,
+        context_window=context_window,
+        cycle=cycle,
+        cycle_session_log=cycle_session_log,
+        cycles_since_last_report=cycles_since_last_report,
+        data_dir=data_dir,
+        last_session_id=last_session_id,
+        loop_cfg=loop_cfg,
+        max_cycles_reached=max_cycles_reached,
+        output_dir=output_dir,
+        reporter_def=reporter_def,
+        results=results,
+        score_inputs=score_inputs,
+        spend_limit_killed=spend_limit_killed,
+        state_path=state_path,
+        task=task,
+        topic_exhausted=topic_exhausted,
+        _persist_state=_persist_state,
+    )
 
 
 # ---------------------------------------------------------------------------
