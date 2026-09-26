@@ -57,6 +57,8 @@ from long_exposure import provider as _provider
 from long_exposure import unified_pool
 from long_exposure import agent_routing
 from long_exposure import model_profiles as _model_profiles
+from long_exposure import flags as _flags
+from long_exposure import hooks as _hooks_pkg
 
 # ---------------------------------------------------------------------------
 # Directory setup
@@ -3428,6 +3430,23 @@ HOOK_ENV_CYCLE = "LONG_EXPOSURE_HOOK_CYCLE"
 HOOK_ENV_STATE_DIR = "LONG_EXPOSURE_HOOK_STATE_DIR"
 HOOK_ENV_EXPECTED_OUTPUT = "LONG_EXPOSURE_EXPECTED_OUTPUT"
 
+# The `hooks:` block in config.yaml reaches the hooks only through env vars:
+# a hook runs as a subprocess spawned by the *vendor CLI*, not by the
+# harness, so it never sees config.yaml and has no reliable way to find the
+# instance dir on its own. `long_exposure.hooks.ENV_BY_KEY` is the mapping;
+# these are the names it resolves to.
+HOOK_ENV_ENVELOPE_OFF = _hooks_pkg.ENV_BY_KEY[("envelope", "enabled")]
+HOOK_ENV_ENVELOPE_MAX_NUDGES = _hooks_pkg.ENV_BY_KEY[("envelope", "max_nudges")]
+HOOK_ENV_COMPACTION_OFF = _hooks_pkg.ENV_BY_KEY[("compaction", "enabled")]
+
+
+def _hook_settings(config: dict | None, hook: str) -> dict:
+    block = (config or {}).get("hooks")
+    if not isinstance(block, dict):
+        return {}
+    section = block.get(hook)
+    return section if isinstance(section, dict) else {}
+
 
 def _add_hook_env(
     env: dict,
@@ -3440,11 +3459,17 @@ def _add_hook_env(
 ) -> None:
     """Tell the vendor hooks that this subprocess is a harness agent turn.
 
-    Unconditional and cheap: setting these costs nothing when no hooks are
-    installed, and gating it on a config flag would mean a run whose
-    operator installed hooks after starting it silently had none of them
-    apply. The hooks themselves decide what to do with the information.
+    The identifying vars are set unconditionally: they cost nothing when no
+    hooks are installed, and gating them on a config flag would mean a run
+    whose operator installed hooks after starting it silently had none of
+    them apply.
 
+    The `hooks:` config block is translated into the disable/tuning vars each
+    hook reads. Only *disabling* is pushed: an installed hook is on by
+    default, so `enabled: true` has nothing to say. An OFF var already
+    present in the parent environment is left alone — it is an operator's
+    deliberate escape hatch, and clearing it here would make that escape
+    hatch depend on which config file the run happened to load.
     """
     env[HOOK_ENV_ACTIVE] = "1"
     if agent_name:
@@ -3455,6 +3480,26 @@ def _add_hook_env(
         env[HOOK_ENV_STATE_DIR] = str(state_dir)
     if expected_output:
         env[HOOK_ENV_EXPECTED_OUTPUT] = str(expected_output)
+
+    envelope = _hook_settings(config, "envelope")
+    if not _flags.truthy(
+        envelope.get("enabled"), True, name="hooks.envelope.enabled"
+    ):
+        env[HOOK_ENV_ENVELOPE_OFF] = "1"
+    nudges = envelope.get("max_nudges")
+    if nudges is not None:
+        try:
+            env[HOOK_ENV_ENVELOPE_MAX_NUDGES] = str(max(0, int(nudges)))
+        except (TypeError, ValueError):
+            # An unparseable value leaves the hook on its own default (1)
+            # rather than guessing; the hook itself is equally defensive.
+            pass
+
+    compaction = _hook_settings(config, "compaction")
+    if not _flags.truthy(
+        compaction.get("enabled"), True, name="hooks.compaction.enabled"
+    ):
+        env[HOOK_ENV_COMPACTION_OFF] = "1"
 
 
 def _local_base_url(config: dict | None = None) -> str:

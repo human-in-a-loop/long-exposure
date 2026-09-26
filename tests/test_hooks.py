@@ -23,18 +23,6 @@ from long_exposure import hooks_install as hi
 from long_exposure.hooks import _io, compaction, envelope
 
 
-def _payload(command="", **extra):
-    p = {
-        "session_id": "s1",
-        "cwd": "/tmp",
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "tool_input": {"command": command},
-    }
-    p.update(extra)
-    return p
-
-
 class HarnessTurnGateTests(unittest.TestCase):
     def test_gate_reads_the_env_var(self):
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -67,6 +55,115 @@ class HarnessTurnGateTests(unittest.TestCase):
                      "LONG_EXPOSURE_GIT_HARNESS_ONLY",
                      "LONG_EXPOSURE_HARNESS_ROOT"):
             self.assertNotIn(gone, env, gone)
+
+
+class ConfigBlockTests(unittest.TestCase):
+    """The `hooks:` block in config.yaml has to actually reach the hooks.
+
+    It reaches them only through env vars: a hook is spawned by the vendor
+    CLI, not by the harness, so it never sees config.yaml. This block was
+    documented and inert for a while — nothing read it — which is the
+    failure these tests pin.
+    """
+
+    def _env(self, config):
+        from long_exposure.orchestrator import _add_hook_env
+
+        env = {}
+        _add_hook_env(env, config)
+        return env
+
+    def test_defaults_disable_nothing(self):
+        for config in ({}, {"hooks": {}}, {"hooks": "not-a-dict"},
+                       {"hooks": {"envelope": {"enabled": True},
+                                  "compaction": {"enabled": True}}}):
+            env = self._env(config)
+            self.assertNotIn(envelope.ENV_DISABLE, env, repr(config))
+            self.assertNotIn(compaction.ENV_DISABLE, env, repr(config))
+
+    def test_disabling_the_envelope_reaches_the_hook(self):
+        env = self._env({"hooks": {"envelope": {"enabled": False}}})
+        self.assertEqual(env[envelope.ENV_DISABLE], "1")
+        self.assertNotIn(compaction.ENV_DISABLE, env)
+        with mock.patch.dict(os.environ, {_io.ENV_ACTIVE: "1", **env}):
+            with mock.patch.object(_io, "read_payload",
+                                   return_value={"last_assistant_message": "no block"}):
+                with mock.patch.object(_io, "continue_turn") as nudged:
+                    envelope.main()
+        nudged.assert_not_called()
+
+    def test_disabling_compaction_reaches_the_hook(self):
+        env = self._env({"hooks": {"compaction": {"enabled": False}}})
+        self.assertEqual(env[compaction.ENV_DISABLE], "1")
+        self.assertNotIn(envelope.ENV_DISABLE, env)
+        with mock.patch.dict(os.environ, env):
+            with mock.patch.object(_io, "read_payload",
+                                   return_value={"hook_event_name": "PreCompact"}):
+                with mock.patch.object(compaction, "record") as recorded:
+                    compaction.main()
+        recorded.assert_not_called()
+
+    def test_a_quoted_false_still_disables(self):
+        """`enabled: "false"` is truthy to a bare bool(); flags.truthy is not."""
+        for word in ("false", "no", "off", "0", "FALSE"):
+            env = self._env({"hooks": {"envelope": {"enabled": word}}})
+            self.assertEqual(env.get(envelope.ENV_DISABLE), "1", word)
+
+    def test_max_nudges_is_passed_through(self):
+        env = self._env({"hooks": {"envelope": {"max_nudges": 3}}})
+        self.assertEqual(env[envelope.ENV_MAX_NUDGES], "3")
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(envelope._max_nudges(), 3)
+
+    def test_max_nudges_zero_means_never_nudge(self):
+        env = self._env({"hooks": {"envelope": {"max_nudges": 0}}})
+        self.assertEqual(env[envelope.ENV_MAX_NUDGES], "0")
+        with mock.patch.dict(os.environ, {_io.ENV_ACTIVE: "1", **env}):
+            with mock.patch.object(_io, "read_payload",
+                                   return_value={"session_id": "s",
+                                                 "last_assistant_message": "no block"}):
+                with mock.patch.object(_io, "continue_turn") as nudged:
+                    envelope.main()
+        nudged.assert_not_called()
+
+    def test_a_negative_max_nudges_is_clamped_not_rejected(self):
+        env = self._env({"hooks": {"envelope": {"max_nudges": -2}}})
+        self.assertEqual(env[envelope.ENV_MAX_NUDGES], "0")
+
+    def test_an_unparseable_max_nudges_leaves_the_hook_default(self):
+        env = self._env({"hooks": {"envelope": {"max_nudges": "lots"}}})
+        self.assertNotIn(envelope.ENV_MAX_NUDGES, env)
+
+    def test_max_nudges_absent_is_not_forced_to_a_number(self):
+        env = self._env({"hooks": {"envelope": {"enabled": True}}})
+        self.assertNotIn(envelope.ENV_MAX_NUDGES, env)
+
+    def test_an_operators_own_off_var_is_not_cleared(self):
+        """The env var is an escape hatch; config must not silently undo it."""
+        from long_exposure.orchestrator import _add_hook_env
+
+        env = {envelope.ENV_DISABLE: "1", compaction.ENV_DISABLE: "1"}
+        _add_hook_env(env, {"hooks": {"envelope": {"enabled": True},
+                                      "compaction": {"enabled": True}}})
+        self.assertEqual(env[envelope.ENV_DISABLE], "1")
+        self.assertEqual(env[compaction.ENV_DISABLE], "1")
+
+    def test_the_shipped_config_enables_both_hooks(self):
+        import yaml
+
+        cfg = yaml.safe_load(
+            (Path(__file__).resolve().parent.parent
+             / "long_exposure" / "config.yaml").read_text()
+        )
+        block = cfg["hooks"]
+        self.assertTrue(block["envelope"]["enabled"])
+        self.assertTrue(block["compaction"]["enabled"])
+        self.assertEqual(block["envelope"]["max_nudges"], 1)
+        # Every key in the shipped block is one _add_hook_env knows about;
+        # a key nothing reads is exactly the inert-config bug again.
+        self.assertEqual(set(block), {"envelope", "compaction"})
+        self.assertEqual(set(block["envelope"]), {"enabled", "max_nudges"})
+        self.assertEqual(set(block["compaction"]), {"enabled"})
 
 
 class EnvelopeTests(unittest.TestCase):

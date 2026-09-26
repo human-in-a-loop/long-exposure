@@ -96,10 +96,39 @@ long-exposure hooks-install --uninstall        # removes only our entries
 | Hook | Event | What it does |
 |---|---|---|
 | **envelope** | `Stop` | If the final message has no complete `[OUTPUT: x]` block, continues the turn and asks for it. Prevents the deliverable being lost behind a trailing checkpoint |
-| **compaction** | `PreCompact`, `PostCompact` | One `health_events` row per provider-side compaction, which the harness cannot otherwise see |
+| **compaction** | `PreCompact`, `PostCompact` | Logs provider-side compaction, which the harness cannot otherwise see. Two `health_events` rows per compaction — `provider_compaction_started` and `..._finished` |
 
 Claude and Codex run the same scripts unmodified. Gemini CLI has neither
 event, so `hooks-install --target gemini` writes nothing and says so.
+
+### Turning one off, or loosening it
+
+Installing puts the shims in your vendor config; the `hooks:` block in
+`config.yaml` decides what they do once a harness turn triggers them:
+
+```yaml
+hooks:
+  envelope:
+    enabled: true      # false → the hook is installed but returns immediately
+    max_nudges: 1      # 0 → never nudge; N → at most N re-asks per turn
+  compaction:
+    enabled: true      # false → no health_events rows for provider compaction
+```
+
+A hook is a subprocess of the *vendor CLI*, not of the harness, so it never
+loads `config.yaml`. The block is translated into environment variables
+(`LONG_EXPOSURE_ENVELOPE_OFF`, `LONG_EXPOSURE_ENVELOPE_MAX_NUDGES`,
+`LONG_EXPOSURE_COMPACTION_OFF`) on every agent turn the harness spawns. You
+can set those directly for a one-off; a value already in the environment is
+left alone, so an export in your shell outranks `config.yaml` for that
+session.
+
+Two consequences worth knowing. `enabled: false` disables the hook for
+*harness turns only* — the shim still runs and still exits 0, it just does
+nothing, so uninstalling is the way to stop it running at all. And with
+`max_nudges: 0` the envelope hook falls straight through to the existing
+transcript re-parse, which is the behaviour the harness had before the hook
+existed.
 
 ### These are not a safety layer
 

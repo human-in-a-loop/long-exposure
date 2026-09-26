@@ -14,6 +14,7 @@ import yaml
 
 from long_exposure import (
     cycle_plan as cp,
+    hooks as hk,
     model_profiles as mp,
     spend_limit as sl,
     startup_gate as g,
@@ -49,6 +50,34 @@ class ShippedConfigMatchesDefaultsTests(unittest.TestCase):
             self.assertIsInstance(block, dict, name)
             unknown = set(block) - set(defaults)
             self.assertEqual(unknown, set(), f"{name} documents unread keys")
+
+    def test_no_unknown_keys_in_the_hooks_block(self):
+        """`hooks:` is nested, so it needs its own walk.
+
+        This block shipped documented-but-inert: config.yaml described
+        `enabled` and `max_nudges` while nothing in the harness read them.
+        Every key here must appear in hooks.ENV_BY_KEY, which is what
+        `_add_hook_env` translates into the vars the hook subprocesses read.
+        """
+        block = load_config().get("hooks")
+        self.assertIsInstance(block, dict)
+        self.assertEqual(set(block), set(hk.DEFAULTS))
+        for hook, section in block.items():
+            self.assertIsInstance(section, dict, hook)
+            unknown = set(section) - set(hk.DEFAULTS[hook])
+            self.assertEqual(unknown, set(), f"hooks.{hook} documents unread keys")
+            for key in section:
+                self.assertIn((hook, key), hk.ENV_BY_KEY, f"hooks.{hook}.{key}")
+
+    def test_hook_modules_read_the_vars_the_harness_sets(self):
+        from long_exposure.hooks import compaction, envelope
+
+        self.assertEqual(envelope.ENV_DISABLE,
+                         hk.ENV_BY_KEY[("envelope", "enabled")])
+        self.assertEqual(envelope.ENV_MAX_NUDGES,
+                         hk.ENV_BY_KEY[("envelope", "max_nudges")])
+        self.assertEqual(compaction.ENV_DISABLE,
+                         hk.ENV_BY_KEY[("compaction", "enabled")])
 
     def test_score_cycle_planning_has_no_unknown_keys(self):
         score = yaml.safe_load(

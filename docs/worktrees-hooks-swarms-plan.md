@@ -338,11 +338,40 @@ under federation, local branch count is not the scaling dial.
 
 ## 5. Hooks — BUILT (2026-09-25)
 
-The three chosen hooks are implemented, tested (42 tests) and verified
-against a live `claude -p`. What follows is the design rationale, with the
-implementation notes folded in.
+Two hooks ship — the `Stop` envelope check and `PreCompact`/`PostCompact`
+observability — with the installer, the shim smoke check and 41 tests, all
+verified against a live `claude -p`. A third, the `PreToolUse` fence, was
+built and then removed (§5.0.1). What follows is the design rationale for each
+candidate, with the implementation notes folded in.
 
-### 5.0 What shipped — and what was removed again
+### 5.0 What shipped
+
+| Piece | Where |
+|---|---|
+| Shared stdin/stdout protocol | `long_exposure/hooks/_io.py` |
+| `Stop` output-envelope check | `long_exposure/hooks/envelope.py` |
+| `PreCompact`/`PostCompact` observability | `long_exposure/hooks/compaction.py` |
+| Per-vendor installer + shim smoke check | `long_exposure/hooks_install.py` |
+| CLI | `long-exposure hooks-install [--target …] [--verify] [--uninstall] [--dry-run]` |
+| Config | `hooks:` block in config.yaml — schema and env mapping in `long_exposure/hooks/__init__.py` (`DEFAULTS`, `ENV_BY_KEY`) |
+| Harness wiring | `orchestrator._add_hook_env`, called on every agent turn — sets the identity vars and translates the `hooks:` block into the disable/tuning vars |
+
+One thing the live testing changed, worth recording because it was not
+visible from the design:
+
+- **The envelope hook is gated on being inside a harness
+  turn** (`LONG_EXPOSURE_HOOK_ACTIVE`, set by `_add_hook_env`). An ungated
+  envelope hook nudged a bare `claude -p` turn into inventing an
+  `[OUTPUT: result]` label it was never asked for — the model said so
+  itself: *"no output type was ever declared to me in this conversation,
+  I'll use a generic label"*. Installed in an operator's home config, that
+  would tax every unrelated turn they take.
+
+Verified live: the envelope hook stays silent outside a harness turn, and
+inside one it makes the agent emit the correctly-named
+`[OUTPUT: work_output]` block.
+
+### 5.0.1 What was removed again
 
 **The `PreToolUse` path fence was built, verified live, and then removed by
 operator decision.** The reasoning, which I agree with: long-exposure treats
@@ -361,47 +390,24 @@ authors commits still stands (§7) — it is now carried by prompt guidance and
 by the harness simply being the thing that runs `git`, which is where it
 always actually lived.
 
-### 5.0 What shipped
-
-| Piece | Where |
-|---|---|
-| Shared stdin/stdout protocol | `long_exposure/hooks/_io.py` |
-| `Stop` output-envelope check | `long_exposure/hooks/envelope.py` |
-| `PreCompact`/`PostCompact` observability | `long_exposure/hooks/compaction.py` |
-| Per-vendor installer + shim smoke check | `long_exposure/hooks_install.py` |
-| CLI | `long-exposure hooks-install [--target …] [--verify] [--uninstall] [--dry-run]` |
-| Config | `hooks:` block in config.yaml |
-| Harness wiring | `orchestrator._add_hook_env`, called on every agent turn |
-
-One thing the live testing changed, worth recording because it was not
-visible from the design:
-
-- **The envelope hook is gated on being inside a harness
-  turn** (`LONG_EXPOSURE_HOOK_ACTIVE`, set by `_add_hook_env`). An ungated
-  envelope hook nudged a bare `claude -p` turn into inventing an
-  `[OUTPUT: result]` label it was never asked for — the model said so
-  itself: *"no output type was ever declared to me in this conversation,
-  I'll use a generic label"*. Installed in an operator's home config, that
-  would tax every unrelated turn they take.
-
-Verified live: the envelope hook stays silent outside a harness turn, and
-inside one it makes the agent emit the correctly-named
-`[OUTPUT: work_output]` block.
-
-### 5.0.1 The bug the tests caught
+### 5.0.2 The bug the tests caught
 
 The installer's ownership marker was the module name
 (`long_exposure.hooks`), which appears only inside the shim's text — while
-the vendor config stores the shim's **path** (`long-exposure-fence.sh`). So
+the vendor config stores the shim's **path** (`long-exposure-envelope.sh`).
+So
 `_is_ours` never matched: uninstall silently left our entries behind and a
 re-install would have duplicated them. Matched on the shim basename now,
 against the known hook names, so an operator's own script living under a
 path that happens to contain "long-exposure" is never removed.
 
-### 5.1 `PreToolUse` on Bash → the fence, and why it was withdrawn
+### 5.0.3 The candidate hooks
 
-Each is a hardening of guidance that already exists in prompt text, and each
-maps to a problem this repo has already had.
+The sections below walk the events considered, in the order they were
+evaluated. Each maps to a problem this repo has already had. Two shipped
+(§5.2 `Stop`, §5.4 `PreCompact`/`PostCompact`), one was built and withdrawn
+(§5.1 `PreToolUse`), and two are deferred (§5.3 `PostToolUse`, §5.5
+`SubagentStart`/`SubagentStop`).
 
 ### 5.1 `PreToolUse` on Bash → the fence, and why it was withdrawn
 
@@ -417,7 +423,7 @@ returns `permissionDecision: deny` converts the harness's most important soft
 fence into a hard one. Both Claude and Codex support it identically; Gemini
 gets it as `BeforeTool`.
 
-This was built and then withdrawn (§5.0). The argument that beat it: the
+This was built and then withdrawn (§5.0.1). The argument that beat it: the
 harness runs agents it trusts, the prompt already states the boundary, and an
 enforcement layer that cannot stop a determined model while duplicating
 guidance for an honest one is not worth its weight.
@@ -460,9 +466,12 @@ it. The live smoke run produced exactly one health event —
 crossed the spend cap. Provider-side compaction is both expensive and
 invisible.
 
-These two hooks make it observable for free: one `health_events` row per
-provider compaction. Pure instrumentation, no behaviour change, and it feeds
-the cost model §4 depends on.
+These two hooks make it observable for free. Both events are installed, so
+each provider compaction writes two `health_events` rows —
+`provider_compaction_started` and `provider_compaction_finished` — which is
+what lets a reader tell a completed compaction from one that began and
+vanished. Pure instrumentation, no behaviour change, and it feeds the cost
+model §4 depends on.
 
 ### 5.5 `SubagentStart` / `SubagentStop` → per-teammate accounting
 
@@ -505,7 +514,7 @@ container boundary — a deployment decision, not a hook.
 
 1. **Git sync layer** (§3). Unlocks the scenario actually described, pure
    git, vendor-neutral, modest scope.
-2. ~~**`PreToolUse` path fence**~~ — **built, then REMOVED** by decision (§5.0).
+2. ~~**`PreToolUse` path fence**~~ — **built, then REMOVED** by decision (§5.0.1).
 3. ~~**`PreCompact`/`PostCompact` observability**~~ — **DONE** (§5.0).
 4. ~~**`Stop` output-envelope enforcement**~~ — **DONE** (§5.0).
 5. **`PostToolUse` validators** (§5.3). Not in the first cut, by decision.
@@ -525,7 +534,7 @@ member with a checkout.
 
 | Question | Decision |
 |---|---|
-| **Which hooks** | The `Stop` **`[OUTPUT: x]` envelope** check and **`PreCompact`/`PostCompact`** observability. The `PreToolUse` **path fence was built and then removed** — the harness treats the model as faithful and has no enforcement layer (§5.0, §5.6). `PostToolUse` validators are not in the first cut |
+| **Which hooks** | The `Stop` **`[OUTPUT: x]` envelope** check and **`PreCompact`/`PostCompact`** observability. The `PreToolUse` **path fence was built and then removed** — the harness treats the model as faithful and has no enforcement layer (§5.0.1, §5.6). `PostToolUse` validators are not in the first cut |
 | **Hook install surface** | A **separate `long-exposure hooks-install`**. Adopting the harness must never silently edit an operator's `~/.claude/settings.json` or `~/.codex/hooks.json` |
 | **Hook failure posture** | Moot once the fence went: both remaining hooks are non-blocking, so `--verify` is a smoke check and nothing fails closed |
 | **Git commit cadence** | **Every cycle boundary** — already the harness's transaction point, so every commit is a coherent cycle and `git log` reads as run history |

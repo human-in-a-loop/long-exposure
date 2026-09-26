@@ -12,9 +12,13 @@ spend cap was `worker#compaction` at **$3.45** — provider-side compaction is
 both the most expensive single call in the cycle and the one the harness has
 no record of.
 
-This hook is pure instrumentation: one `health_events` row per provider
-compaction, no behaviour change, nothing blocked. It is the cheapest of the
-three and the only one with no failure mode worse than a missing log line.
+This hook is pure instrumentation: no behaviour change, nothing blocked,
+and no failure mode worse than a missing log line. It is installed on *both*
+compaction events, so one provider compaction produces **two** rows —
+`provider_compaction_started` from `PreCompact` and
+`provider_compaction_finished` from `PostCompact`. Reading the log, pair them
+by cycle and agent; a `started` with no `finished` is a compaction the CLI
+began and did not complete.
 
 Both Claude and Codex fire `PreCompact` and `PostCompact` with a
 `trigger_reason` / matcher of `manual` or `auto`. Gemini has neither, so
@@ -26,12 +30,13 @@ from __future__ import annotations
 import os
 import sys
 
+import long_exposure.hooks as _pkg
 from long_exposure.hooks import _io
 
 ENV_STATE_DIR = "LONG_EXPOSURE_HOOK_STATE_DIR"
 ENV_AGENT = "LONG_EXPOSURE_HOOK_AGENT"
 ENV_CYCLE = "LONG_EXPOSURE_HOOK_CYCLE"
-ENV_DISABLE = "LONG_EXPOSURE_COMPACTION_OFF"
+ENV_DISABLE = _pkg.ENV_BY_KEY[("compaction", "enabled")]
 
 KIND_PRE = "provider_compaction_started"
 KIND_POST = "provider_compaction_finished"

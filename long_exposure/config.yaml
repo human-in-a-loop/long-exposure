@@ -265,10 +265,12 @@ hooks:
   envelope:
     enabled: true
     max_nudges: 1
-  # PreCompact / PostCompact. Pure instrumentation: one health_events row per
-  # PROVIDER-side compaction, which the harness cannot otherwise see. In the
-  # live smoke run the compaction call was both the most expensive turn of
-  # the cycle and the one with no record.
+  # PreCompact / PostCompact. Pure instrumentation for PROVIDER-side
+  # compaction, which the harness cannot otherwise see. Both events are
+  # installed, so each compaction writes TWO health_events rows:
+  # provider_compaction_started and provider_compaction_finished. In the live
+  # smoke run the compaction call was both the most expensive turn of the
+  # cycle and the one with no record.
   compaction:
     enabled: true
 
@@ -276,7 +278,10 @@ hooks:
 # Four questions asked ONCE, before a run begins, so the expensive choices
 # are made deliberately instead of inherited from whatever this file says.
 #   Q1 model     Q2 workspace     Q3 resume-or-fresh     Q4 spend limit
-# Q4 appears only when usage_allowance.enabled is true.
+# Q4 is always asked and always defaults to NO CAP. If usage_allowance
+# declares no allowance it is a one-line notice, not a prompt; declining it
+# overrides usage_allowance.enabled: true, so the answer given at the gate
+# is the last word.
 #
 # `launch` ONLY. `start`, `resume` and `python -m long_exposure.exploration`
 # stay non-interactive, which is what keeps cron jobs, the fan-out clone

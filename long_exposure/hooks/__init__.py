@@ -45,7 +45,37 @@ only place a rule exists.
 Gemini lacks four of the events, Claude can be invoked with `--bare` (which
 skips hooks), and Codex requires operator review of non-managed hooks. Any
 behaviour living only in a hook would silently vanish on the vendor or
-invocation that lacks it. So every hook here duplicates guidance that is
-already in the system prompt, and the run still works — less safely, or less
-observably — without it.
+invocation that lacks it.
+
+So `envelope` hardens a contract the system prompt already states, and the
+run still works without it — the existing transcript re-parse remains the
+fallback. `compaction` states no rule at all; it only records, so its absence
+costs visibility and nothing else. Neither hook is load-bearing.
+
+## Configuration
+
+`DEFAULTS` below is the whole schema of the `hooks:` block in config.yaml.
+The block reaches a hook only as environment variables, set by
+`orchestrator._add_hook_env` on every agent turn the harness spawns: a hook
+is a subprocess of the *vendor CLI*, so it never loads config.yaml and cannot
+reliably locate the instance dir on its own. `ENV_BY_KEY` records that
+mapping, and `tests/test_docs_config_consistency.py` asserts the shipped
+config documents no key nothing reads — the state this block was actually in
+for a while.
 """
+
+# The complete schema of the `hooks:` block in config.yaml, with its shipped
+# defaults. Anything not listed here is not read.
+DEFAULTS: dict[str, dict] = {
+    "envelope": {"enabled": True, "max_nudges": 1},
+    "compaction": {"enabled": True},
+}
+
+# Which env var carries each key to the hook subprocess. The `enabled` keys
+# map to an inverted "OFF" var because an installed hook is on by default —
+# only disabling needs saying.
+ENV_BY_KEY: dict[tuple[str, str], str] = {
+    ("envelope", "enabled"): "LONG_EXPOSURE_ENVELOPE_OFF",
+    ("envelope", "max_nudges"): "LONG_EXPOSURE_ENVELOPE_MAX_NUDGES",
+    ("compaction", "enabled"): "LONG_EXPOSURE_COMPACTION_OFF",
+}

@@ -50,12 +50,15 @@ import re
 import sys
 from pathlib import Path
 
+import long_exposure.hooks as _pkg
 from long_exposure.hooks import _io
 
 ENV_EXPECTED = "LONG_EXPOSURE_EXPECTED_OUTPUT"   # e.g. "research_brief"
 ENV_STATE_DIR = "LONG_EXPOSURE_HOOK_STATE_DIR"
-ENV_MAX_NUDGES = "LONG_EXPOSURE_ENVELOPE_MAX_NUDGES"
-ENV_DISABLE = "LONG_EXPOSURE_ENVELOPE_OFF"
+# Taken from the package's ENV_BY_KEY rather than re-spelt, so a rename
+# cannot leave the harness setting one name and the hook reading another.
+ENV_MAX_NUDGES = _pkg.ENV_BY_KEY[("envelope", "max_nudges")]
+ENV_DISABLE = _pkg.ENV_BY_KEY[("envelope", "enabled")]
 
 DEFAULT_MAX_NUDGES = 1
 

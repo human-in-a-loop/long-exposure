@@ -18,9 +18,13 @@ path are baked into a two-line script instead.
 ## Merging, not overwriting
 
 An operator's settings file probably already has hooks in it. Entries are
-matched by the `command` containing `long_exposure.hooks.<name>`, so
-re-running the installer replaces long-exposure's own entries and leaves
-everything else alone. `uninstall` removes exactly those.
+recognised as ours when the command's *basename* is one of the shims this
+installer writes (`long-exposure-<hook>.sh`), so re-running the installer
+replaces long-exposure's own entries and leaves everything else alone.
+`uninstall` removes exactly those. Matching the basename rather than the
+module name matters because the config never contains the module name — only
+the shim does — and matching a loose substring would delete an operator's own
+script that happened to sit under a path containing "long-exposure".
 
 ## Vendor mapping
 
@@ -71,11 +75,10 @@ HOOK_TIMEOUT = {"envelope": 20, "compaction": 10}
 
 # How an entry is recognised as ours on re-install and uninstall. The config
 # stores the SHIM PATH, not the module name — the module name only appears
-# inside the shim's text — so the marker has to be the shim's filename stem.
+# inside the shim's text — so recognition has to go by the shim's filename.
 # Getting this wrong meant uninstall silently left our entries behind and a
 # re-install duplicated them; the tests now pin both.
 SHIM_PREFIX = "long-exposure-"
-MARKER = SHIM_PREFIX
 
 
 def vendor_dir(vendor: str, directory: Path | None = None) -> Path:

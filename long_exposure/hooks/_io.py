@@ -1,7 +1,10 @@
 """The stdin/stdout protocol shared by Claude Code and Codex hooks.
 
-Kept deliberately small and dependency-free: these run as subprocesses on
-every matching tool call, so import cost is on the hot path.
+Kept deliberately small and dependency-free. A hook is a fresh subprocess
+spawned by the vendor CLI on each matching event, so its import cost is paid
+every time — `Stop` fires once per turn, `PreCompact`/`PostCompact` only when
+the CLI compacts, but the same module is the one a tool-scoped hook would
+import if one is ever added.
 """
 
 from __future__ import annotations
@@ -24,9 +27,11 @@ from typing import Any
 # ungated hook taxes every unrelated turn they take.
 ENV_ACTIVE = "LONG_EXPOSURE_HOOK_ACTIVE"
 
-# Exit codes. 0 = the JSON on stdout decides; 2 = block, reason on stderr.
+# Both remaining hooks are non-blocking, so exit 0 is the only code either
+# of them returns: the JSON on stdout carries whatever opinion they have.
+# (The vendors also define exit 2 as "block, reason on stderr". Nothing here
+# uses it; the `PreToolUse` fence that did was removed.)
 EXIT_OK = 0
-EXIT_BLOCK = 2
 
 
 def read_payload() -> dict[str, Any]:
@@ -49,15 +54,6 @@ def read_payload() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def tool_name(payload: dict) -> str:
-    return str(payload.get("tool_name") or "")
-
-
-def tool_input(payload: dict) -> dict:
-    ti = payload.get("tool_input")
-    return ti if isinstance(ti, dict) else {}
-
-
 def event_name(payload: dict, default: str = "") -> str:
     return str(payload.get("hook_event_name") or default)
 
@@ -76,23 +72,6 @@ def allow() -> int:
     return EXIT_OK
 
 
-def deny(event: str, reason: str) -> int:
-    """Block a tool call, with the reason surfaced to the agent.
-
-    Emits the JSON form rather than relying on exit 2, because the JSON
-    carries `permissionDecisionReason` — the agent is told *why*, which is
-    what lets it choose a different approach instead of retrying blindly.
-    """
-    _emit({
-        "hookSpecificOutput": {
-            "hookEventName": event or "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    })
-    return EXIT_OK
-
-
 def continue_turn(reason: str) -> int:
     """For Stop / SubagentStop: keep the turn going instead of ending it.
 
@@ -100,17 +79,6 @@ def continue_turn(reason: str) -> int:
     counter-intuitive, but it is the documented contract on both.
     """
     _emit({"decision": "block", "reason": reason})
-    return EXIT_OK
-
-
-def add_context(event: str, text: str) -> int:
-    """Hand the agent extra context without changing control flow."""
-    _emit({
-        "hookSpecificOutput": {
-            "hookEventName": event or "SessionStart",
-            "additionalContext": text,
-        }
-    })
     return EXIT_OK
 
 
