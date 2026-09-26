@@ -761,7 +761,10 @@ agents:
       vocabulary, a `confidence.rationale` explaining what you found,
       and the `evidence` files supporting your judgment. You are the
       canonical confidence assessor for closure / deferral / supersession
-      events.
+      events. A research milestone marked `validated` at `high` confidence
+      must cite what it rests on — a produced file that exists, or a prior
+      event_id — in `evidence` or `artifacts`; later cycles are shown an
+      uncited one as medium.
       </validators>
 
       <manager-and-mechanism-gate>

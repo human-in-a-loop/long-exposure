@@ -209,12 +209,38 @@ defines current status. `promise_check.py` computes this.
 Every cycle's agent prompts get a `promise_ledger_summary` input.
 The harness builds it from:
 
-- Most-recent event per milestone_id.
+- Most-recent event per `(operator, milestone_id)`. On a single-operator
+  ledger that is the same as per milestone. With several operators, each
+  one's latest event on a shared milestone is shown, so a disagreement is
+  visible rather than one side silently hidden (`git-federation.md` §7.1).
 - All `in-progress` items.
 - Any `validated` with `low` or `provisional` confidence in the last
   N cycles.
 
 Capped at ≤8k tokens. Truncation drops oldest first.
+
+**The evidence gate.** A `validated` research milestone claimed at `high`
+confidence is shown as `medium (claimed high; no evidence found)` unless its
+`evidence` or `artifacts` cite something real: a workspace file that exists, or
+a prior event_id. The auditor is the same model grading its own worker, and
+this stops an unbacked confident claim being read as settled by every later
+cycle.
+
+It is deliberately small:
+
+- **Read-side only.** The ledger keeps the claim exactly as written. Agents may
+  append by writing the file directly, which bypasses `append_ledger_event`, so
+  a write-side gate would miss them — and an audit trail should record what was
+  claimed.
+- **Existence, not quality.** It checks the cited file is there, not that it
+  proves anything. The failure it catches is the honest one: a result claimed
+  from an output that was never written.
+- **Research milestones only.** `_plan/`, `_run/`, `_manager/`, `_archive/`,
+  `_orphan/` and `_infra/` are bookkeeping. A plan revision is validated by
+  being decided and has no file behind it the way a finding does.
+
+The auditor's role text states the rule, so the gate hardens something the
+prompt already says rather than being the only place it exists.
 
 ### Per-clone shadow ledgers (Plan 1 Phase 2)
 

@@ -13,6 +13,7 @@ view of the ledger into each cycle's agent prompts.
 from __future__ import annotations
 
 import json
+import re
 import os
 import uuid
 from datetime import datetime, timezone
@@ -351,6 +352,74 @@ def _read_ledger(ledger_path: Path) -> list[dict]:
     return events
 
 
+_UUID_SHAPE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def is_evidenced(event: dict, workspace: Path) -> bool:
+    """True if the event cites something that actually backs it.
+
+    Evidence is any entry in `evidence` or `artifacts` that is either a UUID —
+    a citation of a prior ledger event, as `ledger_graph` reads it — or a
+    workspace-relative path that exists. A path must stay inside the workspace:
+    `../../etc/hosts` exists, but it is not evidence for a research claim.
+    """
+    for key in ("evidence", "artifacts"):
+        items = event.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            if _UUID_SHAPE.match(item.strip()):
+                return True
+            from long_exposure.paths import canonical_rel_path
+
+            rel = canonical_rel_path(item)
+            if not rel or ".." in Path(rel).parts:
+                continue
+            try:
+                if (Path(workspace) / rel).exists():
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _displayed_level(event: dict, workspace: Path) -> str:
+    """The confidence level to SHOW, which may differ from the one claimed.
+
+    The evidence gate. An auditor is the same model grading its own worker, so
+    a confident wrong result can be rubber-stamped and every later cycle reads
+    it as settled. A `validated` research milestone claimed at `high` with
+    nothing behind it — no produced file that exists, no cited event — is shown
+    to later cycles as medium, with the claim kept visible.
+
+    Deliberately small, as asked. It is read-side only: the ledger keeps the
+    agent's claim exactly as written, because agents may append by writing the
+    file directly, bypassing `append_ledger_event`, so a write-side gate would
+    miss them, and because an audit trail should record what was claimed, not
+    what the harness thought of it. It checks that evidence exists, not that it
+    is any good — the harness treats the model as faithful, and the failure this
+    catches is the honest one: a result claimed from an output that was never
+    written. Bookkeeping milestones (`_plan/`, `_run/`, `_manager/`, ...) are
+    exempt: a plan revision is validated by being decided, and has no file
+    behind it in the sense a finding does.
+    """
+    conf = event.get("confidence") or {}
+    level = conf.get("level", "?") if isinstance(conf, dict) else "?"
+    if event.get("status") != "validated" or level != "high":
+        return level
+    from long_exposure.tools.promise_check import RESERVED_NAMESPACES
+
+    mid = str(event.get("milestone_id") or "")
+    if mid.startswith(RESERVED_NAMESPACES):
+        return level
+    if is_evidenced(event, workspace):
+        return level
+    return "medium (claimed high; no evidence found)"
+
+
 def summarize_ledger(workspace: Path, max_chars: int = 32_000) -> str:
     """Produce a token-bounded summary of the ledger for cycle-input injection.
 
@@ -444,10 +513,7 @@ def summarize_ledger(workspace: Path, max_chars: int = 32_000) -> str:
     for ev in selected:
         mid = ev.get("milestone_id", "?")
         status = ev.get("status", "?")
-        conf = ev.get("confidence") or {}
-        if not isinstance(conf, dict):
-            conf = {}
-        level = conf.get("level", "?")
+        level = _displayed_level(ev, workspace)
         cycle = ev.get("cycle", "?")
         agent = ev.get("agent", "?")
         ts = ev.get("ts", "")
