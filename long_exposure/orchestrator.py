@@ -3427,9 +3427,6 @@ HOOK_ENV_AGENT = "LONG_EXPOSURE_HOOK_AGENT"
 HOOK_ENV_CYCLE = "LONG_EXPOSURE_HOOK_CYCLE"
 HOOK_ENV_STATE_DIR = "LONG_EXPOSURE_HOOK_STATE_DIR"
 HOOK_ENV_EXPECTED_OUTPUT = "LONG_EXPOSURE_EXPECTED_OUTPUT"
-HOOK_ENV_HARNESS_ROOT = "LONG_EXPOSURE_HARNESS_ROOT"
-HOOK_ENV_GIT_HARNESS_ONLY = "LONG_EXPOSURE_GIT_HARNESS_ONLY"
-HOOK_ENV_FENCE_SCOPE = "LONG_EXPOSURE_FENCE_SCOPE"
 
 
 def _add_hook_env(
@@ -3448,12 +3445,8 @@ def _add_hook_env(
     operator installed hooks after starting it silently had none of them
     apply. The hooks themselves decide what to do with the information.
 
-    `harness_root` is passed explicitly rather than derived inside the hook,
-    because the hook shim may have been generated against a different
-    checkout than the one running this turn.
     """
     env[HOOK_ENV_ACTIVE] = "1"
-    env[HOOK_ENV_HARNESS_ROOT] = str(SCRIPT_DIR.parent)
     if agent_name:
         env[HOOK_ENV_AGENT] = str(agent_name)
     if cycle is not None:
@@ -3462,14 +3455,6 @@ def _add_hook_env(
         env[HOOK_ENV_STATE_DIR] = str(state_dir)
     if expected_output:
         env[HOOK_ENV_EXPECTED_OUTPUT] = str(expected_output)
-    cfg = config or {}
-    hooks_cfg = cfg.get("hooks") if isinstance(cfg.get("hooks"), dict) else {}
-    scope = str((hooks_cfg.get("fence") or {}).get("scope") or "").strip().lower()
-    if scope in ("turn", "always"):
-        env[HOOK_ENV_FENCE_SCOPE] = scope
-    git_cfg = cfg.get("git_sync") if isinstance(cfg.get("git_sync"), dict) else {}
-    if git_cfg.get("harness_commits_only"):
-        env[HOOK_ENV_GIT_HARNESS_ONLY] = "1"
 
 
 def _local_base_url(config: dict | None = None) -> str:

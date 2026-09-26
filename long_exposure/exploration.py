@@ -4047,35 +4047,6 @@ def run_exploration(
     # that one is a NATURAL end-of-run and still runs the end-of-run
     # pipeline; this one KILLS the run and skips it. Root only.
     spend_limit_killed = False
-    # Fail-closed fence check (hooks.fence.required). Verified by EXERCISING
-    # the installed hook rather than by reading a config file: an entry
-    # existing does not mean the script runs — the shim can point at a moved
-    # checkout, the interpreter can be gone, the execute bit can be lost. An
-    # unattended run with pre-granted tools and a fence that silently is not
-    # there is the one case worth refusing to start for.
-    _hooks_cfg = config.get("hooks") if isinstance(config.get("hooks"), dict) else {}
-    if (_hooks_cfg.get("fence") or {}).get("required") and not _is_clone():
-        from long_exposure import hooks_install as _hooks_mod
-
-        _vendor = _provider.current_provider()
-        if _hooks_mod.HOOK_EVENTS["fence"].get(_vendor):
-            _ok, _detail = _hooks_mod.verify_fence(_vendor)
-            if not _ok:
-                raise RuntimeError(
-                    "hooks.fence.required is set but the fence is not "
-                    f"enforcing: {_detail}. Install it with "
-                    "`long-exposure hooks-install --target "
-                    f"{_vendor}`, or set hooks.fence.required: false."
-                )
-            print(f"[long-exposure] Fence: {_detail}", flush=True)
-        else:
-            print(
-                f"[long-exposure] Fence: {_vendor} has no PreToolUse "
-                "equivalent; hooks.fence.required cannot be honoured on "
-                "this provider.",
-                flush=True,
-            )
-
     if not _is_clone():
         _spend_limit.reset()
         # Clear a marker left by an earlier killed run: a resume that

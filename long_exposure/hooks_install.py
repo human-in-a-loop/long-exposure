@@ -26,7 +26,6 @@ everything else alone. `uninstall` removes exactly those.
 
 | Hook | Claude | Codex | Gemini |
 |---|---|---|---|
-| fence | `PreToolUse` | `PreToolUse` | `BeforeTool` |
 | envelope | `Stop` | `Stop` | — (no event) |
 | compaction | `PreCompact`, `PostCompact` | same | — (no event) |
 
@@ -44,18 +43,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from long_exposure.hooks import fence as _fence
-
 VENDORS = ("claude", "codex", "gemini")
 
 # hook name -> {vendor: [event names]}. An empty list means "this vendor has
 # no equivalent event"; the installer reports it as skipped.
 HOOK_EVENTS: dict[str, dict[str, tuple[str, ...]]] = {
-    "fence": {
-        "claude": ("PreToolUse",),
-        "codex": ("PreToolUse",),
-        "gemini": ("BeforeTool",),
-    },
     "envelope": {
         "claude": ("Stop",),
         "codex": ("Stop",),
@@ -68,15 +60,14 @@ HOOK_EVENTS: dict[str, dict[str, tuple[str, ...]]] = {
     },
 }
 
-# The tool-name matcher per hook. Shell tools are named differently per
-# vendor, so the fence matches all three spellings.
+# The tool-name matcher per hook. Neither remaining hook is tool-scoped, so
+# both match every occurrence of their event.
 HOOK_MATCHER: dict[str, str] = {
-    "fence": "Bash|apply_patch|run_shell_command",
     "envelope": "",
     "compaction": "",
 }
 
-HOOK_TIMEOUT = {"fence": 20, "envelope": 20, "compaction": 10}
+HOOK_TIMEOUT = {"envelope": 20, "compaction": 10}
 
 # How an entry is recognised as ours on re-install and uninstall. The config
 # stores the SHIM PATH, not the module name — the module name only appears
@@ -111,7 +102,8 @@ def shim_path(vendor: str, hook: str, directory: Path | None = None) -> Path:
 
 
 def _harness_root() -> str:
-    return _fence.harness_root()
+    """The harness source tree, for the shim's PYTHONPATH."""
+    return str(Path(__file__).resolve().parent.parent)
 
 
 def shim_text(hook: str) -> str:
@@ -210,6 +202,13 @@ def install(
     if dry_run:
         return result
 
+    if not result["events"]:
+        # Nothing to install for this vendor — every requested hook needs an
+        # event it does not have. Do not create or touch its config file:
+        # the whole reason this is a separate command is that these files
+        # belong to the operator.
+        return result
+
     cfg_path = config_path(vendor, directory)
     cfg = _load(cfg_path)
     existing = cfg.get("hooks")
@@ -284,61 +283,66 @@ def uninstall(vendor: str, directory: Path | None = None) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Fail-closed verification
+# Shim smoke check
 # ---------------------------------------------------------------------------
 
 
-def verify_fence(vendor: str = "claude", directory: Path | None = None) -> tuple[bool, str]:
-    """Prove the fence is installed AND responding, by exercising it.
+def verify(
+    vendor: str = "claude",
+    hook: str = "envelope",
+    directory: Path | None = None,
+) -> tuple[bool, str]:
+    """Check an installed shim actually runs. Returns (ok, detail).
 
-    This is what makes the fence's fail-closed posture real rather than
-    declarative. A config entry existing does not mean the script runs: the
-    shim may point at a moved checkout, the interpreter may be gone, the
-    file may have lost its execute bit. So instead of inspecting the config,
-    this sends the fence a payload containing its self-test marker and
-    requires a `deny` back.
+    A smoke check, not a gate. A config entry existing does not mean the
+    script runs: the shim can point at a moved checkout, the interpreter can
+    be gone, the execute bit can be lost. Both remaining hooks are
+    non-blocking, so a broken one costs an unenforced envelope nudge or a
+    missing log line — worth knowing about, not worth refusing to start a
+    run over.
 
-    Returns (ok, detail).
+    The payload is benign on purpose: a complete output block for the
+    envelope, a plain compaction event for the other. A healthy shim exits 0
+    and says nothing.
     """
-    sp = shim_path(vendor, "fence", directory)
+    sp = shim_path(vendor, hook, directory)
     if not sp.is_file():
-        return False, f"fence shim missing: {sp}"
+        return False, f"{hook} shim missing: {sp}"
     if not os.access(sp, os.X_OK):
-        return False, f"fence shim is not executable: {sp}"
+        return False, f"{hook} shim is not executable: {sp}"
 
-    payload = json.dumps({
-        "hook_event_name": "PreToolUse",
-        "session_id": "verify",
-        "cwd": str(Path.cwd()),
-        "tool_name": "Bash",
-        "tool_input": {"command": f"echo {_fence.SELFTEST_MARKER}"},
-    })
+    if hook == "envelope":
+        payload = {
+            "hook_event_name": "Stop",
+            "session_id": "verify",
+            "last_assistant_message": "[OUTPUT: x]\nbody\n[END OUTPUT: x]",
+        }
+    else:
+        payload = {
+            "hook_event_name": "PreCompact",
+            "session_id": "verify",
+            "trigger_reason": "verify",
+        }
     try:
         proc = subprocess.run(
-            [str(sp)], input=payload, capture_output=True, text=True, timeout=30,
+            [str(sp)], input=json.dumps(payload),
+            capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as e:
-        return False, f"fence shim failed to run: {e!r}"
+        return False, f"{hook} shim failed to run: {e!r}"
 
-    if proc.returncode not in (0, 2):
+    if proc.returncode != 0:
         return False, (
-            f"fence exited {proc.returncode}: "
+            f"{hook} shim exited {proc.returncode}: "
             f"{(proc.stderr or '').strip()[:200]}"
         )
-    try:
-        out = json.loads(proc.stdout or "{}")
-    except ValueError:
-        return False, f"fence emitted non-JSON: {(proc.stdout or '')[:200]!r}"
-    decision = (
-        (out.get("hookSpecificOutput") or {}).get("permissionDecision")
-        if isinstance(out.get("hookSpecificOutput"), dict) else None
-    )
-    if decision != "deny":
-        return False, (
-            "fence did not deny its own self-test payload "
-            f"(decision={decision!r}) — it is installed but not enforcing"
-        )
-    return True, f"fence verified: {sp}"
+    out = (proc.stdout or "").strip()
+    if out:
+        try:
+            json.loads(out)
+        except ValueError:
+            return False, f"{hook} shim emitted non-JSON: {out[:200]!r}"
+    return True, f"{hook} shim runs: {sp}"
 
 
 def render_summary(result: dict[str, Any]) -> str:

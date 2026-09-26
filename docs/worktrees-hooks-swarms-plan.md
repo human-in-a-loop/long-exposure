@@ -342,36 +342,51 @@ The three chosen hooks are implemented, tested (42 tests) and verified
 against a live `claude -p`. What follows is the design rationale, with the
 implementation notes folded in.
 
+### 5.0 What shipped — and what was removed again
+
+**The `PreToolUse` path fence was built, verified live, and then removed by
+operator decision.** The reasoning, which I agree with: long-exposure treats
+the model as a faithful collaborator. A fence that only stops honest mistakes
+duplicates guidance the system prompt already carries, and a fence meant to
+stop an adversarial model could be circumvented anyway — my own threat-model
+note conceded it can only match literal command text, so a path built from
+shell variables or encoded passes straight through. Building enforcement that
+works against neither threat is machinery for its own sake. This is a
+harness, not a safety net; real isolation is a container boundary.
+
+What that decision also removes: the fail-closed startup check, the
+`hooks.fence` config block, the `scope: turn|always` question, and the
+`git_sync.harness_commits_only` enforcement. The *decision* that the harness
+authors commits still stands (§7) — it is now carried by prompt guidance and
+by the harness simply being the thing that runs `git`, which is where it
+always actually lived.
+
 ### 5.0 What shipped
 
 | Piece | Where |
 |---|---|
 | Shared stdin/stdout protocol | `long_exposure/hooks/_io.py` |
-| `PreToolUse` path fence | `long_exposure/hooks/fence.py` |
 | `Stop` output-envelope check | `long_exposure/hooks/envelope.py` |
 | `PreCompact`/`PostCompact` observability | `long_exposure/hooks/compaction.py` |
-| Per-vendor installer + fail-closed verify | `long_exposure/hooks_install.py` |
+| Per-vendor installer + shim smoke check | `long_exposure/hooks_install.py` |
 | CLI | `long-exposure hooks-install [--target …] [--verify] [--uninstall] [--dry-run]` |
 | Config | `hooks:` block in config.yaml |
 | Harness wiring | `orchestrator._add_hook_env`, called on every agent turn |
 
-Two things the live testing changed, both worth recording because neither
-was visible from the design:
+One thing the live testing changed, worth recording because it was not
+visible from the design:
 
-- **Both behaviour-changing hooks are gated on being inside a harness
+- **The envelope hook is gated on being inside a harness
   turn** (`LONG_EXPOSURE_HOOK_ACTIVE`, set by `_add_hook_env`). An ungated
   envelope hook nudged a bare `claude -p` turn into inventing an
   `[OUTPUT: result]` label it was never asked for — the model said so
   itself: *"no output type was ever declared to me in this conversation,
   I'll use a generic label"*. Installed in an operator's home config, that
   would tax every unrelated turn they take.
-- **The fence defaults to `scope: turn`** for the same reason plus a
-  sharper one: `scope: always` would deny the *operator* access to the
-  harness source tree, which is where they develop it.
 
-Verified live four ways: denies the harness root inside a harness turn,
-allows ordinary commands, stays silent outside a harness turn, and makes the
-agent emit the correctly-named `[OUTPUT: work_output]` block.
+Verified live: the envelope hook stays silent outside a harness turn, and
+inside one it makes the agent emit the correctly-named
+`[OUTPUT: work_output]` block.
 
 ### 5.0.1 The bug the tests caught
 
@@ -383,12 +398,12 @@ re-install would have duplicated them. Matched on the shim basename now,
 against the known hook names, so an operator's own script living under a
 path that happens to contain "long-exposure" is never removed.
 
-### 5.1 `PreToolUse` on Bash → make the directory fence real (highest value)
+### 5.1 `PreToolUse` on Bash → the fence, and why it was withdrawn
 
 Each is a hardening of guidance that already exists in prompt text, and each
 maps to a problem this repo has already had.
 
-### 5.1 `PreToolUse` on Bash → make the directory fence real (highest value)
+### 5.1 `PreToolUse` on Bash → the fence, and why it was withdrawn
 
 Today `== DIRECTORY BOUNDARIES ==` is **prose**. The operating protocol says
 so itself: file tools are scoped to the workspace, but *"Bash is NOT
@@ -402,8 +417,10 @@ returns `permissionDecision: deny` converts the harness's most important soft
 fence into a hard one. Both Claude and Codex support it identically; Gemini
 gets it as `BeforeTool`.
 
-This is the one I would build first of the hooks. The harness runs agents
-with permission-skipping by design, for hours, unattended.
+This was built and then withdrawn (§5.0). The argument that beat it: the
+harness runs agents it trusts, the prompt already states the boundary, and an
+enforcement layer that cannot stop a determined model while duplicating
+guidance for an honest one is not worth its weight.
 
 ### 5.2 `Stop` → enforce the `[OUTPUT: x]` envelope
 
@@ -454,15 +471,17 @@ ledger — the guidance even reasons about "halves per-teammate cost" without
 being able to measure it. These hooks give a per-teammate record, which the
 ledger could attribute rather than folding into the lead's row.
 
-### 5.6 Threat model, stated once and plainly
+### 5.6 The stance, stated positively
 
-The fence **stops mistakes, not adversaries.** It matches off-limits paths
-against the literal text of a command, so a path assembled from shell
-variables, an unexpanded `$HOME`, base64, or a `cd` followed by a relative
-reference would all pass. That is the correct trade for the actual risk: the
-failure it prevents is an agent that reasoned its way to `rm -rf` on the
-wrong tree, or decided the harness had a bug worth patching mid-run. It is
-not a sandbox and the docs must not describe it as one. Real isolation is a
+Long-exposure has **no enforcement layer, by design**. It treats the model as
+a faithful collaborator, so hooks here exist for *correctness* (helping a
+cooperating agent satisfy the harness's own output contract) and
+*observability* (recording what the harness cannot otherwise see). Nothing
+polices.
+
+That is why the fence went. An enforcement hook sits in a bad middle: against
+an honest agent it duplicates the system prompt, and against a dishonest one
+it fails, since it can only match literal command text. Real isolation is a
 container boundary — a deployment decision, not a hook.
 
 ### 5.7 Deliberately **not** adopting
@@ -486,7 +505,7 @@ container boundary — a deployment decision, not a hook.
 
 1. **Git sync layer** (§3). Unlocks the scenario actually described, pure
    git, vendor-neutral, modest scope.
-2. ~~**`PreToolUse` path fence**~~ — **DONE** (§5.0).
+2. ~~**`PreToolUse` path fence**~~ — **built, then REMOVED** by decision (§5.0).
 3. ~~**`PreCompact`/`PostCompact` observability**~~ — **DONE** (§5.0).
 4. ~~**`Stop` output-envelope enforcement**~~ — **DONE** (§5.0).
 5. **`PostToolUse` validators** (§5.3). Not in the first cut, by decision.
@@ -506,12 +525,12 @@ member with a checkout.
 
 | Question | Decision |
 |---|---|
-| **Which hooks first** | The `PreToolUse` Bash **path fence**, the `Stop` **`[OUTPUT: x]` envelope** check, and **`PreCompact`/`PostCompact`** observability. `PostToolUse` validators are **not** in the first cut |
+| **Which hooks** | The `Stop` **`[OUTPUT: x]` envelope** check and **`PreCompact`/`PostCompact`** observability. The `PreToolUse` **path fence was built and then removed** — the harness treats the model as faithful and has no enforcement layer (§5.0, §5.6). `PostToolUse` validators are not in the first cut |
 | **Hook install surface** | A **separate `long-exposure hooks-install`**. Adopting the harness must never silently edit an operator's `~/.claude/settings.json` or `~/.codex/hooks.json` |
-| **Hook failure posture** | **Fail closed for the path fence only.** If the fence is configured but not functioning, refuse to start — an unattended permission-skipping run with no fence is exactly what the fence is for. Every other hook warns and continues |
+| **Hook failure posture** | Moot once the fence went: both remaining hooks are non-blocking, so `--verify` is a smoke check and nothing fails closed |
 | **Git commit cadence** | **Every cycle boundary** — already the harness's transaction point, so every commit is a coherent cycle and `git log` reads as run history |
 | **Conflict posture** | **Surface it to the next researcher as an input**, the way `live_guidance` works. A conflict is a run event, not an error; keeps an autonomous run autonomous |
-| **Commit authority** | **Harness only.** Deterministic cycle-boundary commits keep history independent of prompt adherence, matching the existing split where the harness owns bookkeeping and the agent owns content |
+| **Commit authority** | **Harness only**, carried by prompt guidance and by the harness being the thing that runs `git` — not by a hook that blocks `git commit`, which went with the fence |
 | **Swarm shape** | **A federation over a GitHub repo** (§4): independent operators on independent machines, each with a small local fan-out. Not a local swarm |
 | **Governor** | **A concurrency semaphore sized to plan capacity** — which under federation is per operator, and already half-exists as `_fanout_branch_cap()` |
 | **Worktrees** | **Nowhere.** Four candidate levels, four noes (§2) |

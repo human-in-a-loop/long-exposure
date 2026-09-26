@@ -1,10 +1,14 @@
-"""Vendor-neutral lifecycle hooks: the fence, the envelope, compaction.
+"""Vendor-neutral lifecycle hooks: the envelope and compaction.
 
-Two properties carry most of the weight. Every hook must be a no-op outside
-a long-exposure agent turn — a live test found the ungated envelope hook
-nudging a bare `claude -p` turn into inventing an [OUTPUT:] label it was
-never asked for. And the fence's fail-closed check must prove the fence
-ENFORCES, not merely that a config entry exists.
+These are correctness and observability hooks, not enforcement. A
+`PreToolUse` path fence was built and removed: the harness treats the model
+as a faithful collaborator, so a fence that only stops honest mistakes
+duplicates the prompt, and one meant to stop an adversarial model could be
+circumvented anyway.
+
+The property that carries the most weight is the harness-turn gate. A live
+test found the ungated envelope hook nudging a bare `claude -p` turn into
+inventing an [OUTPUT:] label it was never asked for.
 """
 
 import json
@@ -16,7 +20,7 @@ from tempfile import TemporaryDirectory
 from unittest import mock
 
 from long_exposure import hooks_install as hi
-from long_exposure.hooks import _io, compaction, envelope, fence
+from long_exposure.hooks import _io, compaction, envelope
 
 
 def _payload(command="", **extra):
@@ -51,107 +55,18 @@ class HarnessTurnGateTests(unittest.TestCase):
         self.assertEqual(env["LONG_EXPOSURE_HOOK_AGENT"], "worker")
         self.assertEqual(env["LONG_EXPOSURE_HOOK_CYCLE"], "3")
         self.assertEqual(env["LONG_EXPOSURE_EXPECTED_OUTPUT"], "work_output")
-        self.assertIn("LONG_EXPOSURE_HARNESS_ROOT", env)
 
-    def test_fence_scope_and_git_authority_come_from_config(self):
+    def test_no_enforcement_env_is_set(self):
+        """The fence was removed; nothing here should police anything."""
         from long_exposure.orchestrator import _add_hook_env
 
         env = {}
         _add_hook_env(env, {"hooks": {"fence": {"scope": "always"}},
                             "git_sync": {"harness_commits_only": True}})
-        self.assertEqual(env["LONG_EXPOSURE_FENCE_SCOPE"], "always")
-        self.assertEqual(env["LONG_EXPOSURE_GIT_HARNESS_ONLY"], "1")
-
-        env = {}
-        _add_hook_env(env, {"hooks": {"fence": {"scope": "nonsense"}}})
-        self.assertNotIn("LONG_EXPOSURE_FENCE_SCOPE", env)
-
-
-class FenceTests(unittest.TestCase):
-    def test_denies_the_harness_root(self):
-        root = fence.harness_root()
-        deny, reason = fence.check(_payload(f"ls {root}/long_exposure"))
-        self.assertTrue(deny)
-        self.assertIn(root, reason)
-
-    def test_denies_each_off_limits_path(self):
-        for path in fence.denied_paths():
-            deny, _ = fence.check(_payload(f"cat {path}/something"))
-            self.assertTrue(deny, path)
-
-    def test_denies_reads_not_just_writes(self):
-        """A read of a private key is as bad as a write."""
-        key = str(Path.home() / ".ssh" / "id_ed25519")
-        self.assertTrue(fence.check(_payload(f"cat {key}"))[0])
-
-    def test_allows_ordinary_commands(self):
-        for cmd in ("python3 scripts/sweep.py", "pytest -q",
-                    "ls data/", "git status", "git add -A",
-                    "echo hello > out.txt"):
-            self.assertFalse(fence.check(_payload(cmd))[0], cmd)
-
-    def test_checks_path_carrying_tool_inputs_too(self):
-        root = fence.harness_root()
-        deny, _ = fence.check({
-            "tool_name": "Write",
-            "tool_input": {"file_path": f"{root}/long_exposure/x.py"},
-        })
-        self.assertTrue(deny)
-
-    def test_empty_and_malformed_payloads_are_no_opinion(self):
-        for p in ({}, {"tool_input": None}, {"tool_input": {}},
-                  {"tool_input": {"command": ""}}):
-            self.assertFalse(fence.check(p)[0], p)
-
-    def test_selftest_marker_always_denies(self):
-        deny, reason = fence.check(_payload(f"echo {fence.SELFTEST_MARKER}"))
-        self.assertTrue(deny)
-        self.assertIn("self-test", reason)
-
-    def test_git_writes_blocked_only_when_harness_owns_commits(self):
-        cmd = "git commit -m 'work'"
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(fence.ENV_GIT_AUTHORITY, None)
-            self.assertFalse(fence.check(_payload(cmd))[0])
-        with mock.patch.dict(os.environ, {fence.ENV_GIT_AUTHORITY: "1"}):
-            deny, reason = fence.check(_payload(cmd))
-            self.assertTrue(deny)
-            self.assertIn("commit", reason)
-
-    def test_read_only_git_stays_allowed_under_harness_authority(self):
-        with mock.patch.dict(os.environ, {fence.ENV_GIT_AUTHORITY: "1"}):
-            for cmd in ("git status", "git diff", "git log --oneline",
-                        "git add -A", "git show HEAD"):
-                self.assertFalse(fence.check(_payload(cmd))[0], cmd)
-
-    def test_git_log_format_commit_is_not_a_commit(self):
-        with mock.patch.dict(os.environ, {fence.ENV_GIT_AUTHORITY: "1"}):
-            self.assertFalse(
-                fence.check(_payload("git log --format=%H"))[0]
-            )
-
-    def test_default_scope_is_turn(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop(fence.ENV_SCOPE, None)
-            self.assertEqual(fence.scope(), "turn")
-        with mock.patch.dict(os.environ, {fence.ENV_SCOPE: "always"}):
-            self.assertEqual(fence.scope(), "always")
-        with mock.patch.dict(os.environ, {fence.ENV_SCOPE: "garbage"}):
-            self.assertEqual(fence.scope(), "turn")
-
-    def test_env_override_for_the_harness_root(self):
-        with mock.patch.dict(os.environ,
-                             {fence.ENV_HARNESS_ROOT: "/opt/le"}):
-            self.assertEqual(fence.harness_root(), "/opt/le")
-
-    def test_the_prompt_and_the_fence_have_not_drifted(self):
-        """The template is the operator-facing statement of this list."""
-        tpl = Path(
-            "long_exposure/templates/operating-protocol-template.md"
-        ).read_text()
-        for name in fence.HOME_RELATIVE_DENY:
-            self.assertIn(f"~/{name}", tpl, f"{name} missing from the prompt")
-        self.assertIn("{harness_root}", tpl)
+        for gone in ("LONG_EXPOSURE_FENCE_SCOPE",
+                     "LONG_EXPOSURE_GIT_HARNESS_ONLY",
+                     "LONG_EXPOSURE_HARNESS_ROOT"):
+            self.assertNotIn(gone, env, gone)
 
 
 class EnvelopeTests(unittest.TestCase):
@@ -280,15 +195,25 @@ class InstallerTests(unittest.TestCase):
         with TemporaryDirectory() as td:
             d = Path(td)
             for vendor in hi.VENDORS:
-                res = hi.install(vendor, ("fence", "envelope", "compaction"), d)
-                self.assertTrue(Path(res["config"]).is_file(), vendor)
+                res = hi.install(vendor, tuple(hi.HOOK_EVENTS), d)
+                if res["events"]:
+                    self.assertTrue(Path(res["config"]).is_file(), vendor)
+                else:
+                    self.assertFalse(Path(res["config"]).exists(), vendor)
 
     def test_gemini_skips_the_events_it_lacks(self):
         with TemporaryDirectory() as td:
-            res = hi.install("gemini", ("fence", "envelope", "compaction"),
-                             Path(td))
-            self.assertIn("BeforeTool", res["events"])
+            res = hi.install("gemini", tuple(hi.HOOK_EVENTS), Path(td))
+            self.assertEqual(res["events"], {})
             self.assertEqual(sorted(res["skipped"]), ["compaction", "envelope"])
+
+    def test_a_vendor_with_nothing_to_install_is_not_touched(self):
+        """These files belong to the operator; do not create one for nothing."""
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            hi.install("gemini", tuple(hi.HOOK_EVENTS), d)
+            self.assertFalse(hi.config_path("gemini", d).exists())
+            self.assertFalse((d / ".gemini").exists())
 
     def test_codex_writes_hooks_json_not_settings(self):
         self.assertTrue(str(hi.config_path("codex")).endswith("hooks.json"))
@@ -299,16 +224,16 @@ class InstallerTests(unittest.TestCase):
             d = Path(td)
             cfg = hi.config_path("claude", d)
             cfg.parent.mkdir(parents=True, exist_ok=True)
-            mine = {"hooks": {"PreToolUse": [
-                {"matcher": "Bash", "hooks": [
+            mine = {"hooks": {"Stop": [
+                {"hooks": [
                     {"type": "command", "command": "/usr/local/bin/my-own.sh"}]}
             ]}}
             cfg.write_text(json.dumps(mine))
-            hi.install("claude", ("fence",), d)
+            hi.install("claude", ("envelope",), d)
             after = json.loads(cfg.read_text())
             commands = [
                 h["command"]
-                for e in after["hooks"]["PreToolUse"] for h in e["hooks"]
+                for e in after["hooks"]["Stop"] for h in e["hooks"]
             ]
             self.assertIn("/usr/local/bin/my-own.sh", commands)
             self.assertTrue(
@@ -319,11 +244,11 @@ class InstallerTests(unittest.TestCase):
     def test_reinstall_does_not_duplicate_our_entry(self):
         with TemporaryDirectory() as td:
             d = Path(td)
-            hi.install("claude", ("fence",), d)
-            hi.install("claude", ("fence",), d)
+            hi.install("claude", ("envelope",), d)
+            hi.install("claude", ("envelope",), d)
             after = json.loads(hi.config_path("claude", d).read_text())
             ours = [
-                h for e in after["hooks"]["PreToolUse"] for h in e["hooks"]
+                h for e in after["hooks"]["Stop"] for h in e["hooks"]
                 if hi.SHIM_PREFIX in Path(h["command"]).name
             ]
             self.assertEqual(len(ours), 1)
@@ -333,33 +258,33 @@ class InstallerTests(unittest.TestCase):
             d = Path(td)
             cfg = hi.config_path("claude", d)
             cfg.parent.mkdir(parents=True, exist_ok=True)
-            cfg.write_text(json.dumps({"hooks": {"PreToolUse": [
+            cfg.write_text(json.dumps({"hooks": {"Stop": [
                 {"hooks": [{"type": "command", "command": "/keep/me.sh"}]}
             ]}}))
-            hi.install("claude", ("fence",), d)
+            hi.install("claude", ("envelope",), d)
             hi.uninstall("claude", d)
             after = json.loads(cfg.read_text())
             commands = [
                 h["command"]
-                for e in after.get("hooks", {}).get("PreToolUse", [])
+                for e in after.get("hooks", {}).get("Stop", [])
                 for h in e["hooks"]
             ]
             self.assertEqual(commands, ["/keep/me.sh"])
-            self.assertFalse(hi.shim_path("claude", "fence", d).exists())
+            self.assertFalse(hi.shim_path("claude", "envelope", d).exists())
 
     def test_dry_run_writes_nothing(self):
         with TemporaryDirectory() as td:
             d = Path(td)
-            hi.install("claude", ("fence",), d, dry_run=True)
+            hi.install("claude", ("envelope",), d, dry_run=True)
             self.assertFalse(hi.config_path("claude", d).exists())
 
     def test_the_shim_is_executable_and_names_the_module(self):
         with TemporaryDirectory() as td:
             d = Path(td)
-            hi.install("claude", ("fence",), d)
-            sp = hi.shim_path("claude", "fence", d)
+            hi.install("claude", ("envelope",), d)
+            sp = hi.shim_path("claude", "envelope", d)
             self.assertTrue(os.access(sp, os.X_OK))
-            self.assertIn("long_exposure.hooks.fence", sp.read_text())
+            self.assertIn("long_exposure.hooks.envelope", sp.read_text())
 
     def test_an_operator_script_under_a_similar_path_is_not_ours(self):
         """The marker is the shim basename, not a loose substring."""
@@ -367,76 +292,83 @@ class InstallerTests(unittest.TestCase):
             {"type": "command", "command": "/opt/long-exposure-tools/mine.sh"}
         ]}))
         self.assertTrue(hi._is_ours({"hooks": [
-            {"type": "command", "command": "/x/long-exposure-fence.sh"}
+            {"type": "command", "command": "/x/long-exposure-envelope.sh"}
         ]}))
 
 
-class VerifyFenceTests(unittest.TestCase):
-    """Fail-closed means EXERCISING the fence, not reading a config file."""
+class VerifyTests(unittest.TestCase):
+    """`--verify` is a smoke check: does the installed shim actually run?
+
+    Not a gate. Both remaining hooks are non-blocking, so a broken one costs
+    an unenforced nudge or a missing log line rather than a wrong run.
+    """
 
     def test_verify_passes_on_a_real_install(self):
         with TemporaryDirectory() as td:
             d = Path(td)
-            hi.install("claude", ("fence",), d)
-            ok, detail = hi.verify_fence("claude", d)
-            self.assertTrue(ok, detail)
+            hi.install("claude", ("envelope", "compaction"), d)
+            for hook in ("envelope", "compaction"):
+                ok, detail = hi.verify("claude", hook, d)
+                self.assertTrue(ok, detail)
 
     def test_verify_fails_when_not_installed(self):
         with TemporaryDirectory() as td:
-            ok, detail = hi.verify_fence("claude", Path(td))
+            ok, detail = hi.verify("claude", "envelope", Path(td))
             self.assertFalse(ok)
             self.assertIn("missing", detail)
 
     def test_verify_fails_when_the_shim_lost_its_execute_bit(self):
         with TemporaryDirectory() as td:
             d = Path(td)
-            hi.install("claude", ("fence",), d)
-            hi.shim_path("claude", "fence", d).chmod(0o644)
-            ok, detail = hi.verify_fence("claude", d)
+            hi.install("claude", ("envelope",), d)
+            hi.shim_path("claude", "envelope", d).chmod(0o644)
+            ok, detail = hi.verify("claude", "envelope", d)
             self.assertFalse(ok)
             self.assertIn("executable", detail)
 
-    def test_verify_fails_when_the_fence_does_not_deny(self):
-        """A config entry existing is not the same as the fence working."""
+    def test_verify_fails_on_a_shim_that_errors(self):
         with TemporaryDirectory() as td:
             d = Path(td)
-            hi.install("claude", ("fence",), d)
-            sp = hi.shim_path("claude", "fence", d)
-            sp.write_text("#!/bin/sh\nexit 0\n")   # installed, inert
+            hi.install("claude", ("envelope",), d)
+            sp = hi.shim_path("claude", "envelope", d)
+            sp.write_text("#!/bin/sh\nexit 9\n")
             sp.chmod(0o755)
-            ok, detail = hi.verify_fence("claude", d)
+            ok, detail = hi.verify("claude", "envelope", d)
             self.assertFalse(ok)
-            self.assertIn("not enforcing", detail)
+            self.assertIn("exited 9", detail)
 
-    def test_the_shim_really_denies_when_run_as_a_subprocess(self):
+    def test_verify_fails_on_non_json_output(self):
+        with TemporaryDirectory() as td:
+            d = Path(td)
+            hi.install("claude", ("envelope",), d)
+            sp = hi.shim_path("claude", "envelope", d)
+            sp.write_text("#!/bin/sh\necho not-json\n")
+            sp.chmod(0o755)
+            ok, detail = hi.verify("claude", "envelope", d)
+            self.assertFalse(ok)
+            self.assertIn("non-JSON", detail)
+
+    def test_the_envelope_shim_nudges_through_a_real_subprocess(self):
         """End to end through the shim, as a vendor would invoke it."""
         with TemporaryDirectory() as td:
             d = Path(td)
-            hi.install("claude", ("fence",), d)
-            sp = hi.shim_path("claude", "fence", d)
-            payload = json.dumps(_payload(
-                f"cat {fence.harness_root()}/long_exposure/cli.py"
-            ))
-            env = dict(os.environ, **{_io.ENV_ACTIVE: "1"})
-            proc = subprocess.run([str(sp)], input=payload, text=True,
-                                  capture_output=True, timeout=30, env=env)
-            out = json.loads(proc.stdout)
-            self.assertEqual(
-                out["hookSpecificOutput"]["permissionDecision"], "deny",
-            )
-
-    def test_the_shim_allows_an_ordinary_command(self):
-        with TemporaryDirectory() as td:
-            d = Path(td)
-            hi.install("claude", ("fence",), d)
-            sp = hi.shim_path("claude", "fence", d)
-            env = dict(os.environ, **{_io.ENV_ACTIVE: "1"})
+            hi.install("claude", ("envelope",), d)
+            sp = hi.shim_path("claude", "envelope", d)
+            env = dict(os.environ, **{
+                _io.ENV_ACTIVE: "1",
+                envelope.ENV_EXPECTED: "report",
+                envelope.ENV_STATE_DIR: td,
+            })
             proc = subprocess.run(
-                [str(sp)], input=json.dumps(_payload("pytest -q")),
-                text=True, capture_output=True, timeout=30, env=env,
+                [str(sp)], text=True, capture_output=True, timeout=30, env=env,
+                input=json.dumps({
+                    "hook_event_name": "Stop", "session_id": "s",
+                    "last_assistant_message": "done, see above",
+                }),
             )
-            self.assertEqual(proc.returncode, 0)
-            self.assertEqual(proc.stdout.strip(), "")
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["decision"], "block")
+            self.assertIn("[OUTPUT: report]", out["reason"])
 
 
 if __name__ == "__main__":

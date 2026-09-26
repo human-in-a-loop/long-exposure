@@ -19,6 +19,24 @@ and the compaction pair. Where a Gemini equivalent exists the installer maps
 the name; where it does not, the hook is simply not installed and the
 harness behaves as it does today.
 
+## What these are NOT for
+
+**Correctness and observability, not enforcement.** Long-exposure treats the
+model as a faithful collaborator, and deliberately has no enforcement layer.
+A `PreToolUse` path fence was built and then removed on exactly that
+reasoning: a fence that only stops honest mistakes adds machinery the system
+prompt already covers, and one meant to stop an adversarial model could be
+circumvented anyway (it can only match literal command text — a path built
+from shell variables, or encoded, walks straight through). This is a harness,
+not a safety net.
+
+If you need real isolation, it is a container boundary. That is a deployment
+decision, not a hook.
+
+So `envelope` helps a cooperating agent satisfy the harness's own output
+contract, and `compaction` records something the harness cannot otherwise
+see. Neither one polices.
+
 ## The rule these obey
 
 A hook may **harden** a rule the prompt already states. It must never be the

@@ -83,42 +83,48 @@ pre-edited score, but you'll usually want to pass the directive inline.
 
 ## Lifecycle hooks (opt-in)
 
-Three hooks that harden rules the system prompt already states. Off until
-installed, and installed by their own command — never as a side effect of
-anything else, because they write into files you own:
+Two hooks. Off until installed, and installed by their own command — never as
+a side effect of anything else, because they write into files you own:
 
 ```bash
-long-exposure hooks-install --target all       # ~/.claude, ~/.codex, ~/.gemini
+long-exposure hooks-install --target all       # ~/.claude, ~/.codex
 long-exposure hooks-install --target claude --directory .   # project-local
-long-exposure hooks-install --verify           # exercise the fence, exit 1 if inert
+long-exposure hooks-install --verify           # run each shim, exit 1 if broken
 long-exposure hooks-install --uninstall        # removes only our entries
 ```
 
 | Hook | Event | What it does |
 |---|---|---|
-| **fence** | `PreToolUse` | Denies commands touching the off-limits paths the operating protocol names — provider credentials, SSH/GPG keys, `~/.env`, shell and git config, and the harness's own source tree |
 | **envelope** | `Stop` | If the final message has no complete `[OUTPUT: x]` block, continues the turn and asks for it. Prevents the deliverable being lost behind a trailing checkpoint |
 | **compaction** | `PreCompact`, `PostCompact` | One `health_events` row per provider-side compaction, which the harness cannot otherwise see |
 
-Claude and Codex run the same scripts unmodified. Gemini gets the fence
-(as `BeforeTool`) and is told the other two have no equivalent event.
+Claude and Codex run the same scripts unmodified. Gemini CLI has neither
+event, so `hooks-install --target gemini` writes nothing and says so.
 
-**They only act inside a long-exposure agent turn.** Your own interactive
-sessions with either CLI are untouched — the harness sets an env var when it
-spawns an agent, and the hooks check for it. That also means
-`hooks.fence.scope: always` is available but not the default: `always` would
-deny *you* access to the harness source tree.
+### These are not a safety layer
 
-**The fence stops mistakes, not adversaries.** It matches paths against the
-literal command text, so an obfuscated path would pass. It exists because
-these runs go for hours, unattended, with tool permissions pre-granted, and
-the harness root is on every agent's `PYTHONPATH`. Real isolation is a
-container.
+Long-exposure treats the model as a faithful collaborator and has **no
+enforcement layer by design**. A `PreToolUse` path fence was built and then
+removed on that reasoning: a fence that only stops honest mistakes duplicates
+guidance the system prompt already carries, and one meant to stop an
+adversarial model could be circumvented anyway — it can only match literal
+command text, so a path assembled from shell variables or encoded walks
+through. This is a harness, not a safety net.
 
-Set `hooks.fence.required: true` to refuse to start a run when the fence is
-installed but not actually enforcing — checked by exercising it, not by
-reading config, since a shim can point at a moved checkout or lose its
-execute bit.
+If you need real isolation, that is a container boundary — a deployment
+decision, not a hook.
+
+So: `envelope` helps a cooperating agent satisfy the harness's own output
+contract, and `compaction` records something otherwise invisible. Neither
+polices, and `--verify` is a smoke check rather than a gate: both hooks are
+non-blocking, so a broken one costs an unenforced nudge or a missing log
+line, not a wrong run.
+
+**The envelope hook only acts inside a long-exposure agent turn.** Your own
+interactive sessions with either CLI are untouched — the harness sets an env
+var when it spawns an agent, and the hook checks for it. Without that gate it
+nudged unrelated turns into inventing output blocks they were never asked
+for.
 
 ---
 

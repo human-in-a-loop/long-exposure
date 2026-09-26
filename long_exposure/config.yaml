@@ -236,41 +236,32 @@ model_profiles:
 # Claude Code and Codex are wire-compatible for the eleven lifecycle events
 # they share, so ONE script per concern serves both; only the config file
 # that points at it differs. Gemini CLI renames the events (BeforeTool /
-# AfterTool) and lacks four of them, so hooks it cannot fire are skipped.
+# AfterTool) and lacks several, so hooks it cannot fire are skipped.
 #
 # Install them with:  long-exposure hooks-install [--target claude|codex|all]
 # Nothing here installs anything — this block only says how the harness
 # should behave once they are installed.
 #
-# The rule these obey: a hook may HARDEN a rule the prompt already states,
-# never be the only place a rule exists. Gemini lacks events, Claude has
-# --bare, and Codex requires operator review of non-managed hooks, so a
+# NOTE ON SCOPE: these hooks are for CORRECTNESS and OBSERVABILITY, not
+# enforcement. Long-exposure treats the model as a faithful collaborator, so
+# it deliberately has no enforcement layer: a fence that only stops mistakes
+# adds machinery the prompt already covers, and one meant to stop an
+# adversarial model could be circumvented anyway. This is a harness, not a
+# safety net. Real isolation, if you need it, is a container boundary — a
+# deployment decision, not a hook.
+#
+# The rule the hooks still obey: a hook may HARDEN a rule the prompt already
+# states, never be the only place a rule exists. Gemini lacks events, Claude
+# has --bare, and Codex requires operator review of non-managed hooks, so a
 # behaviour living only in a hook would silently vanish somewhere.
 hooks:
-  # PreToolUse. Turns the operating protocol's "off limits" paths from prose
-  # into a denial — including the harness's own source tree, which is on
-  # every agent's PYTHONPATH and therefore writable from Bash.
-  #
-  # THREAT MODEL: this stops mistakes, not adversaries. It matches paths
-  # against the literal command text, so a path built from shell variables
-  # or encoded would pass. Real isolation is a container boundary.
-  fence:
-    # turn   — enforce only inside a long-exposure agent turn (default).
-    # always — enforce on every invocation of that CLI, including your own
-    #          interactive sessions. Note `always` denies YOU access to the
-    #          harness source tree, which is where you develop it.
-    scope: turn
-    # true  — refuse to start a run when the fence is installed but not
-    #         responding (verified by exercising it, not by reading config).
-    #         An unattended run with pre-granted tools and no fence is
-    #         exactly what the fence exists for.
-    # false — warn and continue.
-    required: false
   # Stop. Checks the final message carries a complete [OUTPUT: x] block and,
   # if not, returns decision:block — which means "continue the turn" on both
   # Claude and Codex — so the agent re-emits it. Prevention for the bug class
   # in docs/gaps.md where a reporter's trailing cover note was captured
-  # instead of the report body. Capped at max_nudges to avoid a loop.
+  # instead of the report body. A correctness hook: it helps a cooperating
+  # model satisfy the harness's own output contract. Capped at max_nudges so
+  # a strict hook and a stubborn turn cannot loop.
   envelope:
     enabled: true
     max_nudges: 1

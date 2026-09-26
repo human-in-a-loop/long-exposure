@@ -443,7 +443,7 @@ def _hooks_install(args: argparse.Namespace) -> int:
         _hooks.VENDORS if args.target == "all" else (args.target,)
     )
     directory = Path(args.directory).expanduser() if args.directory else None
-    hooks = tuple(args.hooks) if args.hooks else ("fence", "envelope", "compaction")
+    hooks = tuple(args.hooks) if args.hooks else tuple(_hooks.HOOK_EVENTS)
 
     if args.uninstall:
         for vendor in targets:
@@ -457,10 +457,13 @@ def _hooks_install(args: argparse.Namespace) -> int:
     if args.verify:
         rc = 0
         for vendor in targets:
-            ok, detail = _hooks.verify_fence(vendor, directory)
-            print(f"[hooks] {vendor}: {'OK' if ok else 'FAILED'} — {detail}")
-            if not ok:
-                rc = 1
+            for hook in hooks:
+                if not _hooks.HOOK_EVENTS.get(hook, {}).get(vendor):
+                    continue
+                ok, detail = _hooks.verify(vendor, hook, directory)
+                print(f"[hooks] {vendor}: {'OK' if ok else 'FAILED'} — {detail}")
+                if not ok:
+                    rc = 1
         return rc
 
     for vendor in targets:
@@ -468,15 +471,15 @@ def _hooks_install(args: argparse.Namespace) -> int:
         print(_hooks.render_summary(res))
         if args.dry_run:
             print("  (dry run — nothing written)")
-    if not args.dry_run and "fence" in hooks:
+    if not args.dry_run:
         for vendor in targets:
-            if not _hooks.HOOK_EVENTS["fence"].get(vendor):
-                continue
-            ok, detail = _hooks.verify_fence(vendor, directory)
-            print(f"[hooks] {vendor} fence self-test: "
-                  f"{'OK' if ok else 'FAILED'} — {detail}")
-            if not ok:
-                return 1
+            for hook in hooks:
+                if not _hooks.HOOK_EVENTS.get(hook, {}).get(vendor):
+                    continue
+                ok, detail = _hooks.verify(vendor, hook, directory)
+                if not ok:
+                    print(f"[hooks] {vendor}: FAILED — {detail}")
+                    return 1
     return 0
 
 
@@ -599,8 +602,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_hooks.add_argument("--uninstall", action="store_true",
                          help="Remove only long-exposure's hook entries and shims")
     p_hooks.add_argument("--verify", action="store_true",
-                         help="Exercise the installed fence and report whether "
-                              "it actually denies (exit 1 if not)")
+                         help="Run each installed shim and report whether it "
+                              "works (exit 1 if not). A smoke check: both "
+                              "hooks are non-blocking, so a broken one costs "
+                              "a nudge or a log line, not a run")
 
     p_telem = sub.add_parser("telemetry", help="Telemetry utilities")
     telem_sub = p_telem.add_subparsers(dest="telemetry_command", required=True)
