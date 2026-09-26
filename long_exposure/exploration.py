@@ -3705,6 +3705,13 @@ def run_exploration(
     global _current_loop_cfg, _current_run_config
     _current_loop_cfg = loop_cfg
     _current_run_config = config
+
+    # Bind the operator name to this process before anything appends to the
+    # ledger. `append_ledger_event` resolves identity from the environment, so
+    # without this `federation.operator` in config applies only to agent
+    # subprocesses and the harness's own events carry the hostname instead —
+    # one machine writing under two names. A clone's inherited value wins.
+    _operator = _federation.bind(config)
     max_cycles = loop_cfg.get("max_cycles")
     base_cooldown = loop_cfg.get("cycle_cooldown_seconds", 0)
     fanout_enabled = _fanout_enabled(loop_cfg)

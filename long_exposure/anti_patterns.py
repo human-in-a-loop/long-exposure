@@ -20,16 +20,14 @@ def _safe_read(ledger_path: Path) -> list[dict]:
         lines = ledger_path.read_text().splitlines()
     except OSError:
         return []
+    # Shares workspace_bootstrap.decode_line so a union-merge weld recovers
+    # here too; an anti-pattern warning is exactly what must not go missing.
+    from long_exposure.workspace_bootstrap import decode_line
+
     for raw in lines:
-        line = raw.strip()
-        if not line:
+        if not raw.strip():
             continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            events.append(value)
+        events.extend(decode_line(raw))
     return events
 
 

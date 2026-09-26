@@ -69,10 +69,54 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from xml.sax.saxutils import escape as _xml_escape
+
 from long_exposure import federation as _federation
 
-# A cycle boundary is not a place to hang. Fetch gets the configured budget;
-# the local-only commands are fast and get a fixed short one.
+def _rejects_as_option(value: str) -> bool:
+    """True if this value would be read by git as an option rather than a name.
+
+    `remote` and `shared_branch` are interpolated into git argv, and git parses
+    a leading `-` as an option wherever it appears — including in the refspec
+    slot. Found live: `git fetch --quiet origin "--upload-pack=touch /tmp/x"`
+    executes `touch /tmp/x`. The value comes from config, so an operator who
+    sets it could already run anything on their own machine, which keeps the
+    severity low; it is fixed anyway because the field is *documented as a
+    branch name*, looks inert, and is the kind of value a federation would
+    later template from a run_id or an operator name.
+
+    Validated here, once, rather than per call site: both values reach four
+    different git invocations. An empty value never arrives — `scan` defaults
+    it to `origin` / `main` first, which is what a blank setting means — so
+    this only has to answer the option-shaped question.
+    """
+    return str(value or "").startswith("-")
+
+
+# Paths in the block come from ANOTHER operator's repository, so they are
+# untrusted text on its way into a prompt. Escaped the same way
+# `anti_patterns.build_block` escapes ledger narratives — this is house style,
+# not a new safety layer. Found live: a real file can be named
+# `data/</shared_branch_overlap>.py`, whose path string contains the block's own
+# closing tag and ends it early, so everything after it escapes the block.
+_CONTROL = {c: " " for c in range(0x20)}
+_CONTROL[0x7F] = " "
+
+
+def _safe_path(path: str, limit: int = 200) -> str:
+    """One line, XML-escaped, bounded. Never structural."""
+    text = str(path or "").translate(_CONTROL)
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return _xml_escape(text)
+
+
+# A cycle boundary is not a place to hang. The local commands are fast, so this
+# is a ceiling rather than a budget — but `timeout_seconds` LOWERS it too, so
+# configuring a tight budget tightens the whole scan and not just the fetch.
+# An adversarial rig with a `git` that slept 60s and `timeout_seconds: 2` cost
+# 20s here, because the knob only covered fetch while up to six local calls
+# each waited the fixed ceiling. `scan` now passes min(ceiling, configured).
 LOCAL_TIMEOUT = 20
 
 # `git status --porcelain` on a huge dirty tree is the one local command that
@@ -128,17 +172,18 @@ def _git(args: list[str], cwd: Path, timeout: int = LOCAL_TIMEOUT
         return 127, "", repr(exc)
 
 
-def _is_repo(workspace: Path) -> bool:
-    code, out, _ = _git(["rev-parse", "--is-inside-work-tree"], workspace)
+def _is_repo(workspace: Path, timeout: int = LOCAL_TIMEOUT) -> bool:
+    code, out, _ = _git(["rev-parse", "--is-inside-work-tree"], workspace, timeout)
     return code == 0 and out.strip() == "true"
 
 
-def _resolve(ref: str, workspace: Path) -> str:
-    code, out, _ = _git(["rev-parse", "--verify", "--quiet", ref], workspace)
+def _resolve(ref: str, workspace: Path, timeout: int = LOCAL_TIMEOUT) -> str:
+    code, out, _ = _git(["rev-parse", "--verify", "--quiet", ref], workspace, timeout)
     return out.strip() if code == 0 else ""
 
 
-def _dirty_paths(workspace: Path) -> tuple[set[str], bool]:
+def _dirty_paths(workspace: Path, timeout: int = LOCAL_TIMEOUT
+                 ) -> tuple[set[str], bool]:
     """Workspace-relative paths that are modified, staged or untracked.
 
     `--porcelain=v1 -z` so a path with a space or a quote is one record and
@@ -146,7 +191,8 @@ def _dirty_paths(workspace: Path) -> tuple[set[str], bool]:
     touched.
     """
     code, out, _ = _git(
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all"], workspace
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"], workspace,
+        timeout,
     )
     if code != 0:
         return set(), False
@@ -177,16 +223,29 @@ def scan(workspace: Path, config: dict | None = None) -> Radar:
     remote-tracking refs and no working file.
     """
     cfg = _federation.settings(config).get("conflict_radar") or {}
-    remote = str(cfg.get("remote") or "origin").strip()
-    branch = str(cfg.get("shared_branch") or "main").strip()
+    # Strip BEFORE defaulting. `"   "` is truthy, so `x or "main"` keeps it and
+    # `.strip()` then yields an empty ref name, which fails as "no such ref"
+    # instead of quietly taking the default a blank setting clearly means.
+    remote = str(cfg.get("remote") or "").strip() or "origin"
+    branch = str(cfg.get("shared_branch") or "").strip() or "main"
     timeout = _positive_int(cfg.get("timeout_seconds"), 30)
     max_paths = _positive_int(cfg.get("max_paths"), 20)
     want_fetch = bool(cfg.get("fetch", True))
+    # Every local call gets at most the configured budget, so a tight
+    # `timeout_seconds` bounds the whole scan rather than the fetch alone.
+    local = min(LOCAL_TIMEOUT, timeout)
+
+    for label, value in (("remote", remote), ("shared_branch", branch)):
+        if _rejects_as_option(value):
+            return Radar(
+                reason=f"federation.conflict_radar.{label} is empty or starts "
+                       f"with '-', which git would read as an option: {value!r}"
+            )
 
     workspace = Path(workspace)
     if not workspace.is_dir():
         return Radar(reason=f"workspace is not a directory: {workspace}")
-    if not _is_repo(workspace):
+    if not _is_repo(workspace, local):
         return Radar(reason="workspace is not a git repository")
 
     radar = Radar()
@@ -204,7 +263,7 @@ def scan(workspace: Path, config: dict | None = None) -> Radar:
     shared_ref = ""
     for candidate in (f"{remote}/{branch}", f"refs/remotes/{remote}/{branch}",
                       branch):
-        if _resolve(candidate, workspace):
+        if _resolve(candidate, workspace, local):
             shared_ref = candidate
             break
     if not shared_ref:
@@ -214,13 +273,13 @@ def scan(workspace: Path, config: dict | None = None) -> Radar:
         )
     radar.shared_ref = shared_ref
 
-    head = _resolve("HEAD", workspace)
+    head = _resolve("HEAD", workspace, local)
     if not head:
         return Radar(reason="HEAD does not resolve (empty repository?)",
                      shared_ref=shared_ref, fetched=radar.fetched,
                      stale=radar.stale)
 
-    code, base_out, _ = _git(["merge-base", "HEAD", shared_ref], workspace)
+    code, base_out, _ = _git(["merge-base", "HEAD", shared_ref], workspace, local)
     base = base_out.strip() if code == 0 else ""
     if not base:
         # Unrelated histories. Nothing meaningful to diff against.
@@ -231,7 +290,7 @@ def scan(workspace: Path, config: dict | None = None) -> Radar:
     # --- signal 1: would the committed state conflict? ---
     code, out, _ = _git(
         ["merge-tree", "--write-tree", "--name-only", "HEAD", shared_ref],
-        workspace,
+        workspace, local,
     )
     if code not in (0, 1):
         # merge-tree needs git >= 2.38 for --write-tree. Older git exits with
@@ -242,12 +301,20 @@ def scan(workspace: Path, config: dict | None = None) -> Radar:
         radar.merge_tree_conflicts = _conflict_paths(out)
 
     # --- signal 2: has the shared branch moved under uncommitted work? ---
+    #
+    # `-z` is load-bearing, not tidiness. Without it `git diff --name-only`
+    # C-QUOTES any path with a non-ASCII or special character
+    # (`"data/h\303\251llo.py"`) while `git status -z` reports the raw bytes,
+    # so the two sets spell the same path differently and the intersection is
+    # empty. The radar then reported NO overlap on exactly the paths most
+    # likely to be interesting — a silent false negative, found by an
+    # adversarial rig because every test here had used ASCII names.
     code, diff_out, _ = _git(
-        ["diff", "--name-only", f"{base}..{shared_ref}"], workspace
+        ["diff", "--name-only", "-z", f"{base}..{shared_ref}"], workspace, local
     )
-    remote_changed = {p for p in diff_out.splitlines() if p.strip()} if code == 0 else set()
+    remote_changed = {p for p in diff_out.split("\0") if p.strip()} if code == 0 else set()
     radar.remote_changed = len(remote_changed)
-    dirty, truncated = _dirty_paths(workspace)
+    dirty, truncated = _dirty_paths(workspace, local)
     radar.truncated = truncated
     radar.dirty_overlap = sorted(remote_changed & dirty)[:max_paths]
     radar.merge_tree_conflicts = radar.merge_tree_conflicts[:max_paths]
@@ -302,9 +369,9 @@ def build_block(workspace: Path, config: dict | None = None) -> str | None:
     lines = [
         "<shared_branch_overlap>",
         "  Another operator has changed work you are also touching. This is a",
-        f"  FORECAST against {radar.shared_ref}, not an error, and nothing is",
-        "  blocked. Treat it as a reason to choose differently this cycle, or",
-        "  to reconcile deliberately rather than at merge time.",
+        f"  FORECAST against {_safe_path(radar.shared_ref)}, not an error, and",
+        "  nothing is blocked. Treat it as a reason to choose differently this",
+        "  cycle, or to reconcile deliberately rather than at merge time.",
     ]
     if radar.stale:
         lines.append(
@@ -312,16 +379,16 @@ def build_block(workspace: Path, config: dict | None = None) -> str | None:
             "refs that may be out of date."
         )
     if radar.slices():
-        lines.append(f"  regions: {', '.join(radar.slices())}")
+        lines.append(f"  regions: {', '.join(_safe_path(s) for s in radar.slices())}")
     if radar.dirty_overlap:
         lines.append(
             "  the shared branch changed these, and you have uncommitted "
             "changes in them:"
         )
-        lines += [f"    {p}" for p in radar.dirty_overlap]
+        lines += [f"    {_safe_path(p)}" for p in radar.dirty_overlap]
     if radar.merge_tree_conflicts:
         lines.append("  a merge of committed state would conflict in:")
-        lines += [f"    {p}" for p in radar.merge_tree_conflicts]
+        lines += [f"    {_safe_path(p)}" for p in radar.merge_tree_conflicts]
     if radar.truncated:
         lines.append(
             "  (the working tree has more changes than were scanned; this "

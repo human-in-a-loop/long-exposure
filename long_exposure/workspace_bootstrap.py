@@ -152,6 +152,16 @@ def append_ledger_event(workspace: Path, event: dict) -> None:
         pass
     ledger = resolve_ledger_path(workspace)
     line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+    # NOTE: deliberately a single unconditional write, with no inspection of
+    # the file first. An earlier version read the last byte and prepended a
+    # newline when one was missing, to stop a newline-less file welding two
+    # JSON objects onto one line. That was wrong twice over: read-then-write is
+    # not atomic, so under concurrent appends it produced a spurious blank line
+    # in ~5% of 40-thread trials; and the weld case it targeted is produced by
+    # `merge=union`, where GIT does the concatenation, so no writer-side check
+    # could prevent it anyway. A weld is recovered at read time instead — see
+    # `_read_ledger`.
+    #
     # O_APPEND ensures the kernel performs the seek+write atomically per call.
     fd = os.open(ledger, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
@@ -283,23 +293,61 @@ def bootstrap_workspace(
 # ---------------------------------------------------------------------------
 
 
+_DECODER = json.JSONDecoder()
+
+
+def decode_line(line: str) -> list[dict]:
+    """Every JSON object on one physical line. Usually exactly one.
+
+    A line can carry more than one because `promise_ledger.jsonl` is declared
+    `merge=union` in a federated repo (`docs/git-federation.md` §5.1). Union
+    merge concatenates both sides' added hunks, and if either side's file does
+    not end in a newline — a hand edit, a truncated write, a tool that trims
+    trailing whitespace — the join lands mid-line and two events share one:
+
+        {"event_id":"a",...}{"event_id":"b",...}
+
+    Treating that as one malformed line loses BOTH events, and losing a
+    validated finding silently is the failure this whole area exists to avoid.
+    `raw_decode` walks the line instead, so both are recovered.
+
+    Fixing it here rather than in the writer is deliberate. The writer cannot
+    prevent this — git performs the concatenation, not us — and an earlier
+    attempt to have the writer check for a trailing newline introduced a race:
+    read-then-write is not atomic, and concurrent appends produced a spurious
+    blank line in ~5% of 40-thread trials.
+
+    Never raises. Trailing junk stops the walk and keeps whatever was decoded.
+    """
+    events: list[dict] = []
+    text = (line or "").strip()
+    index = 0
+    length = len(text)
+    while index < length:
+        try:
+            value, end = _DECODER.raw_decode(text, index)
+        except ValueError:
+            break
+        if isinstance(value, dict):
+            events.append(value)
+        if end <= index:          # no forward progress; refuse to spin
+            break
+        index = end
+        while index < length and text[index] in " \t":
+            index += 1
+    return events
+
+
 def _read_ledger(ledger_path: Path) -> list[dict]:
     """Tolerant JSONL reader. Skips malformed lines silently — promise_check
     is responsible for surfacing parse errors; this reader must not crash
-    the cycle loop."""
+    the cycle loop. Recovers welded lines via `decode_line`."""
     if not ledger_path.exists():
         return []
     events: list[dict] = []
     for raw in ledger_path.read_text().splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-            if isinstance(ev, dict):
-                events.append(ev)
-        except json.JSONDecodeError:
-            continue
+        if raw.strip():
+            events.extend(decode_line(raw))
     return events
 
 

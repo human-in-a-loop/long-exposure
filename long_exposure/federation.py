@@ -103,6 +103,24 @@ def slugify(text: str, *, max_len: int = MAX_NAME) -> str:
     return cleaned[:max_len].strip("-._")
 
 
+def _from_config(config: dict | None = None) -> str:
+    """Resolve an operator name WITHOUT consulting the environment.
+
+    Split out so `bind` can re-resolve. `operator_name` prefers the env var, so
+    a re-bind that went through it would just read back the value it set last
+    time and no config change would ever take effect.
+    """
+    name = slugify((settings(config) or {}).get("operator", ""))
+    if name:
+        return name
+    try:
+        host = socket.gethostname()
+    except OSError:
+        host = ""
+    # A FQDN's first label is the machine; the domain is noise in a branch name.
+    return slugify(host.split(".")[0]) or FALLBACK_OPERATOR
+
+
 def operator_name(config: dict | None = None) -> str:
     """This machine's operator name.
 
@@ -115,19 +133,64 @@ def operator_name(config: dict | None = None) -> str:
     — with no identity at all. Deriving it means federation works before
     anyone edits a config file.
     """
-    for candidate in (
-        os.environ.get(ENV_OPERATOR, ""),
-        (settings(config) or {}).get("operator", ""),
-    ):
-        name = slugify(candidate)
-        if name:
-            return name
-    try:
-        host = socket.gethostname()
-    except OSError:
-        host = ""
-    # A FQDN's first label is the machine; the domain is noise in a branch name.
-    return slugify(host.split(".")[0]) or FALLBACK_OPERATOR
+    from_env = slugify(os.environ.get(ENV_OPERATOR, ""))
+    return from_env or _from_config(config)
+
+
+def bind(config: dict | None = None) -> str:
+    """Resolve the operator once per run and put it in the process environment.
+
+    Without this, `federation.operator` in config is silently ignored by every
+    append the harness makes itself. `append_ledger_event` takes no config — it
+    is called from the cycle loop, the manager, the bootstrap event and an
+    agent-run tool, and threading config to all four would be a worse change —
+    so it resolves through `operator_name(None)`, which sees only the
+    environment and the hostname.
+
+    The effect, found by a two-operator end-to-end rig rather than by reading:
+    with `operator: alice` in config on a host named `vm`, the bootstrap event
+    was stamped `vm` while agent-written events were stamped `alice`. One
+    machine wrote under two operator names and every shared milestone looked
+    contested between an operator and themselves — the exact failure
+    `orchestrator._add_federation_env` was added to prevent, arriving by
+    another door.
+
+    A name INHERITED from a parent process wins and is left alone. That is what
+    makes a fan-out clone keep its root's identity: the clone is a separate
+    process that receives the variable through its spawn environment, and its
+    own config load must not relabel its events.
+
+    A name this process set itself on an earlier `bind` does NOT win, and the
+    distinction matters. `bind` mutates the process environment, so without it
+    an embedder that calls `run_exploration` twice — a REPL, the benchmark
+    adapter, a test session — would silently give the second run the first
+    run's operator. Found by the full test suite, where one run_exploration
+    test leaked its operator into every later test in the session.
+    """
+    inherited = slugify(os.environ.get(ENV_OPERATOR, ""))
+    if inherited and not _BOUND_HERE:
+        return inherited
+    name = _from_config(config)
+    _set_bound(name)
+    return name
+
+
+# True once `bind` has written the env var in THIS process. Distinguishes "a
+# parent told us who we are" from "we decided earlier and may decide again".
+_BOUND_HERE = False
+
+
+def _set_bound(name: str) -> None:
+    global _BOUND_HERE
+    os.environ[ENV_OPERATOR] = name
+    _BOUND_HERE = True
+
+
+def _reset_binding() -> None:
+    """Test hook: forget that this process bound an operator."""
+    global _BOUND_HERE
+    _BOUND_HERE = False
+    os.environ.pop(ENV_OPERATOR, None)
 
 
 def event_operator(event: dict, local: str) -> str:

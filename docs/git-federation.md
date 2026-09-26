@@ -255,6 +255,27 @@ unreachable remote. The last one is the interesting case: it still forecasts,
 from whatever refs are local, and marks the block stale — yesterday's refs beat
 nothing.
 
+**What adversarial testing changed.** Two toy rigs — a two-operator
+end-to-end loop with real git and real cycles, and an adversarial battery —
+found five defects that the unit tests had all passed. They are worth listing
+because four of the five were invisible from the code:
+
+| Defect | Why the unit tests missed it |
+|---|---|
+| **Split identity.** `federation.operator` in config was ignored by every in-process append, so one machine wrote under two names — hostname for harness events, config value for agent events — and every shared milestone looked contested between an operator and themselves | The identity fix was correct in isolation and wrong in assembly. Only running two real operators showed it |
+| **Prompt-block escape via a filename.** A real file can be named `data/</shared_branch_overlap>.py`, whose path contains this block's own closing tag; interpolated raw, it ended the block early | No test used a hostile filename, and *another operator* chooses them |
+| **Silent false negative on non-ASCII paths.** `git diff --name-only` C-quotes `"data/h\303\251llo.py"` while `git status -z` gives raw bytes, so the intersection was empty and the radar reported NO overlap | Every existing test used ASCII names. A forecast that silently says "clear" is the worst failure this tool has |
+| **argv injection.** `shared_branch` reaches `git fetch` argv and git parses a leading `-` as an option anywhere — `--upload-pack=touch /tmp/x` executes, verified live | Config values were trusted because an operator who edits config can already run anything. True, but the field is *documented as a branch name* |
+| **`timeout_seconds` bounded only the fetch**, so a hanging git cost 20s per local call rather than the configured budget | The config comment claimed "a cycle boundary must not hang"; nothing checked it |
+
+Plus one defect introduced *by* a fix and caught by the same rigs: the
+writer-side newline check described in §5.1.
+
+All five are pinned in `tests/test_federation_adversarial.py`, with the
+threat model stated there — **not** an adversarial model, which the harness
+explicitly does not defend against, but another operator controlling
+filenames, branch contents and ledger bytes that cross into your prompt.
+
 **Read-only is tested, not asserted.** One test snapshots HEAD, the current
 branch, `git status`, the stash list and two file bodies, runs a full scan, and
 compares. `fetch` is the only side effect and `fetch: false` removes it. A
@@ -289,9 +310,20 @@ Union merge concatenates both sides' added hunks instead of conflicting. For
 this file that is not a convenient approximation, it is *right*, and three
 properties of the existing code are why:
 
-- **Every line is newline-terminated.** `append_ledger_event` writes
-  `json.dumps(event, ...) + "\n"`, so a union merge can never join two JSON
-  objects into one unparseable line.
+- **A weld is recovered, not prevented.** `append_ledger_event` writes
+  `json.dumps(event, ...) + "\n"`, so every line *the harness writes* is
+  newline-terminated. That is not sufficient, and an earlier version of this
+  section wrongly said it was: if either side of a union merge lacks a trailing
+  newline — a hand edit, a truncated write, a tool that trims trailing
+  whitespace — the join lands mid-line and two events share one physical line.
+  `workspace_bootstrap.decode_line` walks the line with `raw_decode` and
+  recovers both, and `summarize_ledger` and `anti_patterns` both use it.
+
+  Recovery belongs in the reader because **git** performs the concatenation,
+  so no writer-side check can prevent it. A writer-side check was tried first
+  and removed: read-then-write is not atomic, and it produced a spurious blank
+  line in ~5% of 40-thread append trials. Fixing the wrong side and adding a
+  race is a fair summary of that attempt.
 - **`event_id` is a UUID4** (`exploration.py:3034`, `manager.py:481`), so it
   is unique across machines with no coordination. Duplicate lines dedupe;
   distinct lines cannot collide.

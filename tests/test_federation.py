@@ -111,10 +111,29 @@ class StampTests(unittest.TestCase):
         from long_exposure.orchestrator import _add_federation_env
 
         config = {"federation": {"operator": "alice"}}
+        fed._reset_binding()
         env = {}
         _add_federation_env(env, config)
+        self.assertEqual(env[fed.ENV_OPERATOR], "alice")
         with mock.patch.dict(os.environ, env):
             self.assertEqual(fed.operator_name(None), "alice")
+
+    def test_a_second_run_in_one_process_does_not_inherit_the_first(self):
+        """`bind` mutates the process environment, so an embedder that calls
+        run_exploration twice must not give run B run A's operator. Found by
+        the full suite leaking one test's operator into every later test."""
+        fed._reset_binding()
+        self.assertEqual(fed.bind({"federation": {"operator": "alice"}}), "alice")
+        self.assertEqual(fed.bind({"federation": {"operator": "bob"}}), "bob")
+
+    def test_an_inherited_name_survives_repeated_binds(self):
+        """A clone never bound its own name, so the root's value keeps winning
+        however many times the clone's config is loaded."""
+        fed._reset_binding()
+        os.environ[fed.ENV_OPERATOR] = "root-op"
+        for _ in range(3):
+            self.assertEqual(fed.bind({"federation": {"operator": "bob"}}),
+                             "root-op")
 
 
 class ContradictionVisibilityTests(unittest.TestCase):
