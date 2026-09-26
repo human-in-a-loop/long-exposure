@@ -115,13 +115,17 @@ class UnionMergeSafetyTests(unittest.TestCase):
 
 
 class IdentityGapTests(unittest.TestCase):
-    """§7.1: the gap the walkthrough says to close before writing git code.
+    """§7.1: CLOSED. `operator` is stamped and readers key on it.
 
-    These assert the gap is still OPEN. Closing it should break them, and the
-    fix is to update §7.1 at the same time.
+    The behavioural tests live in `tests/test_federation.py`; these two pin
+    the parts of §7.1 the walkthrough still describes as-is.
     """
 
-    def test_run_id_carries_no_operator_and_no_randomness(self):
+    def test_run_id_still_carries_no_operator_and_no_randomness(self):
+        """Deliberately unchanged. §7.1 lists three symptoms of one cause,
+        and the fix was the `operator` field, not a new run_id format —
+        changing run_id would invalidate the registry, the state file and
+        every telemetry row for no additional benefit."""
         from long_exposure import workspace_bootstrap as wb
 
         rid = wb.derive_run_id()
@@ -129,7 +133,7 @@ class IdentityGapTests(unittest.TestCase):
         self.assertEqual(rid, wb.derive_run_id(),
                          "two runs in the same second share a run_id")
 
-    def test_ledger_events_carry_no_operator_field(self):
+    def test_ledger_events_now_carry_an_operator(self):
         from long_exposure import workspace_bootstrap as wb
         import tempfile
 
@@ -137,7 +141,23 @@ class IdentityGapTests(unittest.TestCase):
             ws = Path(d)
             wb.emit_run_start_event(ws, "run-x", "a directive")
             row = json.loads((ws / "promise_ledger.jsonl").read_text().strip())
-        self.assertNotIn("operator", row)
+        self.assertTrue(row.get("operator"))
+
+    def test_milestone_id_was_not_prefixed(self):
+        """§7.1 proposed `<operator>/<milestone>`; implementing it showed why
+        a separate field is right. RESERVED_NAMESPACES matches milestone
+        PREFIXES, which an operator segment would defeat."""
+        from long_exposure.tools.promise_check import RESERVED_NAMESPACES
+        from long_exposure import workspace_bootstrap as wb
+        import tempfile
+
+        self.assertIn("_run/", RESERVED_NAMESPACES)
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            wb.emit_run_start_event(ws, "run-x", "a directive")
+            row = json.loads((ws / "promise_ledger.jsonl").read_text().strip())
+        self.assertEqual(row["milestone_id"], "_run/start")
+        self.assertTrue(row["milestone_id"].startswith(RESERVED_NAMESPACES))
 
     def test_a_settled_milestone_from_one_operator_hides_the_others(self):
         """The §7.1 collision, in the shape that actually loses information.

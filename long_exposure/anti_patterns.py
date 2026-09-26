@@ -34,16 +34,27 @@ def _safe_read(ledger_path: Path) -> list[dict]:
 
 
 def _select(events: list[dict], max_entries: int = MAX_ENTRIES) -> list[dict]:
-    by_mid: dict[str, list[dict]] = {}
+    # Keyed on (operator, milestone_id), not milestone_id alone. This reader
+    # surfaces a milestone whose LATEST event is `invalidated`, so with a
+    # milestone-only key a second operator's later non-invalidated event on
+    # the same milestone silently stopped the anti-pattern being surfaced —
+    # the same masking defect measured for summarize_ledger
+    # (git-federation.md §7.1). A missing operator reads as the local one, so
+    # a single-operator ledger selects exactly as it did before.
+    from long_exposure import federation as _federation
+
+    local_operator = _federation.operator_name()
+    by_key: dict[tuple[str, str], list[dict]] = {}
     for event in events:
         mid = event.get("milestone_id")
         if mid:
-            by_mid.setdefault(str(mid), []).append(event)
-    for rows in by_mid.values():
+            key = (_federation.event_operator(event, local_operator), str(mid))
+            by_key.setdefault(key, []).append(event)
+    for rows in by_key.values():
         rows.sort(key=lambda event: str(event.get("ts") or ""))
 
     selected: list[dict] = []
-    for rows in by_mid.values():
+    for rows in by_key.values():
         latest = rows[-1]
         if latest.get("status") != "invalidated":
             continue

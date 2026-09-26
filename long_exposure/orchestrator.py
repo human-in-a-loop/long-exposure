@@ -3421,6 +3421,27 @@ def _add_repo_to_pythonpath(env: dict) -> None:
         env["PYTHONPATH"] = os.pathsep.join([repo_root, *parts])
 
 
+def _add_federation_env(env: dict, config: dict | None = None) -> None:
+    """Pass the resolved operator name down to agent-spawned subprocesses.
+
+    Agents append ledger events by running `python -m
+    long_exposure.tools.ledger_append` under Bash. That subprocess resolves
+    the operator independently, and without this it would fall back to the
+    hostname while the harness used `federation.operator` from config — so
+    one machine would write events under two operator names and every shared
+    milestone would look contested. Resolving once here and exporting it
+    keeps both sides in agreement.
+
+    The agent is never told to set or read this; it is ambient.
+    """
+    try:
+        from long_exposure import federation as _federation
+
+        env[_federation.ENV_OPERATOR] = _federation.operator_name(config)
+    except Exception:
+        pass
+
+
 # Env vars the vendor hooks read. Set on every agent turn the harness
 # spawns, so a hook can tell a harness turn from an operator's own session.
 # See long_exposure/hooks/__init__.py for why that distinction matters.
@@ -3615,6 +3636,7 @@ def _invoke_claude(
     env = (env_base if env_base is not None else os.environ).copy()
     env.pop("CLAUDECODE", None)
     _add_repo_to_pythonpath(env)
+    _add_federation_env(env, config)
     _add_hook_env(
         env,
         config,

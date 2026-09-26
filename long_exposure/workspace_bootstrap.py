@@ -134,7 +134,22 @@ def append_ledger_event(workspace: Path, event: dict) -> None:
     JSONL appends are mostly atomic at the OS level for small lines (POSIX
     O_APPEND + a single write() under PIPE_BUF); shadow ledgers eliminate
     the small-line contention boundary entirely.
+
+    Stamps `operator` when the event does not already carry one. This is the
+    single chokepoint every ledger writer goes through — the cycle loop, the
+    manager, the bootstrap event and the agent-facing `ledger_append` tool —
+    which is why identity is added here rather than at each call site, and
+    why agents never have to know or supply it. See `federation` for the
+    measured defect this closes (git-federation.md §7.1).
     """
+    try:
+        from long_exposure import federation as _federation
+
+        _federation.stamp(event)
+    except Exception:
+        # Identity is useful, not load-bearing. A ledger event that records
+        # the research must never be lost because stamping it failed.
+        pass
     ledger = resolve_ledger_path(workspace)
     line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
     # O_APPEND ensures the kernel performs the seek+write atomically per call.
@@ -305,17 +320,39 @@ def summarize_ledger(workspace: Path, max_chars: int = 32_000) -> str:
     if not events:
         return "[promise_ledger.jsonl is empty or absent]"
 
-    # Group by milestone, sort each group by ts.
-    by_mid: dict[str, list[dict]] = {}
+    # Group by (operator, milestone), sort each group by ts.
+    #
+    # The operator is part of the key because two operators federating over
+    # one repository reach the same milestone independently, and keying on
+    # milestone_id alone made the later event HIDE the earlier one — a
+    # contradicting result vanished from the summary rather than being
+    # flagged (git-federation.md §7.1, measured). A missing `operator` reads
+    # as the local one, so a single-operator ledger — including every ledger
+    # written before this field existed — groups exactly as it did before.
+    from long_exposure import federation as _federation
+
+    local_operator = _federation.operator_name()
+    by_key: dict[tuple[str, str], list[dict]] = {}
     for ev in events:
-        by_mid.setdefault(ev.get("milestone_id") or "_unknown", []).append(ev)
-    for evs in by_mid.values():
+        key = (
+            _federation.event_operator(ev, local_operator),
+            ev.get("milestone_id") or "_unknown",
+        )
+        by_key.setdefault(key, []).append(ev)
+    for evs in by_key.values():
         evs.sort(key=lambda e: e.get("ts", ""))
+
+    # Only name operators when there is genuinely more than one. A
+    # single-operator run keeps byte-identical summary text, which matters
+    # because this string is injected into the prompt.
+    operators = sorted({op for op, _ in by_key})
+    show_operator = len(operators) > 1
+    distinct_milestones = len({mid for _, mid in by_key})
 
     selected: list[dict] = []
     seen_event_ids: set[str] = set()
 
-    for mid, evs in by_mid.items():
+    for evs in by_key.values():
         latest = evs[-1]
         if latest.get("event_id") and latest["event_id"] not in seen_event_ids:
             selected.append(latest)
@@ -336,14 +373,25 @@ def summarize_ledger(workspace: Path, max_chars: int = 32_000) -> str:
             seen_event_ids.add(eid)
 
     # Sort the final set chronologically.
-    selected.sort(key=lambda e: (e.get("ts", ""), e.get("milestone_id", "")))
+    selected.sort(key=lambda e: (
+        e.get("ts", ""),
+        e.get("milestone_id", ""),
+        _federation.event_operator(e, local_operator),
+    ))
 
     lines: list[str] = []
     lines.append("# Promise Ledger Summary")
     lines.append(
-        f"Total events: {len(events)}, distinct milestones: {len(by_mid)}, "
-        f"shown: {len(selected)} (latest-per-milestone + in-progress + low-confidence)"
+        f"Total events: {len(events)}, distinct milestones: "
+        f"{distinct_milestones}, shown: {len(selected)} "
+        f"(latest-per-milestone + in-progress + low-confidence)"
     )
+    if show_operator:
+        lines.append(
+            f"Operators on this ledger: {', '.join(operators)}. A milestone "
+            "reached by more than one operator shows one line per operator; "
+            "where those disagree, that disagreement is the finding."
+        )
     lines.append("")
     for ev in selected:
         mid = ev.get("milestone_id", "?")
@@ -360,8 +408,13 @@ def summarize_ledger(workspace: Path, max_chars: int = 32_000) -> str:
             narrative = narrative[:197] + "..."
         artifacts = ev.get("artifacts") or []
         art_str = f" artifacts={len(artifacts)}" if artifacts else ""
+        who = (
+            f", {_federation.event_operator(ev, local_operator)}"
+            if show_operator else ""
+        )
         lines.append(
-            f"- [{mid}] {status}/{level} (cycle {cycle}, {agent}, {ts}){art_str}"
+            f"- [{mid}] {status}/{level} (cycle {cycle}, {agent}{who}, {ts})"
+            f"{art_str}"
         )
         if narrative:
             lines.append(f"    {narrative}")
