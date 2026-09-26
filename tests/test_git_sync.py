@@ -271,42 +271,176 @@ class CrashRecoveryTests(SyncTestCase):
             self.assertEqual(self.stashes(), [], junk)
 
 
-class IntegrationTests(SyncTestCase):
-    def _other_operator_pushes(self, path, body):
-        bob = self.T / "bob"
-        if not bob.exists():
-            git("clone", "-q", str(self.T / "bare"), str(bob), cwd=self.T)
-            git("config", "user.email", "bob@x", cwd=bob)
-            git("config", "user.name", "bob", cwd=bob)
-        git("checkout", "-q", "main", cwd=bob)
-        git("pull", "-q", "origin", "main", cwd=bob)
-        (bob / path).parent.mkdir(parents=True, exist_ok=True)
-        (bob / path).write_text(body)
-        git("add", "-A", cwd=bob)
-        git("commit", "-qm", f"bob changes {path}", cwd=bob)
-        git("push", "-q", "origin", "main", cwd=bob)
+class PeerImportTests(SyncTestCase):
+    """Integration is a read-only mirror of peers' published work.
 
-    def test_non_conflicting_shared_work_is_merged_in(self):
+    It replaced merging the shared branch into the run branch, which with two
+    operators silently replaced one operator's MEMOIR.md with the other's.
+    """
+
+    def _publish_as(self, operator, files: dict[str, str]):
+        """Put `operators/<operator>/...` on the shared branch, as the
+        integrator would."""
+        pub = self.T / f"pub-{operator}"
+        if not pub.exists():
+            git("clone", "-q", str(self.T / "bare"), str(pub), cwd=self.T)
+            git("config", "user.email", "i@x", cwd=pub)
+            git("config", "user.name", "integrator", cwd=pub)
+        git("checkout", "-q", "main", cwd=pub)
+        git("pull", "-q", "origin", "main", cwd=pub)
+        base = pub / "operators" / operator
+        if base.exists():
+            import shutil
+            shutil.rmtree(base)
+        for rel, body in files.items():
+            (base / rel).parent.mkdir(parents=True, exist_ok=True)
+            (base / rel).write_text(body)
+        git("add", "-A", cwd=pub)
+        git("commit", "-qm", f"publish {operator}", cwd=pub)
+        git("push", "-q", "origin", "main", cwd=pub)
+
+    def test_a_peers_published_work_is_mirrored_read_only(self):
         state = self.begin()
-        self._other_operator_pushes("data/bob.py", "bob's file\n")
+        self._publish_as("bob", {"MEMOIR.md": "bob's memoir\n",
+                                 "literature-survey/families/cuprates.md": "## YBCO (bob)\n"})
         block = gs.before_cycle(state, 1)
-        self.assertTrue((self.ws / "data/bob.py").exists())
-        self.assertIn("Merged new work", block)
+        self.assertEqual((self.ws / "peers/bob/MEMOIR.md").read_text(), "bob's memoir\n")
+        self.assertTrue((self.ws / "peers/bob/literature-survey/families/cuprates.md").exists())
+        self.assertIn("mirrored read-only under peers/, one folder per operator", block)
+        self.assertIn("never edit it", block)
 
-    def test_a_conflict_is_aborted_and_handed_to_the_researcher(self):
+    def test_this_operators_own_files_are_never_touched(self):
+        """THE regression for the defect that forced the redesign."""
+        (self.ws / "MEMOIR.md").write_text("alice's memoir\n")
         state = self.begin()
+        self._publish_as("bob", {"MEMOIR.md": "bob's memoir\n"})
         gs.before_cycle(state, 1)
-        (self.ws / "data/f.py").write_text("alice's version\n")
+        self.assertEqual((self.ws / "MEMOIR.md").read_text(), "alice's memoir\n")
+
+    def test_this_operators_own_projection_is_not_imported(self):
+        state = self.begin()
+        self._publish_as("alice", {"MEMOIR.md": "an older copy of me\n"})
+        gs.before_cycle(state, 1)
+        self.assertFalse((self.ws / "peers/alice").exists())
+
+    def test_the_mirror_follows_upstream_deletions(self):
+        state = self.begin()
+        self._publish_as("bob", {"a.md": "1\n", "b.md": "2\n"})
+        gs.before_cycle(state, 1)
+        self._publish_as("bob", {"a.md": "1 revised\n"})
+        gs.before_cycle(state, 2)
+        self.assertEqual((self.ws / "peers/bob/a.md").read_text(), "1 revised\n")
+        self.assertFalse((self.ws / "peers/bob/b.md").exists())
+
+    def test_peers_are_never_committed_stashed_or_counted_dirty(self):
+        state = self.begin()
+        self._publish_as("bob", {"MEMOIR.md": "bob\n"})
+        gs.before_cycle(state, 1)
+        self.assertFalse(gs._is_dirty(state), "peers/ must not make the tree dirty")
+        (self.ws / "data/f.py").write_text("alice's cycle work\n")
         gs.after_cycle(state, 1, "t")
-        self._other_operator_pushes("data/f.py", "bob's version\n")
-        block = gs.before_cycle(state, 2)
-        self.assertIn("CONFLICTS", block)
-        self.assertIn("data/f.py", block)
-        self.assertIn("not auto-resolved", block)
-        text = (self.ws / "data/f.py").read_text()
-        self.assertEqual(text, "alice's version\n", "no conflict markers left")
-        self.assertFalse((self.ws / ".git" / "MERGE_HEAD").exists(),
-                         "no merge left in progress")
+        tracked = git("ls-files", cwd=self.ws).stdout
+        self.assertNotIn("peers/", tracked)
+        self.assertIn("data/f.py", tracked)
+
+    def test_duplicated_work_is_pointed_out(self):
+        # Premise: this operator HAS a MEMOIR.md too, or the bookkeeping filter
+        # would have nothing to filter (a mutation test found exactly that).
+        (self.ws / "MEMOIR.md").write_text("alice's memoir\n")
+        (self.ws / "literature-survey/families").mkdir(parents=True)
+        (self.ws / "literature-survey/families/cuprates.md").write_text("mine\n")
+        state = self.begin()
+        self._publish_as("bob", {"literature-survey/families/cuprates.md": "bob's\n",
+                                 "MEMOIR.md": "bob\n"})
+        block = gs.before_cycle(state, 1)
+        self.assertIn("you both have literature-survey/families/cuprates.md", block)
+        self.assertNotIn("you both have MEMOIR.md", block,
+                         "harness bookkeeping always overlaps; it is not duplication")
+
+    def test_a_symlink_left_in_the_mirror_cannot_redirect_a_write(self):
+        state = self.begin()
+        self._publish_as("bob", {"notes/x.md": "v1\n"})
+        gs.before_cycle(state, 1)
+        outside = self.T / "outside.txt"
+        outside.write_text("must stay\n")
+        target = self.ws / "peers/bob/notes/x.md"
+        target.unlink()
+        target.symlink_to(outside)
+        self._publish_as("bob", {"notes/x.md": "v2\n"})
+        gs.before_cycle(state, 2)
+        self.assertEqual(outside.read_text(), "must stay\n")
+
+    def test_a_symlinked_directory_in_the_mirror_cannot_redirect_a_write(self):
+        """The case the containment check exists for. A symlinked FILE is also
+        handled by unlinking it before writing, which hid this gap until a
+        mutation test removed the check and nothing failed."""
+        state = self.begin()
+        self._publish_as("bob", {"notes/x.md": "v1\n"})
+        gs.before_cycle(state, 1)
+        outside = self.T / "outside_dir"
+        outside.mkdir()
+        notes = self.ws / "peers/bob/notes"
+        import shutil
+        shutil.rmtree(notes)
+        notes.symlink_to(outside, target_is_directory=True)
+        self._publish_as("bob", {"notes/x.md": "v2\n", "notes/new.md": "new\n"})
+        gs.before_cycle(state, 2)
+        self.assertEqual(list(outside.iterdir()), [],
+                         "nothing may be written through the symlinked directory")
+
+    def test_a_repo_that_already_ignores_peers_keeps_committing(self):
+        """THE rehearsal defect. The live-test repo's .gitignore lists peers/
+        and instances/. git_sync also excluded them with `:(exclude)` pathspecs,
+        and `git add` exits 1 when a pathspec names an ignored path — so from
+        the first peer import on, every commit was skipped as a failed add."""
+        (self.ws / ".gitignore").write_text("peers/\ninstances/\n")
+        git("add", ".gitignore", cwd=self.ws)
+        git("commit", "-qm", "ignore rules like the live-test repo", cwd=self.ws)
+        state = self.begin()
+        for cycle in (1, 2, 3):
+            self._publish_as("bob", {"notes.md": f"bob cycle {cycle}\n"})
+            block = gs.before_cycle(state, cycle) or ""
+            self.assertTrue((self.ws / "peers/bob/notes.md").exists())
+            (self.ws / "data/f.py").write_text(f"alice cycle {cycle}\n")
+            self.assertTrue(gs.after_cycle(state, cycle, f"c{cycle}"),
+                            f"cycle {cycle} did not commit")
+            self.assertNotIn("git add failed", block)
+        log = self.log()
+        self.assertEqual([l for l in log if l.startswith("long-exposure cycle")],
+                         ["long-exposure cycle 3: c3", "long-exposure cycle 2: c2",
+                          "long-exposure cycle 1: c1"])
+        self.assertNotIn("peers/", git("ls-files", cwd=self.ws).stdout)
+
+    def test_private_ignores_are_recorded_once(self):
+        self.begin()
+        self.begin()
+        text = (self.ws / ".git/info/exclude").read_text()
+        self.assertEqual(text.count("/peers/"), 1)
+        self.assertEqual(text.count("/instances/i1/"), 1)
+        self.assertEqual(text.count("long-exposure git_sync"), 1)
+
+    def test_template_files_are_not_reported_as_duplicated_work(self):
+        """The first rehearsal listed README, exclusions.md, the empty CSV and
+        .gitkeep — files every operator got from the shared branch — ahead of
+        the one real duplicate."""
+        (self.ws / "literature-survey").mkdir()
+        (self.ws / "literature-survey/README.md").write_text("contract\n")
+        git("add", "-A", cwd=self.ws)
+        git("commit", "-qm", "template", cwd=self.ws)
+        git("push", "-q", "origin", "main", cwd=self.ws)
+        (self.ws / "literature-survey/cuprates.md").write_text("mine\n")
+        state = self.begin()
+        self._publish_as("bob", {"literature-survey/README.md": "contract\n",
+                                 "literature-survey/cuprates.md": "bob's\n"})
+        block = gs.before_cycle(state, 1)
+        self.assertIn("you both have literature-survey/cuprates.md", block)
+        self.assertNotIn("README.md", block.split("you both have", 1)[1])
+
+    def test_unsafe_relative_paths_are_rejected(self):
+        for bad in ("../x", "a/../../x", "/etc/hosts", ".git/config", "a//b", "./a"):
+            self.assertFalse(gs._safe_rel(bad), bad)
+        for ok in ("a", "literature-survey/families/cuprates.md", "a.b/c"):
+            self.assertTrue(gs._safe_rel(ok), ok)
 
     def test_an_unreachable_remote_is_a_notice_not_a_failure(self):
         state = self.begin()
@@ -325,7 +459,6 @@ class IntegrationTests(SyncTestCase):
             gs.before_cycle(state, 1)
         subs = [c.args[0][0] for c in run.call_args_list]
         self.assertNotIn("fetch", subs)
-        self.assertNotIn("merge", subs)
 
 
 class NeverDestroyTests(SyncTestCase):
@@ -389,9 +522,9 @@ class NeverDestroyTests(SyncTestCase):
         calls = []
         real = gitcmd.run
 
-        def spy(args, cwd, timeout=20):
+        def spy(args, cwd, timeout=20, **kw):
             calls.append(list(args))
-            return real(args, cwd, timeout)
+            return real(args, cwd, timeout, **kw)
 
         with mock.patch.object(gitcmd, "run", side_effect=spy):
             state = self.begin()
@@ -401,12 +534,13 @@ class NeverDestroyTests(SyncTestCase):
             gs.before_cycle(state, 2)
             (self.ws / "data/f.py").write_text("partial\n")
             state = self.begin(last=1)             # crash + recovery
-            IntegrationTests._other_operator_pushes(self, "data/f.py", "bob\n")
-            gs.before_cycle(state, 2)              # conflict path
+            PeerImportTests._publish_as(self, "bob", {"MEMOIR.md": "bob\n"})
+            gs.before_cycle(state, 2)              # peer import path
             gs.finish(state)
         subs = [next((a for a in c if not a.startswith("-") and "=" not in a), "")
                 for c in calls]
-        self.assertTrue({"stash", "commit", "push", "merge"} & set(subs), subs)
+        self.assertTrue({"stash", "commit", "push", "cat-file"} <= set(subs), subs)
+        self.assertNotIn("merge", subs, "integration no longer merges")
         self.assertEqual([s for s in subs if s in DESTRUCTIVE_GIT], [])
         self.assertEqual([a for c in calls for a in c if a in FORCE_FLAGS], [])
 

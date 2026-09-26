@@ -13,10 +13,12 @@ a resumed run can put the dead turn's edits aside and start from a workspace
 that matches its state.
 
 **Federation, for several.** `docs/git-federation.md` §4: each run commits to
-its own branch, `long-exposure/<operator>/<run_id>`, and merges the shared
-branch in before each cycle. Runs never contend for a branch, so a push is
-never forced, and convergence to the shared branch stays a pull request a
-person reviews.
+its own branch, `long-exposure/<operator>/<run_id>`, and nothing ever merges
+it. A separate integrator (`long_exposure/integrator.py`) projects each
+operator's published paths onto the shared branch under `operators/<op>/`, and
+before each cycle this module mirrors every OTHER operator's projection,
+read-only, into the workspace's `peers/`. Ownership is by path, so operators
+never conflict, and no push is ever forced.
 
 ## Never destroy, always recoverable
 
@@ -27,10 +29,9 @@ nothing it does can lose work. Concretely —
   researcher is told the stash exists and how to restore it;
 - it never force-pushes, never rebases, never checks out paths, and never
   passes `--no-verify` (the operator's own hooks apply to its commits);
-- a merge that conflicts is aborted and the conflict is handed to the next
-  researcher as an input. It is never auto-resolved: conflicts in generated
-  artifacts are usually "keep both", conflicts in source are a disagreement
-  between two runs, and neither is a strategy flag's call;
+- it never merges another operator's work into this one. An earlier version
+  merged the shared branch in, and with two operators that silently replaced
+  one operator's MEMOIR.md with the other's (see `_integrate`);
 - every failure — no remote, a rejected push, a failed commit, a hook that
   blocks — is a notice to the next cycle, and the run continues.
 
@@ -78,7 +79,6 @@ class SyncState:
     operator: str
     run_id: str
     marker_dir: Path
-    excludes: list[str] = field(default_factory=list)
     harness_commit: str = "unknown"
     # Things to tell the next researcher. Drained by `before_cycle`.
     notices: list[str] = field(default_factory=list)
@@ -159,9 +159,12 @@ def begin(
         integrate=_flags.truthy(cfg.get("integrate"), True),
         timeout=_positive_int(cfg.get("timeout_seconds"), 60),
         operator=operator, run_id=run_id, marker_dir=Path(marker_dir),
-        excludes=_exclude_specs(workspace, exclude_paths or []),
         harness_commit=_harness_commit(),
     )
+    if not _ignore_privately(state, _private_patterns(workspace, exclude_paths or [])):
+        _say("off: could not record harness-private paths in .git/info/exclude, "
+             "so they could end up committed")
+        return None
 
     marker = _read_marker(state)
     if marker is not None and marker.get("run_id") != run_id:
@@ -234,7 +237,7 @@ def _stash_crashed_cycle(state: SyncState, cycle) -> None:
 def _stash(state: SyncState, label: str) -> bool:
     code, _, err = _git(state, ["stash", "push", "--include-untracked",
                                 "-m", f"long-exposure: {label}",
-                                "--", ".", *state.excludes])
+                                "--", "."])
     if code != 0:
         _say(f"could not stash ({err.strip()[:120]}); leaving the edits in place")
         return False
@@ -247,7 +250,7 @@ def _stash(state: SyncState, label: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def before_cycle(state: SyncState | None, cycle: int) -> str | None:
-    """Mark the cycle in progress, merge the shared branch in, report notices.
+    """Mark the cycle in progress, mirror peers' published work, report notices.
 
     Returns a `<git_sync>` block for the researcher, or None when there is
     nothing to say.
@@ -261,45 +264,160 @@ def before_cycle(state: SyncState | None, cycle: int) -> str | None:
 
 
 def _integrate(state: SyncState) -> None:
+    """Bring other operators' published work in, as read-only mirrors.
+
+    Reads the shared branch's `operators/<peer>/` trees — projected there by the
+    integrator — and mirrors each peer's into the workspace's `peers/<peer>/`,
+    which git_sync never commits.
+
+    This REPLACED a design that merged the shared branch into the run branch.
+    That design was unsafe with more than one operator: every operator's harness
+    keeps per-operator state at the same paths (`MEMOIR.md`,
+    `plan_of_record.md`, `reports/...`), and once the shared branch held another
+    operator's history, merging it back silently replaced this operator's memoir
+    with theirs — no conflict, because relative to the merge base only one side
+    had changed the file. Found by testing against real repositories before any
+    live run. A mirror never touches this operator's own files, so it cannot do
+    that.
+    """
     code, _, err = _git(state, ["fetch", "--quiet", state.remote,
                                 state.shared_branch], state.timeout)
     if code != 0:
         state.notices.append(
             f"Could not fetch {state.remote}/{state.shared_branch} "
-            f"({err.strip()[:100]}); this cycle starts from local history "
-            "and may be missing other operators' work.")
+            f"({err.strip()[:100]}); peers' work was not refreshed this cycle.")
         return
     ref = f"refs/remotes/{state.remote}/{state.shared_branch}"
     if _git(state, ["rev-parse", "--verify", "--quiet", ref])[0] != 0:
         return
-    if _is_dirty(state):
-        # Only reachable if something edited the workspace between cycles.
-        state.notices.append(
-            f"Skipped merging {state.remote}/{state.shared_branch}: the "
-            "workspace had uncommitted changes at cycle start.")
+    code, out, _ = _git(state, ["ls-tree", "-r", "-z", ref, "--",
+                                _federation.OPERATORS_DIR + "/"])
+    if code != 0:
         return
-    code, out, err = _git(state, [*_identity(state), "merge", "--no-edit",
-                                  ref], state.timeout)
-    if code == 0:
-        if "Already up to date" not in out:
-            state.notices.append(
-                f"Merged new work from {state.remote}/{state.shared_branch} "
-                "into this run before the cycle started.")
+    peers: dict[str, dict[str, str]] = {}
+    for rec in out.split("\0"):
+        if not rec or "\t" not in rec:
+            continue
+        meta, path = rec.split("\t", 1)
+        mode, kind, sha = meta.split()
+        if kind != "blob" or mode not in ("100644", "100755"):
+            continue
+        parts = path.split("/")
+        if len(parts) < 3:
+            continue
+        peer, rel = parts[1], "/".join(parts[2:])
+        if peer == state.operator or peer != _federation.slugify(peer):
+            continue
+        if not _safe_rel(rel):
+            continue
+        peers.setdefault(peer, {})[rel] = sha
+
+    # Files every operator got from the shared branch itself (the directive,
+    # a README contract, an empty table with its header) are not duplicated
+    # work, and listing them buried the real overlap in the first rehearsal.
+    code, tout, _ = _git(state, ["ls-tree", "-r", "-z", "--name-only", ref])
+    template = {p for p in tout.split("\0")
+                if p and not p.startswith(_federation.OPERATORS_DIR + "/")} if code == 0 else set()
+    root = state.workspace / _federation.PEERS_DIR
+    lines = []
+    for peer in sorted(peers):
+        changed = _mirror(state, root / peer, peers[peer])
+        overlap = sorted(rel for rel in peers[peer]
+                         if rel not in _BOOKKEEPING and rel not in template
+                         and (state.workspace / rel).is_file())
+        if changed or overlap:
+            line = f"{peer}: {len(peers[peer])} files"
+            if changed:
+                line += f", {changed} updated since last cycle"
+            if overlap:
+                shown = ", ".join(overlap[:12]) + (" …" if len(overlap) > 12 else "")
+                line += f"; you both have {shown}"
+            lines.append(line)
+    for stale in (sorted(p.name for p in root.iterdir() if p.is_dir())
+                  if root.is_dir() else []):
+        if stale not in peers and stale == _federation.slugify(stale):
+            _remove_tree(root / stale, root)
+    if lines:
+        state.notices.append(
+            "Other operators' published work is mirrored read-only under "
+            f"{_federation.PEERS_DIR}/, one folder per operator — read it before "
+            "duplicating their work, and never edit it (it is overwritten each "
+            "cycle). "
+            + " | ".join(lines))
+
+
+# Every operator publishes these harness files, so "you both have them" is
+# always true and says nothing about duplicated research.
+_BOOKKEEPING = {"promise_ledger.jsonl", "MEMOIR.md", "plan_of_record.md", "STRUCTURE.md"}
+
+
+def _safe_rel(rel: str) -> bool:
+    """A path from ANOTHER operator's tree, about to be written to disk here."""
+    parts = rel.split("/")
+    return bool(rel) and not rel.startswith("/") and all(
+        p not in ("", ".", "..", ".git") for p in parts)
+
+
+def _mirror(state: SyncState, dest: Path, files: dict[str, str]) -> int:
+    """Make `dest` hold exactly `files` (rel -> blob id). Returns files changed.
+
+    Writes only regular files, only inside `dest`, and never through a symlink:
+    `target.resolve()` follows any link an agent may have left in the mirror,
+    so a resolved path outside `dest` is skipped rather than written.
+    """
+    dest_real = dest.resolve()
+    changed = 0
+    for rel, sha in files.items():
+        target = dest / rel
+        try:
+            target.resolve().relative_to(dest_real)
+        except (ValueError, OSError):
+            continue
+        code, blob, _ = _gitcmd.run(["cat-file", "blob", sha], state.workspace,
+                                    LOCAL_TIMEOUT, binary=True)
+        if code != 0:
+            continue
+        try:
+            if target.is_file() and not target.is_symlink() and target.read_bytes() == blob:
+                continue
+            if target.is_symlink():
+                target.unlink()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blob)
+            changed += 1
+        except OSError:
+            continue
+    if dest.is_dir():
+        for existing in sorted(dest.rglob("*"), key=lambda q: len(q.parts), reverse=True):
+            rel = existing.relative_to(dest).as_posix()
+            try:
+                if existing.is_symlink() or (existing.is_file() and rel not in files):
+                    if rel not in files or existing.is_symlink():
+                        existing.unlink()
+                        changed += 1
+                elif existing.is_dir() and not any(existing.iterdir()):
+                    existing.rmdir()
+            except OSError:
+                continue
+    return changed
+
+
+def _remove_tree(path: Path, root: Path) -> None:
+    """Delete a peer mirror that no longer exists upstream. Only ever inside
+    `peers/`, which holds nothing but copies of the shared branch."""
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
         return
-    conflicted = [p for p in _git(state, ["diff", "--name-only", "-z",
-                                          "--diff-filter=U"])[1].split("\0") if p]
-    _git(state, ["merge", "--abort"])
-    if conflicted:
-        state.notices.append(
-            f"Merging {state.remote}/{state.shared_branch} CONFLICTS with this "
-            "run, so it was aborted and not auto-resolved. Conflicting files: "
-            + ", ".join(conflicted[:20])
-            + ". Another run changed the same files differently — decide "
-              "whether to reconcile them this cycle or work elsewhere.")
-    else:
-        state.notices.append(
-            f"Could not merge {state.remote}/{state.shared_branch} "
-            f"({(err or out).strip()[:120]}); continuing without it.")
+    for p in sorted(path.rglob("*"), key=lambda q: len(q.parts), reverse=True):
+        try:
+            (p.unlink if p.is_symlink() or p.is_file() else p.rmdir)()
+        except OSError:
+            continue
+    try:
+        path.rmdir()
+    except OSError:
+        pass
 
 
 def after_cycle(state: SyncState | None, cycle: int,
@@ -356,7 +474,7 @@ def _push(state: SyncState) -> None:
 
 
 def _commit(state: SyncState, subject: str) -> bool:
-    code, _, err = _git(state, ["add", "-A", "--", ".", *state.excludes])
+    code, _, err = _git(state, ["add", "-A", "--", "."])
     if code != 0:
         state.notices.append(f"git add failed ({err.strip()[:120]}).")
         return False
@@ -402,26 +520,69 @@ def _identity(state: SyncState) -> list[str]:
 
 def _is_dirty(state: SyncState) -> bool:
     code, out, _ = _git(state, ["status", "--porcelain", "--untracked-files=all",
-                                "--", ".", *state.excludes])
+                                "--", "."])
     return code == 0 and bool(out.strip())
 
 
-def _exclude_specs(workspace: Path, paths: list[Path]) -> list[str]:
-    """Pathspecs keeping harness-private files out of commits and stashes.
+def _private_patterns(workspace: Path, paths: list[Path]) -> list[str]:
+    """Ignore patterns for the paths the harness owns inside the workspace.
 
-    The instance dir holds this module's own marker and the run state. If it
-    sits inside the workspace, stashing it on crash recovery would stash the
-    very state the resume is reading.
+    `peers/` always: it is a mirror of the shared branch. And any of `paths`
+    — the instance dir, output dir, session DB — that sits inside the
+    workspace: the instance dir holds this module's own marker and the run
+    state, and stashing it on crash recovery would stash the very state the
+    resume is reading.
     """
-    specs = []
+    out = [f"/{_federation.PEERS_DIR}/"]
     for p in paths:
         try:
             rel = Path(p).resolve().relative_to(workspace)
         except (ValueError, OSError):
             continue                     # outside the workspace: nothing to do
-        if str(rel) not in ("", "."):
-            specs.append(f":(exclude){rel.as_posix()}")
-    return specs
+        if str(rel) in ("", "."):
+            continue
+        pat = "/" + rel.as_posix() + ("/" if Path(p).is_dir() else "")
+        if pat not in out:
+            out.append(pat)
+    return out
+
+
+_EXCLUDE_HEADER = "# long-exposure git_sync: harness-private paths (safe to delete)"
+
+
+def _ignore_privately(state: SyncState, patterns: list[str]) -> bool:
+    """Record `patterns` in the repository's `.git/info/exclude`.
+
+    git's own mechanism for machine-local ignores: never committed, never
+    shared, and honoured by add, status and stash alike. It REPLACED passing
+    `:(exclude)` pathspecs, which broke in a way only a rehearsal found. When a
+    pathspec names a path the repository's .gitignore already ignores, `git
+    add` stages everything else and then exits 1 ("The following paths are
+    ignored by one of your .gitignore files"). The live-test repo ignores
+    `peers/`, so from the first peer import onward every commit was reported
+    as a failed add and skipped — commits, and therefore publishing, silently
+    stopped at cycle 3. An ignore rule cannot collide with another ignore rule.
+    """
+    code, out, _ = _git(state, ["rev-parse", "--git-path", "info/exclude"])
+    if code != 0 or not out.strip():
+        return False
+    path = Path(out.strip())
+    if not path.is_absolute():
+        path = state.workspace / path
+    try:
+        existing = path.read_text().splitlines() if path.is_file() else []
+        missing = [p for p in patterns if p not in existing]
+        if missing:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as fh:
+                if existing and existing[-1].strip():
+                    fh.write("\n")
+                if _EXCLUDE_HEADER not in existing:
+                    fh.write(_EXCLUDE_HEADER + "\n")
+                fh.write("\n".join(missing) + "\n")
+        return True
+    except OSError:
+        return False
 
 
 def _harness_commit() -> str:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -99,7 +98,11 @@ def build_block(
     max_rationale_chars: int = MAX_RATIONALE_CHARS,
 ) -> str:
     try:
-        events = _safe_read(Path(workspace) / "promise_ledger.jsonl")
+        # Includes peers' mirrored ledgers: an approach another operator has
+        # already invalidated is exactly the warning this block exists to give.
+        from long_exposure.workspace_bootstrap import read_ledger_with_peers
+
+        events = read_ledger_with_peers(Path(workspace))
         return _render(
             _select(events, max_entries=max_entries),
             max_rationale_chars=max_rationale_chars,

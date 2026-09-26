@@ -288,6 +288,12 @@ federation:
   operator: ""
   remote: "origin"
   shared_branch: "main"
+  # What this operator shares with the others. `long-exposure integrate`
+  # projects these from each operator's run branch to operators/<op>/<path> on
+  # the shared branch; every other operator's git_sync mirrors them, read-only,
+  # into its gitignored peers/<op>/. Ownership is by path, so operators never
+  # conflict. Add your project's deliverable directory here.
+  publish_paths: ["promise_ledger.jsonl", "MEMOIR.md", "plan_of_record.md"]
 
   # A forecast, at the start of each researcher cycle, of overlap between this
   # workspace and the shared branch. READ-ONLY: its only side effect is an
@@ -321,11 +327,13 @@ federation:
   # researcher is told how to restore them, so the run restarts from a
   # workspace that matches its saved state.
   #
-  # Federation for SEVERAL: before each cycle the shared branch is merged in,
-  # and after it the run branch is pushed. Each run has its own branch, so a
-  # push is never forced; reaching the shared branch is a pull request a
-  # person reviews. A merge conflict is aborted and handed to the researcher —
-  # never auto-resolved.
+  # Federation for SEVERAL: after each cycle the run branch is pushed, and
+  # `long-exposure integrate` (a separate process, run beside the harness)
+  # projects every operator's publish_paths onto the shared branch under
+  # operators/<op>/. Before each cycle, every OTHER operator's projection is
+  # mirrored read-only into this workspace's peers/<op>/. Nothing is ever
+  # merged: ownership is by path, so operators cannot conflict. (Merging was
+  # tried first and silently replaced one operator's MEMOIR.md with another's.)
   #
   # Never destroys work: no reset, clean, rebase, force-push, or --no-verify
   # (your own pre-commit hooks apply to its commits), enforced by
@@ -334,7 +342,7 @@ federation:
   git_sync:
     enabled: false
     push: true              # false = local commits only (crash consistency, no remote)
-    integrate: true         # merge the shared branch in before each cycle
+    integrate: true         # mirror peers' published work in before each cycle
     timeout_seconds: 60     # fetch / merge / push budget
 
 # === Startup gate (opt-in) ===

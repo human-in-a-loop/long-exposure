@@ -54,6 +54,12 @@ import socket
 
 DEFAULTS: dict = {
     "operator": "",
+    # What each operator shares. The integrator projects these, from each
+    # operator's own run branch, to `operators/<operator>/<path>` on the shared
+    # branch; every other operator's git_sync mirrors them into its gitignored
+    # `peers/<operator>/`. Paths are workspace-relative files or directories.
+    # A project adds its deliverable directory here.
+    "publish_paths": ["promise_ledger.jsonl", "MEMOIR.md", "plan_of_record.md"],
     # One remote and one shared branch for the whole feature family. They used
     # to live inside conflict_radar; with git_sync also needing them, two copies
     # would let the radar forecast against one branch while sync integrated
@@ -118,6 +124,34 @@ def remote_and_branch(config: dict | None = None) -> tuple[str, str]:
     remote = str(s.get("remote") or "").strip() or "origin"
     branch = str(s.get("shared_branch") or "").strip() or "main"
     return remote, branch
+
+
+# Where each operator's published work lives on the shared branch, and where a
+# workspace mirrors its PEERS' published work. Ownership is by path: nothing
+# under operators/<x>/ is ever written by anyone but the integrator projecting
+# operator x, so two operators can never conflict there.
+OPERATORS_DIR = "operators"
+PEERS_DIR = "peers"
+
+
+def publish_paths(config: dict | None = None) -> list[str]:
+    """The workspace-relative paths an operator shares, cleaned.
+
+    Entries that would escape the workspace or reach into the projection or
+    peer trees themselves are dropped: publishing `peers/` would re-share other
+    operators' work under this operator's name.
+    """
+    from long_exposure.paths import canonical_rel_path
+
+    out = []
+    for raw in settings(config).get("publish_paths") or []:
+        rel = canonical_rel_path(str(raw or ""))
+        parts = rel.split("/")
+        if (not rel or ".." in parts or parts[0] in (OPERATORS_DIR, PEERS_DIR, ".git")):
+            continue
+        if rel not in out:
+            out.append(rel)
+    return out
 
 
 def slugify(text: str, *, max_len: int = MAX_NAME) -> str:

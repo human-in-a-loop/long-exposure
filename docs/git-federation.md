@@ -6,7 +6,8 @@
 |---|---|
 | Operator identity on the ledger (§7.1) | **Built.** `long_exposure/federation.py` |
 | Conflict radar (§4.3) | **Built**, off by default. `long_exposure/conflict_radar.py` — **read-only** |
-| Per-cycle commits, integration, push (§4.1, §4.2) | **Built**, off by default. `long_exposure/git_sync.py` |
+| Per-cycle commits and push (§4.2) | **Built**, off by default. `long_exposure/git_sync.py` |
+| Publishing: the integrator and the peer mirror (§4.1, §4.5) | **Built**. `long_exposure/integrator.py`, `long-exposure integrate` |
 | Crash recovery (§4.4) | **Built**, part of git_sync. Not in the original design |
 | Slice-name canonicalisation (§6.2) | **Built**, no consumer yet |
 | Claims registry (§6) | **Not built**, deliberately — §8 says run the experiment first |
@@ -138,41 +139,83 @@ use it rather than reinvent a reduction step (plan §4.1).
 Two new seams. Both sit exactly where the harness already has a transaction
 point, so neither invents a lifecycle stage.
 
-### 4.1 Before the roles run — BUILT
+### 4.1 Before the roles run — BUILT: mirror peers, never merge
 
-`git_sync.before_cycle`, called at the top of every root cycle, before
-`_assemble_cycle_inputs` (both extracted from `run_exploration` so this had
-somewhere clean to attach):
+`git_sync.before_cycle`, at the top of every root cycle:
 
 ```
 1.  write the in-progress marker {run_id, cycle}
 2.  git fetch <remote> <shared_branch>
-3.  git merge --no-edit <remote>/<shared_branch>     # into this run's branch
-4.  on conflict: collect the files, git merge --abort, tell the researcher
-5.  return a <git_sync> block if there is anything to say
+3.  mirror every OTHER operator's operators/<op>/ into peers/<op>/   (read-only)
+4.  return a <git_sync> block naming peers' new work and any overlap
 ```
 
-**Merge, not rebase** — a departure from the original design, which said
-"rebase (or merge)". The run branch is pushed every cycle, so rebasing it would
-rewrite published history and force every later push. Merging never does, which
-is what lets `git_sync` promise it never force-pushes.
+**This replaced a merge, and the reason is the most important finding of the
+multi-operator work.** The first version merged the shared branch into the run
+branch before each cycle. Tested against real repositories before any live run,
+it was unsafe with two operators:
 
-The block joins the live-guidance parts list beside the radar's:
+- Every operator's harness keeps per-operator state at the **same paths** —
+  `MEMOIR.md`, `plan_of_record.md`, `reports/cycles/...`. Once the shared branch
+  holds operator B's history, git sees operator A's copy of those files as a
+  newer revision of B's. Merging the shared branch back into B's run replaced
+  B's memoir with A's — **silently, with no conflict**, because relative to the
+  merge base only one side had changed the file.
+- A per-path `merge=keep-local` driver does not help: merge drivers run only
+  when both sides changed a file.
+- The `merge=union` driver, the obvious way to combine two operators' survey
+  files, works line by line and de-duplicates shared lines, so two
+  independently written entries came out interleaved with one entry's body
+  missing.
 
-```python
-parts = [p for p in (fanout_guide, sibling_block, anti_patterns_block,
-                     conflict_block, sync_block, guidance) if p]
+So nothing is merged. Each operator's own files are only ever written by that
+operator; other operators' work arrives as a mirror under `peers/`, which the
+researcher reads and git_sync never commits. The ledger reader includes
+`peers/*/promise_ledger.jsonl`, so another operator's findings appear in the
+summary labelled with their name — the payoff of the operator-identity work in
+§7.1. The block also names files both operators have written, the
+duplication signal, excluding files everyone got from the shared branch's own
+template.
+
+`peers/` is kept out of commits by an entry in `.git/info/exclude` rather than a
+`:(exclude)` pathspec. The pathspec broke in a way only the end-to-end
+rehearsal found: when a repository's `.gitignore` already ignores the path, `git
+add` stages everything else and exits 1, so from the first peer import every
+commit was reported as a failed add and skipped.
+
+### 4.5 The integrator — BUILT: publishing as a projection
+
+`long-exposure integrate` runs **beside** each operator's harness, never inside
+it, and publishes to the shared branch:
+
+```
+main  =  main's own files (directive, contract, template)        unchanged
+      +  operators/<op>/<path>  for each operator's newest run branch,
+                                for each path in federation.publish_paths
 ```
 
-A merge conflict is surfaced here, as an input, not raised as an error (plan
-§7), and **never auto-resolved**. The merge is aborted, so the workspace is left
-with no conflict markers and no merge in progress; the researcher is told which
-files conflict. Conflicts on generated artifacts are usually "keep both";
-conflicts in source are a research disagreement between two runs, and a
-strategy flag is the wrong instrument for a disagreement.
+- **Deterministic, not an LLM.** Building the projection is mechanical and has
+  nothing to resolve; an LLM would add nondeterminism to the one component
+  whose value is being exactly repeatable.
+- **Plumbing only**, against a temporary index in a private bare clone: no
+  working tree, nothing the harness or the operator is using. Blobs are
+  referenced, not copied, so a projected file is byte-identical to its source.
+- **A pure function of the run-branch tips**, so two integrators on two
+  machines compute the same tree. When both push, the remote accepts one and
+  rejects the other, and the loser re-derives on the new tip — git's push
+  rejection is the whole coordination protocol. Two integrators with the same
+  view in the same second produce byte-identical commits, so the second push is
+  a no-op; a forced interleaving in the test suite exercises the rejection path.
+- Never forces a push, never touches a run branch, never projects a symlink.
+  `--until-pid` runs one final round after the harness exits, so the closing
+  report is published.
 
-An unreachable remote, a dirty tree, or an unrelated history is a notice, not a
-failure. The cycle always runs.
+**Rehearsed before the live run**, as the exact live setup with only the model
+stubbed: two operators on their own clones, configs from the real generator,
+real `run_exploration` cycles, two integrators as separate processes through the
+real CLI. 37 checks, stable across three runs. The first attempt failed 7 of
+them and found the `.gitignore` defect above plus noise in the overlap report;
+both are fixed and pinned by tests.
 
 ### 4.2 After the roles run — BUILT
 
@@ -367,6 +410,13 @@ already says.
 Four classes, and the class decides the mechanism. This is the whole of
 §4.2's third primitive, worked out.
 
+> **Superseded for the shared branch by §4.1 and §4.5.** Nothing is merged
+> any more: each operator's published files land under
+> `operators/<op>/` on main and come back as `peers/<op>/`. The analysis below
+> is kept because it is why merging was abandoned — union merge is still
+> correct for a ledger merged *by hand*, and `.gitattributes` keeps it as a
+> safety net — but the harness no longer relies on any of it.
+
 ### 5.1 `promise_ledger.jsonl` — union merge, and it is correct
 
 One line in `.gitattributes`:
@@ -423,6 +473,11 @@ pattern rescopes one level up:
 
 The work is a rename and a re-scope of a mechanism that exists and is
 tested, which is why this is the cheapest hard problem on the list.
+
+**What shipped instead:** the projection gives the same result with no
+rename. Each operator's `MEMOIR.md` lands at `operators/<op>/MEMOIR.md` and is
+read by the others as `peers/<op>/MEMOIR.md`; nobody's memoir is ever written
+by anyone else.
 
 ### 5.3 `plan_of_record.md` — the genuine contention point
 
@@ -616,16 +671,20 @@ clean.
    recovery (§4.4) added on the way. It shipped with a first decomposition of
    `run_exploration`, which created the seams it attaches to and surfaced a
    persistence bug on the way (`audit_free_streak` reached 3 of 7 save sites).
-4. **The experiment** (plan §4.5). Two operators, one repo, one small shared
+4. ~~**The integrator and the peer mirror** (§4.1, §4.5)~~ — **DONE**. The
+   merge-based step 3 was replaced after an empirical test showed merging
+   silently overwrote a peer's memoir; publishing is now a projection.
+5. **The experiment** (plan §4.5). Two operators, one repo, one small shared
    directive, both on the same harness commit, *no claims registry*. Count: how
    many merges conflict, what they conflict on, and whether the two runs
-   produce complementary or duplicated work. The radar's forecasts can now be
-   checked against what actually conflicted, and the `Long-Exposure-*`
-   trailers make every commit attributable. **This is the next thing.**
-5. **Then** decide the claims registry's shape from §6.2 with data, and
+   produce complementary or duplicated work. With the projection there is
+   nothing left to conflict, so the measure is duplication (the peer notice
+   reports overlapping paths), push rejections in the integrator logs, and
+   whether each run used what it found in `peers/`. **This is the next thing.**
+6. **Then** decide the claims registry's shape from §6.2 with data, and
    `MEMOIR.<operator>.md` if the experiment shows memoir conflicts dominate.
 
-Steps 4 and 5 stay in that order on purpose. The claims registry is the part of
+Steps 5 and 6 stay in that order on purpose. The claims registry is the part of
 this design with the most guesswork in it, and the experiment is cheap.
 
 The config, all of it read (`long_exposure/config.yaml`):
@@ -635,6 +694,10 @@ federation:
   operator: ""              # blank derives from the hostname
   remote: "origin"          # shared by the radar and git_sync
   shared_branch: "main"
+  publish_paths:            # what the integrator projects to operators/<op>/
+    - promise_ledger.jsonl
+    - MEMOIR.md
+    - plan_of_record.md
   conflict_radar:
     enabled: false
     fetch: true
@@ -643,7 +706,7 @@ federation:
   git_sync:
     enabled: false
     push: true              # false = local commits only
-    integrate: true         # merge the shared branch in before each cycle
+    integrate: true         # mirror peers' published work in before each cycle
     timeout_seconds: 60
 ```
 

@@ -420,6 +420,36 @@ def _displayed_level(event: dict, workspace: Path) -> str:
     return "medium (claimed high; no evidence found)"
 
 
+def read_ledger_with_peers(workspace: Path) -> list[dict]:
+    """This workspace's ledger plus every peer's mirrored ledger, de-duplicated.
+
+    Peers' ledgers arrive through git_sync as read-only mirrors under
+    `peers/<operator>/promise_ledger.jsonl`. Reading them here is what makes
+    federation useful to a researcher: another operator's validated finding, or
+    an approach they have already invalidated, shows up in this operator's
+    summary, labelled with who reached it. They are read, never merged into
+    this workspace's own ledger, so this operator's validators see only its own
+    events. De-duplicated by event_id in case an event reaches both.
+    """
+    from long_exposure import federation as _federation
+
+    seen: set[str] = set()
+    events: list[dict] = []
+    sources = [Path(workspace) / "promise_ledger.jsonl"]
+    peers = Path(workspace) / _federation.PEERS_DIR
+    if peers.is_dir():
+        sources += sorted(peers.glob("*/promise_ledger.jsonl"))
+    for src in sources:
+        for ev in _read_ledger(src):
+            eid = ev.get("event_id")
+            if eid and eid in seen:
+                continue
+            if eid:
+                seen.add(eid)
+            events.append(ev)
+    return events
+
+
 def summarize_ledger(workspace: Path, max_chars: int = 32_000) -> str:
     """Produce a token-bounded summary of the ledger for cycle-input injection.
 
@@ -432,8 +462,7 @@ def summarize_ledger(workspace: Path, max_chars: int = 32_000) -> str:
 
     Returns a single string ready to inject as `promise_ledger_summary`.
     """
-    ledger_path = workspace / "promise_ledger.jsonl"
-    events = _read_ledger(ledger_path)
+    events = read_ledger_with_peers(workspace)
     if not events:
         return "[promise_ledger.jsonl is empty or absent]"
 

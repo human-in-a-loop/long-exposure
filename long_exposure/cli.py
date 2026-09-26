@@ -437,6 +437,40 @@ Manager notices are surfaced through `long-exposure status` from
     return 0
 
 
+def _integrate(args: argparse.Namespace) -> int:
+    """Run the integrator beside a run. See long_exposure/integrator.py."""
+    from pathlib import Path
+
+    from long_exposure import federation, gitcmd, integrator
+    from long_exposure.orchestrator import load_config
+
+    config = load_config(args.config) if args.config else load_config()
+    url = args.url
+    if not url:
+        ws = Path(config.get("working_directory") or ".").expanduser()
+        code, out, err = gitcmd.run(["remote", "get-url", "origin"], ws)
+        if code != 0 or not out.strip():
+            print(f"[integrator] no --url and no origin in {ws}: {err.strip()}",
+                  file=sys.stderr)
+            return 2
+        url = out.strip()
+    clone_dir = Path(args.clone_dir).expanduser().resolve()
+    ws = Path(config.get("working_directory") or ".").expanduser().resolve()
+    if clone_dir == ws or ws in clone_dir.parents:
+        print("[integrator] --clone-dir must be outside the workspace", file=sys.stderr)
+        return 2
+    log = Path(args.log).expanduser() if args.log else clone_dir.parent / "integration_log.jsonl"
+    print(f"[integrator] publishing to {url} every {args.interval:.0f}s; "
+          f"paths: {', '.join(federation.publish_paths(config))}",
+          flush=True)
+    return integrator.run_loop(
+        config, url=url, clone_dir=clone_dir, log_path=log,
+        interval=args.interval, until_pid=args.until_pid,
+        stop_file=Path(args.stop_file) if args.stop_file else None,
+        max_rounds=1 if args.once else None,
+    )
+
+
 def _hooks_install(args: argparse.Namespace) -> int:
     """Install (or remove, or verify) the vendor lifecycle hooks."""
     targets = (
@@ -607,6 +641,28 @@ def build_parser() -> argparse.ArgumentParser:
                               "hooks are non-blocking, so a broken one costs "
                               "a nudge or a log line, not a run")
 
+    p_integ = sub.add_parser(
+        "integrate",
+        help="Publish every operator's shared work to the shared branch "
+             "(runs beside a run, never inside it)",
+    )
+    p_integ.add_argument("--url", default=None,
+                         help="remote to publish to (default: the workspace's "
+                              "`origin` URL, read from working_directory)")
+    p_integ.add_argument("--clone-dir", required=True,
+                         help="a private directory for the integrator's bare "
+                              "clone — outside the workspace")
+    p_integ.add_argument("--interval", type=float, default=300,
+                         help="seconds between rounds (default 300)")
+    p_integ.add_argument("--until-pid", type=int, default=None,
+                         help="stop after this process exits, with one final round")
+    p_integ.add_argument("--stop-file", default=None,
+                         help="stop when this file exists")
+    p_integ.add_argument("--once", action="store_true", help="one round, then exit")
+    p_integ.add_argument("--log", default=None,
+                         help="JSONL log of every round (default: "
+                              "<clone-dir>/../integration_log.jsonl)")
+
     p_telem = sub.add_parser("telemetry", help="Telemetry utilities")
     telem_sub = p_telem.add_subparsers(dest="telemetry_command", required=True)
     p_telem_sum = telem_sub.add_parser(
@@ -674,6 +730,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cli_install(args)
     if args.command == "hooks-install":
         return _hooks_install(args)
+    if args.command == "integrate":
+        return _integrate(args)
     if args.command == "telemetry" and args.telemetry_command == "summarize":
         return _telemetry_summarize(args)
     parser.error(f"unknown command: {args.command}")

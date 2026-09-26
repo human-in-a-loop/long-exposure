@@ -17,22 +17,39 @@ import subprocess
 from pathlib import Path
 
 
-def run(args: list[str], cwd: Path, timeout: int = 20) -> tuple[int, str, str]:
+def run(args: list[str], cwd: Path, timeout: int = 20, *,
+        input: str | None = None, env: dict | None = None,
+        binary: bool = False) -> tuple[int, str | bytes, str]:
     """Run git. Never raises; a failure to launch looks like a non-zero exit.
 
     Exit 124 is a timeout and 127 a launch failure, matching the shell
     conventions so a caller can tell them from git's own codes.
+
+    `input` feeds stdin (plumbing such as `update-index --index-info`), `env`
+    is merged over the process environment (for a temporary GIT_INDEX_FILE),
+    and `binary=True` returns stdout as bytes — needed for `cat-file blob`,
+    where a published file may not be valid UTF-8.
     """
+    import os
+
+    full_env = None
+    if env:
+        full_env = {**os.environ, **env}
     try:
         proc = subprocess.run(
-            ["git", *args], cwd=str(cwd), capture_output=True, text=True,
-            timeout=timeout,
+            ["git", *args], cwd=str(cwd), capture_output=True,
+            text=not binary, timeout=timeout, env=full_env,
+            input=(input.encode() if binary and input is not None else input),
         )
-        return proc.returncode, proc.stdout or "", proc.stderr or ""
+        out = proc.stdout if proc.stdout is not None else (b"" if binary else "")
+        err = proc.stderr or (b"" if binary else "")
+        if binary and isinstance(err, bytes):
+            err = err.decode("utf-8", "replace")
+        return proc.returncode, out, err
     except subprocess.TimeoutExpired:
-        return 124, "", f"timed out after {timeout}s"
+        return 124, (b"" if binary else ""), f"timed out after {timeout}s"
     except (OSError, subprocess.SubprocessError) as exc:
-        return 127, "", repr(exc)
+        return 127, (b"" if binary else ""), repr(exc)
 
 
 def rejects_as_option(value: str) -> bool:

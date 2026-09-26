@@ -43,7 +43,8 @@ READ_ONLY_GIT = {
     "describe", "config", "check-ref-format",
     "fetch",   # the documented exception
 }
-WRITE_GIT = {"add", "commit", "push", "merge", "stash", "switch"}
+WRITE_GIT = {"add", "commit", "push", "merge", "stash", "switch",
+             "read-tree", "update-index", "write-tree", "commit-tree"}
 DESTRUCTIVE_GIT = {
     "reset", "clean", "rebase", "checkout", "restore", "rm", "mv",
     "filter-branch", "filter-repo", "update-ref", "symbolic-ref", "gc",
@@ -89,14 +90,33 @@ class GitPolicyTests(unittest.TestCase):
                 files.add(str(path.relative_to(REPO)))
         self.assertEqual(files, {"long_exposure/gitcmd.py"}, files)
 
-    def test_only_the_two_policy_modules_use_the_chokepoint(self):
+    def test_only_the_three_policy_modules_use_the_chokepoint(self):
         users = set()
         for path in (REPO / "long_exposure").rglob("*.py"):
             if path.name == "gitcmd.py":
                 continue
             if re.search(r"import gitcmd|gitcmd import", path.read_text()):
                 users.add(path.name)
-        self.assertEqual(users, {"conflict_radar.py", "git_sync.py"}, users)
+        self.assertEqual(users, {"conflict_radar.py", "git_sync.py",
+                                 "integrator.py"}, users)
+
+    def test_the_integrator_uses_only_plumbing_and_never_forces(self):
+        """It writes the SHARED branch, so it gets an allowlist, not a
+        denylist: plumbing against a temporary index in a private bare clone,
+        and a non-forced push. The `+` in its fetch refspec updates its own
+        private cache and is not a push."""
+        allowed = {"clone", "fetch", "rev-parse", "for-each-ref", "ls-tree",
+                   "read-tree", "update-index", "write-tree", "commit-tree", "push"}
+        argvs = _git_argvs(self._module("integrator.py"))
+        self.assertTrue(argvs)
+        self.assertEqual({sub for _, sub, _ in argvs} - allowed, set())
+        self.assertEqual([c for _, _, cs in argvs for c in cs if c in FORCE_FLAGS], [])
+        pushes = [cs for _, sub, cs in argvs if sub == "push"]
+        self.assertTrue(pushes)
+        self.assertFalse([c for cs in pushes for c in cs if c.startswith("+")])
+        for _, sub, cs in argvs:
+            if sub == "clone":
+                self.assertIn("--bare", cs, "the integrator's clone must be bare")
 
     def test_the_radar_is_read_only(self):
         argvs = _git_argvs(self._module("conflict_radar.py"))
@@ -119,7 +139,14 @@ class GitPolicyTests(unittest.TestCase):
     def test_git_sync_actually_writes_what_it_says(self):
         """Guards against the policy passing because the module went empty."""
         subs = {sub for _, sub, _ in _git_argvs(self._module("git_sync.py"))}
-        self.assertTrue({"add", "commit", "push", "merge", "stash"} <= subs, subs)
+        self.assertTrue({"add", "commit", "push", "stash", "switch"} <= subs, subs)
+
+    def test_git_sync_no_longer_merges_anything(self):
+        """It used to merge the shared branch into the run branch, which with
+        more than one operator silently replaced one operator's MEMOIR.md with
+        another's. Integration is now a read-only mirror; no merge at all."""
+        subs = {sub for _, sub, _ in _git_argvs(self._module("git_sync.py"))}
+        self.assertNotIn("merge", subs)
 
     def test_the_policy_bites(self):
         """A test that cannot fail is not a test."""

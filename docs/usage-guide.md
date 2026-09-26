@@ -198,13 +198,30 @@ What it will and won't do:
   test the build runs.
 - **Your pre-commit hooks apply.** If one fails, the commit is skipped, the
   work stays, and the next cycle's commit carries it.
-- **Merges, never auto-resolves.** Before each cycle the shared branch is merged
-  in; a conflict is aborted and the researcher is told which files — the
-  workspace is never left with conflict markers.
+- **Never merges anyone's work into yours.** Other operators' published work
+  is mirrored read-only into `peers/<operator>/` before each cycle, and their
+  ledger findings appear in your summary, labelled. Your own files are only
+  ever written by your run.
 - **Needs the workspace to be the repository's top level**, because switching
   branches moves the whole tree. It refuses otherwise and says why.
 - Root process only; fan-out clones share the workspace and the root commits
   their combined work after the barrier.
+
+### Publishing to the shared branch — `long-exposure integrate`
+
+Run it beside the harness, one per machine:
+
+```bash
+long-exposure --config run-config.yaml integrate \
+    --clone-dir ~/le-runs/<name>/integrator.git --interval 300 --until-pid <harness pid>
+```
+
+Every few minutes it rebuilds the shared branch as `operators/<op>/<path>` for
+each operator's newest run and each path in `federation.publish_paths`, and
+pushes. Two integrators on two machines compute the same result, so they never
+fight; if both push at once, git rejects one and it simply re-derives. Nothing
+is merged and nothing can conflict. Add your project's deliverable directory to
+`publish_paths`.
 
 ### Operator identity — always on, costs nothing
 
